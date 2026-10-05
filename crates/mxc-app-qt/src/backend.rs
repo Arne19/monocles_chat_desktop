@@ -409,6 +409,11 @@ pub mod qobject {
         #[cxx_name = "closeWebxdc"]
         fn close_webxdc(self: Pin<&mut Backend>);
 
+        /// The user answered a `webxdcSendRequest` dialog (true = send, false = discard).
+        #[qinvokable]
+        #[cxx_name = "confirmWebxdcSend"]
+        fn confirm_webxdc_send(self: Pin<&mut Backend>, accept: bool);
+
         /// Whether `room` supports OMEMO (gates the encryption toggle for MUCs).
         #[qinvokable]
         #[cxx_name = "mucOmemoCapable"]
@@ -529,10 +534,11 @@ pub mod qobject {
         #[cxx_name = "messageStored"]
         fn message_stored(self: Pin<&mut Backend>, conversation_id: i64);
 
-        /// Emitted when a downloaded file finished saving; `path` is the local file (QML opens it).
+        /// Emitted when a downloaded file finished saving; `path` is the local file. QML opens it
+        /// with the system handler only if `open` (plain documents/media - see safe_to_open).
         #[qsignal]
         #[cxx_name = "fileSaved"]
-        fn file_saved(self: Pin<&mut Backend>, path: QString);
+        fn file_saved(self: Pin<&mut Backend>, path: QString, open: bool);
 
         /// Emitted when the open conversation should reload (e.g. a delivery-state change).
         #[qsignal]
@@ -618,6 +624,19 @@ pub mod qobject {
         #[qsignal]
         #[cxx_name = "webxdcNotify"]
         fn webxdc_notify(self: Pin<&mut Backend>, text: QString);
+
+        /// A WebXDC app asked to send into chat `peer` (`sendToChat`): a file (`file_name`,
+        /// `file_size` bytes; empty/-1 if none) and/or `text`. Nothing is sent until QML calls
+        /// `confirmWebxdcSend`.
+        #[qsignal]
+        #[cxx_name = "webxdcSendRequest"]
+        fn webxdc_send_request(
+            self: Pin<&mut Backend>,
+            peer: QString,
+            file_name: QString,
+            file_size: i64,
+            text: QString,
+        );
     }
 
     // Lets the Rust side obtain a `CxxQtThread` to queue property updates back onto the
@@ -936,6 +955,11 @@ impl qobject::Backend {
     /// QML entry point — the app window closed.
     pub fn close_webxdc(self: Pin<&mut Self>) {
         crate::webxdc::close();
+    }
+
+    /// QML entry point — the user confirmed (or refused) a WebXDC `sendToChat`.
+    pub fn confirm_webxdc_send(self: Pin<&mut Self>, accept: bool) {
+        crate::webxdc::resolve_send_to_chat(accept);
     }
 
     /// QML entry point — query a room's OMEMO capability.

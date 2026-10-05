@@ -71,6 +71,14 @@ pub fn instance_host(thread: &str) -> String {
     host
 }
 
+/// Size cap for downloading an `.xdc` bundle (webxdc apps are typically well under 1 MiB).
+const MAX_XDC_DOWNLOAD: u64 = 32 * 1024 * 1024;
+/// Caps for extracting one: total uncompressed bytes and number of entries. A sender-made zip
+/// can declare tiny sizes and inflate to gigabytes (a zip bomb), so the actual bytes written
+/// are counted, not the declared ones.
+const MAX_XDC_EXTRACTED: u64 = 128 * 1024 * 1024;
+const MAX_XDC_ENTRIES: usize = 4096;
+
 /// The single live app instance (like the GTK client: one app window at a time).
 struct Live {
     thread: String,
@@ -91,7 +99,7 @@ pub fn open(peer: String, thread: String, url: String) {
     session::runtime().spawn(async move {
         let path = session::image_cache_path(&url);
         if !path.is_file() {
-            match mxc_proto::xeps::http_upload::download_any(&url).await {
+            match mxc_proto::xeps::http_upload::download_any(&url, MAX_XDC_DOWNLOAD).await {
                 Ok(bytes) => {
                     if let Some(dir) = path.parent() {
                         let _ = std::fs::create_dir_all(dir);
@@ -134,6 +142,9 @@ pub fn open(peer: String, thread: String, url: String) {
 /// Drop the live instance (the QML app window closed).
 pub fn close() {
     *LIVE.lock().unwrap() = None;
+    if let Some(r) = PENDING_SEND.lock().unwrap().take() {
+        r.discard();
+    }
 }
 
 /// Push every stored update past the live view's cursor into the running app
@@ -211,6 +222,122 @@ pub fn push_realtime(thread: &str, data_b64: &str) {
     });
 }
 
+/// Upper bound for a `sendToChat` file (base64 length, ~48 MiB decoded).
+const MAX_SEND_TO_CHAT_B64: u64 = 64 * 1024 * 1024;
+
+struct PendingFile {
+    path: PathBuf,
+    name: String,
+    size: u64,
+}
+
+/// A `sendToChat` request waiting for the user's confirmation.
+struct PendingSend {
+    account_id: i64,
+    peer: String,
+    thread: String,
+    file: Option<PendingFile>,
+    text: Option<String>,
+}
+
+impl PendingSend {
+    fn discard(self) {
+        if let Some(f) = self.file {
+            let _ = std::fs::remove_file(f.path);
+        }
+    }
+}
+
+/// At most one request at a time; further ones are refused until it's answered, so an app
+/// can't bury the user in prompts.
+static PENDING_SEND: Mutex<Option<PendingSend>> = Mutex::new(None);
+
+/// Park `req` and ask QML to confirm it (`webxdcSendRequest`).
+fn request_send_to_chat(req: PendingSend) {
+    let (file_name, file_size, text, peer) = (
+        req.file.as_ref().map(|f| f.name.clone()).unwrap_or_default(),
+        req.file.as_ref().map(|f| f.size as i64).unwrap_or(-1),
+        req.text.clone().unwrap_or_default(),
+        req.peer.clone(),
+    );
+    {
+        let mut pending = PENDING_SEND.lock().unwrap();
+        if pending.is_some() {
+            tracing::info!("webxdc sendToChat: a request is already awaiting confirmation; refused");
+            drop(pending);
+            req.discard();
+            return;
+        }
+        *pending = Some(req);
+    }
+    let Some(qt) = session::backend_qt() else {
+        if let Some(r) = PENDING_SEND.lock().unwrap().take() {
+            r.discard();
+        }
+        return;
+    };
+    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+        backend.as_mut().webxdc_send_request(
+            QString::from(&peer),
+            QString::from(&file_name),
+            file_size,
+            QString::from(&text),
+        );
+    });
+}
+
+/// The user answered the confirmation dialog. On `accept`, send what the app asked for - the
+/// text with the chat's own encryption (it used to go out in plaintext even in OMEMO chats),
+/// the file through the normal file path (which encrypts per chat as well).
+pub fn resolve_send_to_chat(accept: bool) {
+    let Some(req) = PENDING_SEND.lock().unwrap().take() else { return };
+    let still_live = LIVE.lock().unwrap().as_ref().is_some_and(|l| l.thread == req.thread);
+    if !accept || !still_live {
+        req.discard();
+        return;
+    }
+    let Some((commands, _, _)) = session::client_info() else {
+        req.discard();
+        return;
+    };
+    session::runtime().spawn(async move {
+        let PendingSend { account_id, peer, file, text, .. } = req;
+        if let Some(f) = file {
+            let path = f.path.to_string_lossy().into_owned();
+            let cmd = if f.name.to_ascii_lowercase().ends_with(".xdc") {
+                Command::SendWebxdcFile { account_id, to: peer.clone(), path }
+            } else {
+                Command::SendFile { account_id, to: peer.clone(), path, caption: None }
+            };
+            let _ = commands.try_send(cmd);
+        }
+        if let Some(body) = text {
+            let encrypted = match session::store().await {
+                Ok(store) => store
+                    .conversation_encryption(account_id, &peer)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|e| e != "none"),
+                // Unknown state: don't risk sending in the clear.
+                Err(_) => true,
+            };
+            let _ = commands.try_send(Command::SendMessage {
+                account_id,
+                to: peer,
+                body,
+                encryption: if encrypted {
+                    mxc_proto::Encryption::Omemo2
+                } else {
+                    mxc_proto::Encryption::None
+                },
+                reply_to: None,
+                id: None,
+            });
+        }
+    });
+}
+
 /// Handle one JSON message POSTed by the app to `/__bridge__` (Chromium IO thread).
 fn bridge_message(msg: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(msg) else { return };
@@ -257,37 +384,33 @@ fn bridge_message(msg: &str) {
             }
         }
         "sendToChat" => {
-            // Forward a file and/or text from the app into the chat.
+            // Never sent directly: the user confirms in a dialog of the main window (which the
+            // app can't draw over or click), as the webxdc spec has the user confirm. Until then
+            // the request is only parked; see request_send_to_chat / resolve_send_to_chat.
+            let mut file = None;
             if let Some((b64, name)) = prop("base64").zip(prop("name")) {
-                if let Some(bytes) = mxc_proto::xeps::webxdc::b64_decode(&b64) {
-                    let safe: String = name
-                        .chars()
-                        .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
-                        .collect();
-                    let dir = webxdc_cache_dir().join("out");
-                    let _ = std::fs::create_dir_all(&dir);
-                    let out = dir.join(format!("{:08x}-{safe}", hash_str(&b64) as u32));
-                    if std::fs::write(&out, &bytes).is_ok() {
-                        let path = out.to_string_lossy().into_owned();
-                        let cmd = if safe.to_ascii_lowercase().ends_with(".xdc") {
-                            Command::SendWebxdcFile { account_id, to: peer.clone(), path }
-                        } else {
-                            Command::SendFile { account_id, to: peer.clone(), path, caption: None }
-                        };
-                        let _ = commands.try_send(cmd);
-                    }
+                if b64.len() as u64 > MAX_SEND_TO_CHAT_B64 {
+                    tracing::warn!("webxdc sendToChat: file too large, ignored");
+                    return;
                 }
+                let Some(bytes) = mxc_proto::xeps::webxdc::b64_decode(&b64) else { return };
+                let safe: String = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+                    .collect();
+                let dir = webxdc_cache_dir().join("out");
+                let _ = std::fs::create_dir_all(&dir);
+                let out = dir.join(format!("{:08x}-{safe}", hash_str(&b64) as u32));
+                if std::fs::write(&out, &bytes).is_err() {
+                    return;
+                }
+                file = Some(PendingFile { path: out, name: safe, size: bytes.len() as u64 });
             }
-            if let Some(text) = prop("text") {
-                let _ = commands.try_send(Command::SendMessage {
-                    account_id,
-                    to: peer,
-                    body: text,
-                    encryption: mxc_proto::Encryption::None,
-                    reply_to: None,
-                    id: None,
-                });
+            let text = prop("text");
+            if file.is_none() && text.is_none() {
+                return;
             }
+            request_send_to_chat(PendingSend { account_id, peer, thread, file, text });
         }
         _ => {}
     }
@@ -335,6 +458,11 @@ fn extract_xdc(xdc_path: &std::path::Path, thread: &str) -> anyhow::Result<PathB
     std::fs::create_dir_all(&dir)?;
     let file = std::fs::File::open(xdc_path)?;
     let mut zip = zip::ZipArchive::new(file)?;
+    if zip.len() > MAX_XDC_ENTRIES {
+        let _ = std::fs::remove_dir_all(&dir);
+        anyhow::bail!("webxdc bundle has too many entries ({})", zip.len());
+    }
+    let mut written: u64 = 0;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
         let Some(rel) = entry.enclosed_name() else { continue };
@@ -347,7 +475,15 @@ fn extract_xdc(xdc_path: &std::path::Path, thread: &str) -> anyhow::Result<PathB
             std::fs::create_dir_all(parent)?;
         }
         let mut f = std::fs::File::create(&out)?;
-        std::io::copy(&mut entry, &mut f)?;
+        // Copy at most one byte more than the remaining budget, so overflow is detected.
+        let budget = MAX_XDC_EXTRACTED - written;
+        let n = std::io::copy(&mut std::io::Read::take(&mut entry, budget + 1), &mut f)?;
+        written += n;
+        if n > budget {
+            drop(f);
+            let _ = std::fs::remove_dir_all(&dir);
+            anyhow::bail!("webxdc bundle too large when extracted (over {MAX_XDC_EXTRACTED} bytes)");
+        }
     }
     if let Some(fp) = &fingerprint {
         let _ = std::fs::write(&marker, fp);

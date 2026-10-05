@@ -1101,10 +1101,17 @@ pub async fn download_file(
     url: &str,
     filename: &str,
 ) -> anyhow::Result<()> {
-    let bytes = crate::xeps::http_upload::download_any(url).await?;
+    let bytes =
+        crate::xeps::http_upload::download_any(url, crate::xeps::http_upload::MANUAL_DOWNLOAD_LIMIT).await?;
     let dir = download_dir();
     tokio::fs::create_dir_all(&dir).await.ok();
-    let path = unique_path(&dir, filename);
+    // SECURITY: `filename` can come from the sender (the SFS `<name>`). Joining an absolute
+    // or `../` name would write anywhere the user can (e.g. ~/.config/autostart/x.desktop),
+    // so only a sanitized final component is used, and the result must sit in `dir`.
+    let path = unique_path(&dir, &safe_file_name(filename));
+    if path.parent() != Some(dir.as_path()) {
+        anyhow::bail!("refusing to save outside the downloads folder");
+    }
     tokio::fs::write(&path, &bytes)
         .await
         .map_err(|e| anyhow::anyhow!("save {}: {e}", path.display()))?;
@@ -1126,6 +1133,41 @@ fn download_dir() -> std::path::PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     std::path::Path::new(&home).join("Downloads")
+}
+
+/// A sender-supplied file name reduced to something safe to create in the downloads folder:
+/// only its final path component (no `/`, `\\`, `..`), no control characters, not hidden
+/// (a leading `.` is dropped), at most 200 bytes, never empty.
+fn safe_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
+    let mut cleaned = cleaned.trim().trim_start_matches('.').trim().to_string();
+    if cleaned.len() > 200 {
+        let mut cut = 200;
+        while !cleaned.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        // keep the extension if there is a short one
+        let ext = cleaned.rsplit_once('.').map(|(_, e)| e.to_string()).filter(|e| e.len() <= 10);
+        cleaned.truncate(cut);
+        if let Some(ext) = ext {
+            if !cleaned.ends_with(&ext) {
+                let keep = cut.saturating_sub(ext.len() + 1);
+                let mut k = keep;
+                while !cleaned.is_char_boundary(k) {
+                    k -= 1;
+                }
+                cleaned.truncate(k);
+                cleaned.push('.');
+                cleaned.push_str(&ext);
+            }
+        }
+    }
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// A non-colliding path in `dir` for `filename` (appends ` (n)` before the extension).
@@ -2620,6 +2662,30 @@ mod file_caption_tests {
             "<fallback xmlns='{NS_FALLBACK}' for='{NS_SFS}'/>"
         ));
         assert_eq!(strip_fallback_spans(&content, "anything", &[NS_SFS]), "");
+    }
+}
+
+#[cfg(test)]
+mod download_name_tests {
+    use super::{safe_file_name, unique_path};
+
+    #[test]
+    fn sender_file_names_cannot_escape_the_downloads_folder() {
+        assert_eq!(safe_file_name("report.pdf"), "report.pdf");
+        assert_eq!(safe_file_name("/home/user/.config/autostart/x.desktop"), "x.desktop");
+        assert_eq!(safe_file_name("../../.bashrc"), "bashrc");
+        assert_eq!(safe_file_name("..\\..\\evil.exe"), "evil.exe");
+        assert_eq!(safe_file_name(".."), "file");
+        assert_eq!(safe_file_name(""), "file");
+        assert_eq!(safe_file_name("a\nb\u{0}c.txt"), "abc.txt");
+        let long = format!("{}.pdf", "x".repeat(500));
+        let s = safe_file_name(&long);
+        assert!(s.len() <= 200 && s.ends_with(".pdf"));
+        let dir = std::env::temp_dir().join("mxc-dl-test");
+        for name in ["/etc/passwd", "../../x", "..", "a/../../b"] {
+            let p = unique_path(&dir, &safe_file_name(name));
+            assert_eq!(p.parent(), Some(dir.as_path()), "{name}");
+        }
     }
 }
 

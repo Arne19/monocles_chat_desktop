@@ -8,7 +8,6 @@
 //! macros emit.)
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -413,7 +412,11 @@ fn prefetch_story_media(url: String, qt: &CxxQtThread<StoryModel>) {
     }
     let qt = qt.clone();
     runtime().spawn(async move {
-        let result = mxc_proto::xeps::http_upload::download_any(&url).await;
+        let result = mxc_proto::xeps::http_upload::download_any(
+            &url,
+            mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT,
+        )
+        .await;
         IMAGE_REQUESTED.lock().unwrap().remove(&url);
         if let Ok(bytes) = result {
             if let Some(dir) = path.parent() {
@@ -935,10 +938,16 @@ fn avatar_cache_dir() -> PathBuf {
     base.join("monocles-chat").join("avatars")
 }
 
+/// Avatar cache file for `jid` (contact, room, or `room/nick` occupant - all sender-chosen),
+/// named by SHA-256 like the media cache: collision-resistant and stable across Rust releases.
 fn avatar_cache_path(jid: &str) -> PathBuf {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    jid.hash(&mut h);
-    avatar_cache_dir().join(format!("{:016x}", h.finish()))
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(jid.as_bytes());
+    let mut name = String::with_capacity(40);
+    for b in &digest[..20] {
+        name.push_str(&format!("{b:02x}"));
+    }
+    avatar_cache_dir().join(name)
 }
 
 fn save_avatar_to_disk(jid: &str, data: &[u8]) {
@@ -995,25 +1004,59 @@ fn encode_frame_data_url(frame: &CallVideoFrame) -> Option<String> {
 // --- Inline image / sticker URL cache (shared layout with the GTK client: ~/.cache/monocles-chat/media) ---
 
 /// The file extension to use for a downloaded image URL (from the URL's last path segment).
+/// The cache file extension for a media URL: its own extension when that is one of
+/// [`SAFE_OPEN_EXTENSIONS`], else "img". The URL is sender-controlled, so nothing else (path or
+/// shell characters, very long names, executable types) may reach the file name.
 fn url_ext(url: &str) -> String {
     let name = url.rsplit('/').next().unwrap_or("");
     let name = name.split(['?', '#']).next().unwrap_or(name);
     let ext = name.rsplit('.').next().unwrap_or("");
-    if ext.is_empty() || ext == name {
+    let ext = ext.to_ascii_lowercase();
+    // Only known document/media extensions: cached files are also handed to xdg-open (e.g. the
+    // story "Play video" button), so `x.desktop` declared as video must not be cached as such.
+    if ext.is_empty() || ext == name.to_ascii_lowercase() || !SAFE_OPEN_EXTENSIONS.contains(&ext.as_str()) {
         "img".to_string()
     } else {
-        ext.to_ascii_lowercase()
+        ext
     }
 }
 
-/// The deterministic on-disk cache path an image URL maps to (its existence = "downloaded").
-/// Matches the GTK client's layout so a dev machine can share the cache.
+/// File types that may be handed to the system's default application: plain images, audio,
+/// video and documents. The sender picks the type, and `xdg-open` on e.g. a `.desktop`, `.jar`,
+/// `.exe` (wine) or `.flatpakref` file can run code or start installs.
+const SAFE_OPEN_EXTENSIONS: &[&str] = &[
+    // images
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "heif",
+    // audio / video
+    "mp3", "m4a", "aac", "ogg", "oga", "opus", "flac", "wav", "mp4", "m4v", "webm", "mkv", "mov",
+    // documents
+    "pdf", "txt", "md", "odt", "ods", "odp", "docx", "xlsx", "pptx", "doc", "xls", "ppt", "csv", "epub",
+];
+
+/// The deterministic on-disk cache path a media URL maps to (its existence = "downloaded").
+/// Named by SHA-256 of the URL: with a non-cryptographic hash a sender could craft a URL that
+/// collides with another one and have its file shown in that one's place (and std's hasher
+/// isn't even stable across Rust releases).
 pub fn image_cache_path(url: &str) -> PathBuf {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    url.hash(&mut h);
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(url.as_bytes());
+    let mut name = String::with_capacity(48);
+    for b in &digest[..20] {
+        name.push_str(&format!("{b:02x}"));
+    }
     let base = avatar_cache_dir();
     let media = base.parent().map(|p| p.join("media")).unwrap_or_else(|| base.join("media"));
-    media.join(format!("{:016x}.{}", h.finish(), url_ext(url)))
+    media.join(format!("{name}.{}", url_ext(url)))
+}
+
+/// Whether a file the user just downloaded may be opened automatically with the system's
+/// default application: only [`SAFE_OPEN_EXTENSIONS`]; anything else is just saved (the toast
+/// says where).
+fn safe_to_open(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| SAFE_OPEN_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Download (+ decrypt, for `aesgcm://`) any not-yet-cached image URLs referenced by `rows`,
@@ -1035,7 +1078,12 @@ fn prefetch_images(rows: &[mxc_store::MessageRow], qt: &CxxQtThread<MessageModel
         }
         let qt = qt.clone();
         runtime().spawn(async move {
-            let result = mxc_proto::xeps::http_upload::download_any(&url).await;
+            // Fetched without the user asking: the small automatic-download cap applies.
+            let result = mxc_proto::xeps::http_upload::download_any(
+                &url,
+                mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT,
+            )
+            .await;
             IMAGE_REQUESTED.lock().unwrap().remove(&url);
             if let Ok(bytes) = result {
                 if let Some(dir) = path.parent() {
@@ -1066,7 +1114,12 @@ pub fn fetch_media(url: String, qt: CxxQtThread<MessageModel>) {
         return; // already downloading
     }
     runtime().spawn(async move {
-        let result = mxc_proto::xeps::http_upload::download_any(&url).await;
+        // The user asked for this one (tapped "Download").
+        let result = mxc_proto::xeps::http_upload::download_any(
+            &url,
+            mxc_proto::xeps::http_upload::MANUAL_DOWNLOAD_LIMIT,
+        )
+        .await;
         IMAGE_REQUESTED.lock().unwrap().remove(&url);
         if let Ok(bytes) = result {
             if let Some(dir) = path.parent() {
@@ -1326,8 +1379,9 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
                     });
                 }
                 Event::FileSaved { path, .. } => {
+                    let open = safe_to_open(&path);
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
-                        backend.as_mut().file_saved(QString::from(&path));
+                        backend.as_mut().file_saved(QString::from(&path), open);
                     });
                 }
                 Event::ConversationsUpdated { .. } => {
@@ -2499,4 +2553,38 @@ fn backend_update(qt: &CxxQtThread<Backend>, status: &str, connected: bool) {
         backend.as_mut().set_status(QString::from(&status));
         backend.as_mut().set_connected(connected);
     });
+}
+
+#[cfg(test)]
+mod received_file_tests {
+    use super::{image_cache_path, safe_to_open, url_ext};
+
+    #[test]
+    fn cache_names_take_only_safe_extensions() {
+        assert_eq!(url_ext("https://u.example/a/photo.JPG"), "jpg");
+        assert_eq!(url_ext("https://u.example/a/clip.mp4?x=1#y"), "mp4");
+        assert_eq!(url_ext("https://u.example/a/x.desktop"), "img");
+        assert_eq!(url_ext("https://u.example/a/x.sh"), "img");
+        assert_eq!(url_ext("https://u.example/a/noext"), "img");
+        assert_eq!(url_ext("aesgcm://u.example/a/f.pdf#abcd"), "pdf");
+    }
+
+    #[test]
+    fn cache_paths_are_sha256_named_and_distinct() {
+        let a = image_cache_path("https://u.example/a.jpg");
+        let b = image_cache_path("https://u.example/b.jpg");
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(name.len(), 40 + ".jpg".len());
+        assert!(name[..40].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn only_documents_and_media_open_automatically() {
+        assert!(safe_to_open("/home/u/Downloads/report.PDF"));
+        assert!(safe_to_open("/home/u/Downloads/song.ogg"));
+        for bad in ["x.desktop", "x.sh", "x.jar", "x.exe", "x.flatpakref", "x.html", "x.AppImage", "noext"] {
+            assert!(!safe_to_open(&format!("/home/u/Downloads/{bad}")), "{bad}");
+        }
+    }
 }

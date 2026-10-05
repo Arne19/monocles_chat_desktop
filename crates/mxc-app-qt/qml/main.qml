@@ -399,16 +399,24 @@ ApplicationWindow {
             window.toastText = text
             toastTimer.restart()
         }
+        // A WebXDC app wants to send something into the chat: ask first (nothing is sent until
+        // the user confirms). Shown in the main window, which the app can't draw over.
+        function onWebxdcSendRequest(peer, fileName, fileSize, text) {
+            webxdcSendDialog.ask(peer, fileName, fileSize, text)
+        }
         // Passive feedback from the core (key verification, OMEMO resets, …).
         function onToast(text) {
             window.toastText = text
             toastTimer.restart()
         }
-        // A downloaded file finished saving → open it with the system handler.
-        function onFileSaved(path) {
+        // A downloaded file finished saving → open it with the system handler, but only plain
+        // documents/media (`open`): the sender picks the file type, and opening e.g. a
+        // .desktop/.jar/.exe file can run code. Everything else is just saved.
+        function onFileSaved(path, open) {
             window.toastText = qsTr("Saved to ") + path
             toastTimer.restart()
-            Qt.openUrlExternally("file://" + path)
+            if (open)
+                Qt.openUrlExternally("file://" + path)
         }
         // OMEMO2 device keys arrived → refresh whichever keys dialog is showing them.
         function onKeysChanged(jid) {
@@ -3978,6 +3986,87 @@ ApplicationWindow {
         }
         onAccepted: backend.setSubscription(jid, "subscribed")
         onRejected: backend.setSubscription(jid, "unsubscribed")
+    }
+
+    // WebXDC sendToChat confirmation. Everything shown comes from the (untrusted) app, so it is
+    // rendered as plain text - rich text could disguise what is about to be sent.
+    Dialog {
+        id: webxdcSendDialog
+        property string peer: ""
+        property string fileName: ""
+        property real fileSize: -1
+        property string text: ""
+        property bool answered: false
+        function ask(p, name, size, t) {
+            peer = p; fileName = name; fileSize = size; text = t; answered = false
+            window.raise()
+            window.requestActivate()
+            open()
+        }
+        function sizeLabel(bytes) {
+            if (bytes < 1024) return bytes + " B"
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB"
+            return (bytes / (1024 * 1024)).toFixed(1) + " MB"
+        }
+        title: qsTr("Send from app?")
+        anchors.centerIn: parent
+        modal: true
+        width: 420
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                text: qsTr("A WebXDC app wants to send this to %1:").arg(webxdcSendDialog.peer)
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: webxdcSendDialog.fileName.length > 0
+                textFormat: Text.PlainText
+                wrapMode: Text.WrapAnywhere
+                font.bold: true
+                text: qsTr("File: %1 (%2)").arg(webxdcSendDialog.fileName)
+                      .arg(webxdcSendDialog.sizeLabel(webxdcSendDialog.fileSize))
+            }
+            Label {
+                Layout.fillWidth: true
+                visible: webxdcSendDialog.text.length > 0
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                maximumLineCount: 12
+                elide: Text.ElideRight
+                text: webxdcSendDialog.text.length > 600
+                      ? webxdcSendDialog.text.substring(0, 600) + "…"
+                      : webxdcSendDialog.text
+            }
+        }
+        footer: DialogButtonBox {
+            Button {
+                text: qsTr("Cancel")
+                flat: true
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+            }
+            Button {
+                text: qsTr("Send")
+                flat: true
+                highlighted: true
+                DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
+            }
+        }
+        onAccepted: {
+            if (answered) return
+            answered = true
+            backend.confirmWebxdcSend(true)
+        }
+        // Escape, clicking outside or Cancel: never sends. Deferred one turn so it can't beat
+        // onAccepted whichever order Qt emits closed/accepted in for the Send button.
+        onClosed: Qt.callLater(function() {
+            if (!webxdcSendDialog.answered) {
+                webxdcSendDialog.answered = true
+                backend.confirmWebxdcSend(false)
+            }
+        })
     }
 
     // XEP-0424 retract confirmation (same wording as the GTK client) — deleting also asks

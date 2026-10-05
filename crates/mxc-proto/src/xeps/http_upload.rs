@@ -24,9 +24,99 @@ const NS_UPLOAD: &str = "urn:xmpp:http:upload:0";
 const NS_DISCO_ITEMS: &str = "http://jabber.org/protocol/disco#items";
 const NS_DISCO_INFO: &str = "http://jabber.org/protocol/disco#info";
 
+/// Size cap for media fetched without the user asking (chat images/audio, story media).
+pub const AUTO_DOWNLOAD_LIMIT: u64 = 16 * 1024 * 1024;
+/// Size cap for a file the user explicitly chose to download.
+pub const MANUAL_DOWNLOAD_LIMIT: u64 = 256 * 1024 * 1024;
+
 fn http_client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| reqwest::Client::builder().build().expect("reqwest client"))
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            // A sender-chosen server must not be able to hang a download forever.
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(60))
+            // Redirects stay on HTTPS and off our own machine/LAN (see checked_url).
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    attempt.error("too many redirects")
+                } else if attempt.url().scheme() != "https" || is_local_target(attempt.url()) {
+                    attempt.error("refusing redirect to a non-https or local address")
+                } else {
+                    attempt.follow()
+                }
+            }))
+            .build()
+            .expect("reqwest client")
+    })
+}
+
+/// Whether `url` points at this machine or a private/link-local network. File URLs come from
+/// message senders; fetching them (often automatically) must not turn us into a client for
+/// probing or poking services on our LAN (router admin pages, local daemons, ...). Literal
+/// addresses and local names only - a public name resolving to a private address isn't caught.
+fn is_local_target(url: &url::Url) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    fn v4_local(ip: Ipv4Addr) -> bool {
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
+    }
+    fn v6_local(ip: Ipv6Addr) -> bool {
+        let seg0 = ip.segments()[0];
+        ip.is_loopback()
+            || ip.is_unspecified()
+            || (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
+            || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+            || ip.to_ipv4_mapped().is_some_and(v4_local)
+    }
+    match url.host() {
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost") || d.ends_with(".local")
+        }
+        Some(url::Host::Ipv4(ip)) => v4_local(ip),
+        Some(url::Host::Ipv6(ip)) => v6_local(ip),
+        None => true,
+    }
+}
+
+/// Parse a received file URL, requiring https (XEP-0363 download URLs are https) and a
+/// non-local host.
+fn checked_url(raw: &str) -> anyhow::Result<url::Url> {
+    let url = url::Url::parse(raw).map_err(|e| anyhow::anyhow!("bad file url: {e}"))?;
+    if url.scheme() != "https" {
+        anyhow::bail!("refusing non-https file url");
+    }
+    if is_local_target(&url) {
+        anyhow::bail!("refusing file url pointing at a local address");
+    }
+    Ok(url)
+}
+
+/// GET `url` into memory, refusing anything larger than `max` bytes - checked against the
+/// announced Content-Length and again while streaming, since a server may lie or send none.
+async fn fetch_capped(url: url::Url, max: u64) -> anyhow::Result<Vec<u8>> {
+    let mut resp = http_client().get(url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("download GET failed: HTTP {}", resp.status());
+    }
+    if let Some(len) = resp.content_length() {
+        if len > max {
+            anyhow::bail!("file too large ({len} bytes, limit {max})");
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() as u64 + chunk.len() as u64 > max {
+            anyhow::bail!("file too large (over the {max} byte limit)");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Cache of discovered upload-service JIDs, keyed by server domain.
@@ -153,16 +243,24 @@ fn aesgcm_encrypt(plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
 
 /// AES-256-GCM decrypt using an iv‖key combo (44 bytes = 12-IV, or 48 = 16-IV).
 fn aesgcm_decrypt(combo: &[u8], ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let iv_len = match combo.len() {
-        44 => 12,
-        48 => 16,
+    // The fragment is IV ‖ KEY: a 12-byte IV (current clients) or a 16-byte one (older
+    // Conversations-based clients). Aes256Gcm's nonce is 12 bytes - handing it 16 used to
+    // panic - so the 16-byte variant needs its own cipher type.
+    type Aes256Gcm16 = aes_gcm::AesGcm<aes_gcm::aes::Aes256, aes_gcm::aead::consts::U16>;
+    let err = |e: aes_gcm::Error| anyhow::anyhow!("aesgcm decrypt (bad key or corrupt file): {e}");
+    match combo.len() {
+        44 => {
+            let (iv, key) = combo.split_at(12);
+            let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("aesgcm key: {e}"))?;
+            cipher.decrypt(Nonce::from_slice(iv), ciphertext).map_err(err)
+        }
+        48 => {
+            let (iv, key) = combo.split_at(16);
+            let cipher = Aes256Gcm16::new_from_slice(key).map_err(|e| anyhow::anyhow!("aesgcm key: {e}"))?;
+            cipher.decrypt(aes_gcm::aead::generic_array::GenericArray::from_slice(iv), ciphertext).map_err(err)
+        }
         n => anyhow::bail!("unexpected aesgcm key length {n}"),
-    };
-    let (iv, key) = combo.split_at(iv_len);
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("aesgcm key: {e}"))?;
-    cipher
-        .decrypt(Nonce::from_slice(iv), ciphertext)
-        .map_err(|e| anyhow::anyhow!("aesgcm decrypt (bad key or corrupt file): {e}"))
+    }
 }
 
 /// Rewrite an `https://` get URL into an `aesgcm://` URL carrying the key in the fragment.
@@ -225,38 +323,29 @@ pub async fn upload_plain(
     Ok(slot.get_url)
 }
 
-/// Download an `aesgcm://` URL and decrypt it, returning the plaintext file bytes.
-pub async fn download_decrypt(aesgcm_url: &str) -> anyhow::Result<Vec<u8>> {
+/// Download an `aesgcm://` URL (at most `max` bytes) and decrypt it, returning the plaintext.
+pub async fn download_decrypt(aesgcm_url: &str, max: u64) -> anyhow::Result<Vec<u8>> {
     let (url, frag) = aesgcm_url
         .split_once('#')
         .ok_or_else(|| anyhow::anyhow!("aesgcm url has no key fragment"))?;
     let https = format!("https{}", url.strip_prefix("aesgcm").unwrap_or(url));
     let combo = hex::decode(frag).map_err(|e| anyhow::anyhow!("bad key fragment: {e}"))?;
-
-    let resp = http_client().get(&https).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("download GET failed: HTTP {}", resp.status());
-    }
-    let ciphertext = resp.bytes().await?;
+    let ciphertext = fetch_capped(checked_url(&https)?, max).await?;
     aesgcm_decrypt(&combo, &ciphertext)
 }
 
-/// Download a plain (unencrypted) `http(s)://` URL, returning the raw file bytes.
-pub async fn download_plain(url: &str) -> anyhow::Result<Vec<u8>> {
-    let resp = http_client().get(url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("download GET failed: HTTP {}", resp.status());
-    }
-    Ok(resp.bytes().await?.to_vec())
+/// Download a plain (unencrypted) `https://` URL (at most `max` bytes).
+pub async fn download_plain(url: &str, max: u64) -> anyhow::Result<Vec<u8>> {
+    fetch_capped(checked_url(url)?, max).await
 }
 
-/// Download a file URL, transparently handling both encrypted (`aesgcm://`) and plain
-/// (`http(s)://`) links and returning the decoded file bytes.
-pub async fn download_any(url: &str) -> anyhow::Result<Vec<u8>> {
+/// Download a received file URL - encrypted (`aesgcm://`) or plain `https://` - refusing
+/// anything over `max` bytes ([`AUTO_DOWNLOAD_LIMIT`] / [`MANUAL_DOWNLOAD_LIMIT`]).
+pub async fn download_any(url: &str, max: u64) -> anyhow::Result<Vec<u8>> {
     if is_aesgcm_url(url) {
-        download_decrypt(url).await
+        download_decrypt(url, max).await
     } else {
-        download_plain(url).await
+        download_plain(url, max).await
     }
 }
 
@@ -299,5 +388,49 @@ mod header_tests {
             allowed_headers(&put),
             vec![("Authorization".to_string(), "Basic abc".to_string()), ("Cookie".to_string(), "a=b".to_string())]
         );
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn only_public_https_urls_are_fetched() {
+        assert!(checked_url("https://upload.example.org/a/b.jpg").is_ok());
+        for bad in [
+            "http://upload.example.org/a.jpg",
+            "file:///etc/passwd",
+            "https://localhost/x",
+            "https://printer.local/x",
+            "https://127.0.0.1/x",
+            "https://192.168.1.1/admin",
+            "https://10.0.0.5/x",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.1.1/x",
+            "https://[::1]/x",
+            "https://[fd00::1]/x",
+            "https://[::ffff:192.168.0.1]/x",
+        ] {
+            assert!(checked_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn aesgcm_accepts_12_and_16_byte_ivs() {
+        use aes_gcm::aead::generic_array::GenericArray;
+        type Aes256Gcm16 = aes_gcm::AesGcm<aes_gcm::aes::Aes256, aes_gcm::aead::consts::U16>;
+        let key = [7u8; 32];
+        // 12-byte IV (current format)
+        let iv12 = [1u8; 12];
+        let ct = Aes256Gcm::new_from_slice(&key).unwrap().encrypt(Nonce::from_slice(&iv12), &b"hi"[..]).unwrap();
+        let combo: Vec<u8> = iv12.iter().chain(key.iter()).copied().collect();
+        assert_eq!(aesgcm_decrypt(&combo, &ct).unwrap(), b"hi");
+        // 16-byte IV (older clients) - used to panic
+        let iv16 = [2u8; 16];
+        let ct = Aes256Gcm16::new_from_slice(&key).unwrap().encrypt(GenericArray::from_slice(&iv16), &b"yo"[..]).unwrap();
+        let combo: Vec<u8> = iv16.iter().chain(key.iter()).copied().collect();
+        assert_eq!(aesgcm_decrypt(&combo, &ct).unwrap(), b"yo");
+        assert!(aesgcm_decrypt(&[0u8; 40], &ct).is_err());
     }
 }
