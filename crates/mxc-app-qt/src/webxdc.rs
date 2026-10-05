@@ -5,7 +5,7 @@
 //! The `.xdc` (a zip) is extracted to a cache dir and served over a private `webxdc://` URI
 //! scheme implemented by the C++ shim (`cpp/webxdc_shim.cpp` — QtWebEngine's scheme handler and
 //! `QtWebEngineQuick::initialize` have no Rust bindings). `webxdc.js` (served at `/webxdc.js`)
-//! defines the JS API; the app talks back by `fetch()`-POSTing JSON to `webxdc://app/__bridge__`,
+//! defines the JS API; the app talks back by `fetch()`-POSTing JSON to `/__bridge__` on its origin,
 //! which the shim forwards to [`bridge_message`] (on a Chromium IO thread). Outgoing
 //! `sendUpdate`/realtime become `Command::SendWebxdc{Update,Realtime}`; incoming updates (from
 //! the session event pump) are pushed back into the view via Backend signals → `runJavaScript`.
@@ -24,9 +24,10 @@ use crate::session;
 extern "C" {
     /// Register the `webxdc://` scheme + WebEngine GL sharing. MUST run before QGuiApplication.
     fn mxc_webxdc_pre_app_init();
-    /// Point the scheme handler at an extracted app dir + its generated webxdc.js (installs the
-    /// handler on the default profile on first use). Must run on the Qt thread.
-    fn mxc_webxdc_install(root: *const c_char, js: *const c_char);
+    /// Point the scheme handler at an extracted app dir + its generated webxdc.js, served only
+    /// on `webxdc://<host>/` (installs the handler + offline interceptor on the default profile
+    /// on first use). Must run on the Qt thread.
+    fn mxc_webxdc_install(root: *const c_char, js: *const c_char, host: *const c_char);
 }
 
 /// Called by the C++ scheme handler with each JSON message the app POSTs to `/__bridge__`.
@@ -45,11 +46,29 @@ pub fn pre_app_init() {
     unsafe { mxc_webxdc_pre_app_init() }
 }
 
-fn install(root: &str, js: &str) {
-    let (Ok(root), Ok(js)) = (std::ffi::CString::new(root), std::ffi::CString::new(js)) else {
+fn install(root: &str, js: &str, host: &str) {
+    let (Ok(root), Ok(js), Ok(host)) =
+        (std::ffi::CString::new(root), std::ffi::CString::new(js), std::ffi::CString::new(host))
+    else {
         return;
     };
-    unsafe { mxc_webxdc_install(root.as_ptr(), js.as_ptr()) }
+    unsafe { mxc_webxdc_install(root.as_ptr(), js.as_ptr(), host.as_ptr()) }
+}
+
+/// The private origin host of app instance `thread`: `x` + 128 bits of SHA-256. Every instance
+/// gets its own origin, so apps can't read each other's localStorage/IndexedDB (they all used
+/// to share `webxdc://app`). A cryptographic hash because the thread id is chosen by whoever
+/// sent the app - with a weak hash one could pick an id that collides with a victim app's
+/// host and share its storage.
+pub fn instance_host(thread: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(thread.as_bytes());
+    let mut host = String::with_capacity(33);
+    host.push('x');
+    for b in &digest[..16] {
+        host.push_str(&format!("{b:02x}"));
+    }
+    host
 }
 
 /// The single live app instance (like the GTK client: one app window at a time).
@@ -104,9 +123,10 @@ pub fn open(peer: String, thread: String, url: String) {
 
         let Some(qt) = session::backend_qt() else { return };
         let dir_s = dir.to_string_lossy().into_owned();
+        let host = instance_host(&thread);
         let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
-            install(&dir_s, &js); // scheme-handler setup needs the Qt thread
-            backend.as_mut().webxdc_ready(QString::from(&thread));
+            install(&dir_s, &js, &host); // scheme-handler setup needs the Qt thread
+            backend.as_mut().webxdc_ready(QString::from(&thread), QString::from(&host));
         });
     });
 }
@@ -438,4 +458,20 @@ window.webxdc = (() => {{
 }})();
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance_host;
+
+    #[test]
+    fn instance_hosts_are_distinct_valid_labels() {
+        let a = instance_host("thread-a");
+        let b = instance_host("thread-b");
+        assert_ne!(a, b);
+        assert_eq!(a, instance_host("thread-a"));
+        assert_eq!(a.len(), 33);
+        assert!(a.starts_with('x'));
+        assert!(a[1..].chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
 }

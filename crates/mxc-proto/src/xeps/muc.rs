@@ -102,6 +102,10 @@ pub async fn join(
         store.set_muc_password(cfg.account_id, room, pw).await?;
     }
 
+    // XEP-0359: does the room stamp stanza-ids? Learn it before the first room message
+    // arrives so its `<stanza-id by=room>` can be trusted (best-effort; unknown = untrusted).
+    super::stanza_id::discover(w, cfg.account_id, room).await;
+
     // XEP-0045 join: <x><history maxstanzas='0'/>[<password>…</password>]</x>.
     let mut x = Element::builder("x", NS_MUC)
         .append(Element::builder("history", NS_MUC).attr(crate::ncname("maxstanzas"), "0").build());
@@ -149,6 +153,7 @@ pub async fn configure_room(
         .build();
     if let Ok(reply) = iq::request(w, req).await {
         if let Some(query) = reply.get_child("query", NS_DISCO_INFO) {
+            super::stanza_id::set_supported(cfg.account_id, room, super::stanza_id::advertises(query));
             for f in query.children().filter(|c| c.name() == "feature") {
                 match f.attr("var") {
                     Some("muc_membersonly") => members_only = true,

@@ -52,11 +52,18 @@ async fn handle_iq(
         return Ok(());
     }
 
-    // Roster pushes (set) / results.
+    // Roster pushes (RFC 6121 §2.1.6): only a `set` from our own server is a push. Anyone else
+    // could otherwise add/remove/rename our contacts. Replies to our own roster fetch never get
+    // here (iq::try_resolve consumes them), so an unsolicited `result` is ignored as well.
     if let Some(query) = iq.get_child("query", "jabber:iq:roster") {
-        roster::handle_roster_payload(store, cfg, events, query).await?;
         if iq_type == "set" {
-            roster::ack_iq(w, iq)?;
+            if super::origin::from_server(iq.attr("from"), cfg.bare()) {
+                roster::handle_roster_payload(store, cfg, events, query).await?;
+                roster::ack_iq(w, iq)?;
+            } else {
+                tracing::warn!(from = ?iq.attr("from"), "rejecting roster push from foreign entity");
+                w.send(error_iq(iq, "cancel", "forbidden"))?;
+            }
         }
         return Ok(());
     }
@@ -75,4 +82,20 @@ async fn handle_iq(
 
     tracing::trace!(iq_type, "unhandled iq");
     Ok(())
+}
+
+/// An `<iq type='error'>` answering `req` with a stanza error condition.
+fn error_iq(req: &Element, error_type: &str, condition: &str) -> Element {
+    let mut b = Element::builder("iq", "jabber:client").attr(crate::ncname("type"), "error");
+    if let Some(id) = req.attr("id") {
+        b = b.attr(crate::ncname("id"), id);
+    }
+    if let Some(from) = req.attr("from") {
+        b = b.attr(crate::ncname("to"), from);
+    }
+    let error = Element::builder("error", "jabber:client")
+        .attr(crate::ncname("type"), error_type)
+        .append(Element::builder(condition, "urn:ietf:params:xml:ns:xmpp-stanzas").build())
+        .build();
+    b.append(error).build()
 }

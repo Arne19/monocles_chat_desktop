@@ -45,9 +45,9 @@ pub async fn fetch_comments(w: &Writer, post_author: &str, post_id: &str) -> Vec
     let Ok(reply) = pep::items(w, Some(post_author), &node, Some(100)).await else {
         return Vec::new();
     };
-    let mut comments: Vec<FeedPost> = pep::extract_items(&reply)
+    let mut comments: Vec<FeedPost> = pep::extract_items_with_publisher(&reply)
         .iter()
-        .filter_map(|(id, entry)| parse_comment(id.as_deref(), entry))
+        .filter_map(|(id, publisher, entry)| parse_comment(id.as_deref(), publisher.as_deref(), entry))
         .collect();
     comments.sort_by(|a, b| a.published.cmp(&b.published));
     comments
@@ -193,6 +193,9 @@ fn comments_config() -> Element {
         ("pubsub#max_items", "max"),
         ("pubsub#notify_retract", "1"),
         ("pubsub#publish_model", "open"),
+        // Stamp each comment with its real publisher: anyone may publish here, so the Atom
+        // <author> alone can't be trusted (checked in parse_comment).
+        ("pubsub#itempublisher", "1"),
     ])
 }
 
@@ -237,16 +240,33 @@ async fn create_node(
 
 // --- parsing -------------------------------------------------------------------------------
 
-fn author_of(entry: &Element, fallback: &str) -> String {
+/// The bare JID claimed by the entry's Atom `<author><uri>xmpp:…</uri>`, if any. This is free
+/// text written by whoever published the item - only a claim.
+fn claimed_author(entry: &Element) -> Option<String> {
     entry
         .get_child("author", NS_ATOM)
         .and_then(|a| a.get_child("uri", NS_ATOM))
         .map(|u| u.text())
         .and_then(|uri| {
-            uri.strip_prefix("xmpp:")
+            uri.trim()
+                .strip_prefix("xmpp:")
                 .map(|s| s.split(['/', '?']).next().unwrap_or(s).to_string())
         })
-        .unwrap_or_else(|| fallback.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The author of an item published by `publisher` (bare JID): the publisher itself. A claimed
+/// `<author>` naming someone else makes the item invalid (None) - otherwise anyone could post
+/// "as" one of our contacts on their own node (as in monocles Android's Post/Comment).
+fn verified_author(entry: &Element, publisher: &str) -> Option<String> {
+    let publisher = publisher.split('/').next().unwrap_or(publisher);
+    match claimed_author(entry) {
+        Some(claimed) if !claimed.eq_ignore_ascii_case(publisher) => {
+            tracing::warn!(%claimed, %publisher, "ignoring feed item whose author isn't its publisher");
+            None
+        }
+        _ => Some(publisher.to_string()),
+    }
 }
 
 fn published_of(entry: &Element) -> i64 {
@@ -304,9 +324,11 @@ fn parse_post(item_id: Option<&str>, entry: &Element, owner_bare: &str) -> Optio
     if title.trim().is_empty() && content.trim().is_empty() && attachment_url.is_empty() {
         return None;
     }
+    // A post on `owner_bare`'s microblog node is by `owner_bare`.
+    let author = verified_author(entry, owner_bare)?;
     Some(FeedPost {
         id: item_id_of(item_id, entry),
-        author: author_of(entry, owner_bare),
+        author,
         title,
         content,
         published: published_of(entry),
@@ -316,8 +338,11 @@ fn parse_post(item_id: Option<&str>, entry: &Element, owner_bare: &str) -> Optio
     })
 }
 
-/// Parse one comment entry (its body is the `<title>`).
-fn parse_comment(item_id: Option<&str>, entry: &Element) -> Option<FeedPost> {
+/// Parse one comment entry (its body is the `<title>`). Comments nodes are open for anyone to
+/// publish to; when the service stamped the item's `publisher`, that is the author and a
+/// different claimed `<author>` drops the comment. Without it (nodes created without
+/// `pubsub#itempublisher`) the claim can't be verified and is shown as-is.
+fn parse_comment(item_id: Option<&str>, publisher: Option<&str>, entry: &Element) -> Option<FeedPost> {
     if entry.name() != "entry" {
         return None;
     }
@@ -329,9 +354,13 @@ fn parse_comment(item_id: Option<&str>, entry: &Element) -> Option<FeedPost> {
     if content.trim().is_empty() {
         return None;
     }
+    let author = match publisher {
+        Some(p) => verified_author(entry, p)?,
+        None => claimed_author(entry).unwrap_or_default(),
+    };
     Some(FeedPost {
         id: item_id_of(item_id, entry),
-        author: author_of(entry, ""),
+        author,
         title: String::new(),
         content,
         published: published_of(entry),
@@ -339,4 +368,41 @@ fn parse_comment(item_id: Option<&str>, entry: &Element) -> Option<FeedPost> {
         attachment_url: String::new(),
         attachment_type: String::new(),
     })
+}
+
+#[cfg(test)]
+mod authorship_tests {
+    use super::*;
+
+    fn entry(author: Option<&str>) -> Element {
+        let mut e = Element::builder("entry", NS_ATOM)
+            .append(Element::builder("title", NS_ATOM).append("hello").build());
+        if let Some(a) = author {
+            e = e.append(
+                Element::builder("author", NS_ATOM)
+                    .append(Element::builder("uri", NS_ATOM).append(a).build())
+                    .build(),
+            );
+        }
+        e.build()
+    }
+
+    #[test]
+    fn post_must_be_by_node_owner() {
+        let ok = parse_post(Some("p1"), &entry(Some("xmpp:alice@example.org")), "alice@example.org").unwrap();
+        assert_eq!(ok.author, "alice@example.org");
+        assert!(parse_post(Some("p1"), &entry(Some("xmpp:bob@example.org")), "alice@example.org").is_none());
+        assert_eq!(parse_post(Some("p1"), &entry(None), "alice@example.org").unwrap().author, "alice@example.org");
+    }
+
+    #[test]
+    fn comment_must_match_stamped_publisher() {
+        assert!(parse_comment(Some("c1"), Some("mallory@evil.org/x"), &entry(Some("xmpp:alice@example.org"))).is_none());
+        let ok = parse_comment(Some("c1"), Some("alice@example.org/web"), &entry(Some("xmpp:alice@example.org"))).unwrap();
+        assert_eq!(ok.author, "alice@example.org");
+        let anon = parse_comment(Some("c1"), Some("bob@example.org"), &entry(None)).unwrap();
+        assert_eq!(anon.author, "bob@example.org");
+        // Unstamped nodes: unverifiable claim kept (documented limitation).
+        assert_eq!(parse_comment(Some("c1"), None, &entry(Some("xmpp:carol@example.org"))).unwrap().author, "carol@example.org");
+    }
 }

@@ -601,7 +601,7 @@ pub mod qobject {
         /// Emitted when an opened WebXDC app is extracted + served — QML creates the window.
         #[qsignal]
         #[cxx_name = "webxdcReady"]
-        fn webxdc_ready(self: Pin<&mut Backend>, thread: QString);
+        fn webxdc_ready(self: Pin<&mut Backend>, thread: QString, host: QString);
 
         /// Emitted with new status updates for the running app: `items` is a comma-joined list
         /// of update JSON objects, fed to the app via `__webxdcPushUpdates([items])`.

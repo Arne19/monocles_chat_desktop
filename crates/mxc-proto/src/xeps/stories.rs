@@ -182,7 +182,8 @@ pub async fn handle_event(store: &Store, cfg: &AccountConfig, events: &Sender<Ev
     // Retractions remove the item; published items are parsed + stored.
     for retract in items.children().filter(|c| c.name() == "retract") {
         if let Some(id) = retract.attr("id") {
-            let _ = store.delete_story(id).await;
+            // Only the publisher's own story (`contact` = the event's sender) can be retracted.
+            let _ = store.delete_story(cfg.account_id, &contact, id).await;
         }
     }
     let published: Vec<(Option<String>, Element)> = items
@@ -204,7 +205,7 @@ pub async fn handle_event(store: &Store, cfg: &AccountConfig, events: &Sender<Ev
 /// Retract one of our own stories. If the server no longer has the item (`item-not-found` —
 /// e.g. it already expired, or was stored under a stale client-side id), we still drop the
 /// local copy so the UI can clear it.
-pub async fn retract(w: &Writer, store: &Store, uuid: &str) -> anyhow::Result<()> {
+pub async fn retract(w: &Writer, store: &Store, cfg: &AccountConfig, uuid: &str) -> anyhow::Result<()> {
     match pep::retract(w, NS_STORIES, uuid).await {
         Ok(_) => {}
         Err(e) if e.to_string().contains("item-not-found") => {
@@ -212,6 +213,6 @@ pub async fn retract(w: &Writer, store: &Store, uuid: &str) -> anyhow::Result<()
         }
         Err(e) => return Err(e),
     }
-    store.delete_story(uuid).await?;
+    store.delete_story(cfg.account_id, cfg.bare(), uuid).await?;
     Ok(())
 }

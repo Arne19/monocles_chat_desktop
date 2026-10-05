@@ -410,8 +410,9 @@ impl Store {
     }
 
     /// XEP-0308: replace the body of the message targeted by `target_marker`, recording
-    /// the edit pointer. Only applies if the editor matches the original sender side
-    /// (enforced by the caller). Returns the edited row id if found.
+    /// the edit pointer. No sender check — only for edits *we* make locally; incoming
+    /// corrections go through [`Self::find_from_sender`] + [`Self::correct_message`].
+    /// Returns the edited row id if found.
     pub async fn apply_correction(
         &self,
         conversation_id: i64,
@@ -435,7 +436,9 @@ impl Store {
     /// XEP-0424: tombstone the targeted message — per spec the content AND its metadata go
     /// (body, attachment, correction/reply links, fingerprint, reactions); only a minimal
     /// stub row remains. Returns the message id and the body it had, so callers can also
-    /// drop any media-cache file downloaded for it.
+    /// drop any media-cache file downloaded for it. No sender check — only for retractions
+    /// *we* make locally; incoming ones go through [`Self::find_from_sender`] +
+    /// [`Self::retract_message_id`].
     pub async fn retract_message(
         &self,
         conversation_id: i64,
@@ -455,6 +458,133 @@ impl Store {
             .execute(self.pool())
             .await?;
         Ok(Some((orig.id, orig.body)))
+    }
+
+    /// The newest non-retracted message in `conversation_id` with marker `marker_id` that was
+    /// sent by the same party as an incoming correction/retraction: same `direction`, and — when
+    /// `occupant_id` is given (MUC) — the same XEP-0421 occupant id. This is the authorization
+    /// for XEP-0308/0424: only the original sender may edit or retract a message (Conversations'
+    /// `findMessageWithUuidOrRemoteId` filter).
+    ///
+    /// With `fingerprint = Some(fp)` (corrections), a message received under an OMEMO fingerprint
+    /// additionally only matches an edit made under that *same* fingerprint (`fp` = `None` for a
+    /// plaintext edit matches only unencrypted originals) — monocles Android's
+    /// `fingerprintsMatch`: otherwise the peer's server could forge a plaintext correction that
+    /// rewrites an encrypted message. Retractions use the same rule; only a XEP-0425 moderation
+    /// (from the room itself, via [`Self::find_by_stanza_id`]) is exempt.
+    pub async fn find_from_sender(
+        &self,
+        conversation_id: i64,
+        marker_id: &str,
+        direction: &str,
+        occupant_id: Option<&str>,
+        fingerprint: Option<Option<&str>>,
+    ) -> Result<Option<i64>> {
+        let (check_fp, fp) = match fingerprint {
+            Some(fp) => (1i64, fp),
+            None => (0i64, None),
+        };
+        let id: Option<i64> = sqlx::query_scalar(
+            r#"SELECT id FROM messages
+               WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2)
+                     AND direction = ?3 AND (?4 IS NULL OR occupant_id = ?4)
+                     AND retracted = 0
+                     AND (?5 = 0 OR omemo_fingerprint IS NULL OR omemo_fingerprint = ?6)
+               ORDER BY id DESC LIMIT 1"#,
+        )
+        .bind(conversation_id)
+        .bind(marker_id)
+        .bind(direction)
+        .bind(occupant_id)
+        .bind(check_fp)
+        .bind(fp)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(id)
+    }
+
+    /// The newest non-retracted message in `conversation_id` with archive id `stanza_id` (a
+    /// XEP-0425 moderation from the room references the room-assigned stanza-id only).
+    pub async fn find_by_stanza_id(&self, conversation_id: i64, stanza_id: &str) -> Result<Option<i64>> {
+        let id: Option<i64> = sqlx::query_scalar(
+            r#"SELECT id FROM messages
+               WHERE conversation_id = ?1 AND stanza_id = ?2 AND retracted = 0
+               ORDER BY id DESC LIMIT 1"#,
+        )
+        .bind(conversation_id)
+        .bind(stanza_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(id)
+    }
+
+    /// XEP-0308: replace the body of message `message_id` (already authorized by the caller
+    /// via [`Self::find_from_sender`]). The row takes the *correction's* encryption and
+    /// fingerprint, so a plaintext correction of an encrypted message can't keep the lock.
+    pub async fn correct_message(
+        &self,
+        message_id: i64,
+        target_marker: &str,
+        new_body: &str,
+        encryption: &str,
+        fingerprint: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE messages SET body = ?1, edited_of = ?2, encryption = ?3, omemo_fingerprint = ?4
+               WHERE id = ?5"#,
+        )
+        .bind(new_body)
+        .bind(target_marker)
+        .bind(encryption)
+        .bind(fingerprint)
+        .bind(message_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// XEP-0424 tombstone of message `message_id` (already authorized by the caller); same
+    /// effect as [`Self::retract_message`]. Returns the body it had.
+    pub async fn retract_message_id(&self, message_id: i64) -> Result<Option<String>> {
+        let body: Option<Option<String>> = sqlx::query_scalar("SELECT body FROM messages WHERE id = ?1")
+            .bind(message_id)
+            .fetch_optional(self.pool())
+            .await?;
+        sqlx::query(
+            r#"UPDATE messages SET retracted = 1, body = NULL, attachment = NULL,
+               edited_of = NULL, reply_to = NULL, omemo_fingerprint = NULL WHERE id = ?1"#,
+        )
+        .bind(message_id)
+        .execute(self.pool())
+        .await?;
+        sqlx::query("DELETE FROM reactions WHERE message_id = ?1")
+            .bind(message_id)
+            .execute(self.pool())
+            .await?;
+        Ok(body.flatten())
+    }
+
+    /// XEP-0184/0333 from the counterpart: advance the delivery state of one of *our* messages
+    /// in `conversation_id` (never another conversation's, never an incoming one), and never
+    /// downgrade `displayed` back to `received`. Returns whether a row changed.
+    pub async fn mark_outgoing_state(
+        &self,
+        conversation_id: i64,
+        marker_id: &str,
+        state: &str,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            r#"UPDATE messages SET state = ?1
+               WHERE conversation_id = ?2 AND direction = 'out'
+                     AND (stanza_id = ?3 OR origin_id = ?3)
+                     AND NOT (?1 = 'received' AND state = 'displayed')"#,
+        )
+        .bind(state)
+        .bind(conversation_id)
+        .bind(marker_id)
+        .execute(self.pool())
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Attach XEP-0066/0363 media metadata JSON to a message.
@@ -1012,4 +1142,83 @@ pub struct MamCursor {
     pub first_id: Option<String>,
     pub last_id: Option<String>,
     pub complete: bool,
+}
+
+#[cfg(test)]
+mod sender_auth_tests {
+    use crate::{Direction, NewMessage, Store};
+
+    fn msg(conv: i64, origin: &str, dir: Direction, occ: Option<&str>) -> NewMessage {
+        NewMessage {
+            conversation_id: conv,
+            stanza_id: None,
+            origin_id: Some(origin.into()),
+            counterpart: "x@y".into(),
+            direction: dir,
+            body: Some("hello".into()),
+            encryption: "omemo2".into(),
+            reply_to: None,
+            omemo_fingerprint: Some("fp".into()),
+            attachment: None,
+            occupant_id: occ.map(str::to_string),
+            timestamp: "2026-10-04T00:00:00Z".into(),
+            thread: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn corrections_and_retractions_only_match_the_sender() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        let other = store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
+        let mine = store.insert_message(&msg(room, "m1", Direction::Out, Some("occ-me"))).await.unwrap().unwrap();
+        let alice = store.insert_message(&msg(room, "a1", Direction::In, Some("occ-alice"))).await.unwrap().unwrap();
+
+        // Mallory (another occupant) can target neither Alice's nor our message.
+        assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-mallory"), None).await.unwrap(), None);
+        assert_eq!(store.find_from_sender(room, "m1", "in", Some("occ-mallory"), None).await.unwrap(), None);
+        // Alice can target hers, we can target ours.
+        assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-alice"), None).await.unwrap(), Some(alice));
+        assert_eq!(store.find_from_sender(room, "m1", "out", None, None).await.unwrap(), Some(mine));
+        // Other conversations never match.
+        assert_eq!(store.find_from_sender(other, "a1", "in", None, None).await.unwrap(), None);
+
+        // An encrypted original can only be corrected under its own fingerprint.
+        assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-alice"), Some(None)).await.unwrap(), None);
+        assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-alice"), Some(Some("other"))).await.unwrap(), None);
+        assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-alice"), Some(Some("fp"))).await.unwrap(), Some(alice));
+
+        // Applying a correction takes over its encryption state.
+        store.correct_message(alice, "a1", "edited", "none", None).await.unwrap();
+        let row = store.message_by_marker(room, "a1").await.unwrap().unwrap();
+        assert_eq!(row.body.as_deref(), Some("edited"));
+        assert_eq!(row.encryption, "none");
+        assert_eq!(row.omemo_fingerprint, None);
+
+        // A plaintext retraction can't delete an encrypted message (fresh one: a2).
+        let a2 = store.insert_message(&msg(room, "a2", Direction::In, Some("occ-alice"))).await.unwrap().unwrap();
+        assert_eq!(store.find_from_sender(room, "a2", "in", Some("occ-alice"), Some(None)).await.unwrap(), None);
+        assert_eq!(store.find_from_sender(room, "a2", "in", Some("occ-alice"), Some(Some("fp"))).await.unwrap(), Some(a2));
+
+        // Retracted messages can't be targeted again.
+        assert_eq!(store.retract_message_id(alice).await.unwrap().as_deref(), Some("edited"));
+        assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-alice"), None).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn receipts_only_touch_our_messages_in_that_conversation() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let bob = store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
+        let eve = store.conversation_id(acc, "eve@example.org", "chat").await.unwrap();
+        store.insert_message(&msg(bob, "out1", Direction::Out, None)).await.unwrap();
+        store.insert_message(&msg(bob, "in1", Direction::In, None)).await.unwrap();
+
+        assert!(!store.mark_outgoing_state(eve, "out1", "displayed").await.unwrap());
+        assert!(!store.mark_outgoing_state(bob, "in1", "displayed").await.unwrap());
+        assert!(store.mark_outgoing_state(bob, "out1", "displayed").await.unwrap());
+        // No downgrade from displayed to received.
+        assert!(!store.mark_outgoing_state(bob, "out1", "received").await.unwrap());
+    }
 }

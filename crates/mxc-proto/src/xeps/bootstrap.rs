@@ -13,6 +13,10 @@ use crate::event::Event;
 use crate::xeps::{bookmarks, carbons, extdisco, mam, muc, omemo, presence, roster};
 
 pub async fn run(w: &Writer, store: &Store, cfg: &AccountConfig, events: &Sender<Event>) {
+    // XEP-0359: learn whether our account stamps stanza-ids before any archive/live message is
+    // processed — until then `<stanza-id by=us>` is untrusted (see stanza_id.rs).
+    super::stanza_id::discover(w, cfg.account_id, cfg.bare()).await;
+
     // XEP-0280: mirror across devices.
     if let Err(e) = carbons::enable(w) {
         tracing::warn!(error = %e, "enable carbons");

@@ -63,17 +63,22 @@ pub async fn handle_incoming(
                         .ok()
                         .flatten()
                         .unwrap_or_default();
-                    let _ = events
-                        .send(Event::MucAvatar {
-                            account_id: cfg.account_id,
-                            room: room.to_string(),
-                            nick: nick.to_string(),
-                            data,
-                        })
-                        .await;
+                    // The photo must be the one the presence advertised (XEP-0153 hash).
+                    if crate::xeps::avatar::sha1_hex(&data).eq_ignore_ascii_case(&hash) {
+                        let _ = events
+                            .send(Event::MucAvatar {
+                                account_id: cfg.account_id,
+                                room: room.to_string(),
+                                nick: nick.to_string(),
+                                data,
+                            })
+                            .await;
+                    } else {
+                        tracing::warn!(%from, "occupant vCard avatar does not match advertised hash; ignoring");
+                    }
                 }
             } else if !bare.eq_ignore_ascii_case(cfg.bare()) {
-                crate::xeps::avatar::fetch_best(w, events, cfg.account_id, &bare, false).await;
+                crate::xeps::avatar::fetch_for_hash(w, events, cfg.account_id, &bare, &hash).await;
             }
         }
     }
@@ -86,7 +91,17 @@ pub async fn handle_incoming(
         let is_self = x
             .children()
             .any(|c| c.name() == "status" && c.attr("code") == Some("110"));
-        if let Some((room, nick)) = from.split_once('/') {
+        // Only for a room we actually have (Conversations ignores MUC presence for rooms it
+        // hasn't joined). Creating the conversation here would let any sender spawn a fake room
+        // — or pin their own JID's conversation kind to "muc", turning their later 1:1
+        // messages into MUC-PMs without the SCE `<to>` binding.
+        let is_our_room = match from.split_once('/') {
+            Some((room, _)) => {
+                store.conversation_kind(cfg.account_id, room).await.ok().flatten().as_deref() == Some("muc")
+            }
+            None => false,
+        };
+        if let Some((room, nick)) = from.split_once('/').filter(|_| is_our_room) {
             if let Ok(conv) = store.conversation_id(cfg.account_id, room, "muc").await {
                 if ptype == "unavailable" {
                     let _ = store.remove_muc_occupant(conv, nick).await;
@@ -96,11 +111,10 @@ pub async fn handle_incoming(
                     let _ = store.upsert_muc_occupant(conv, nick, real, aff).await;
                 }
                 if is_self {
-                    if let Some(occ) = pres
-                        .get_child("occupant-id", "urn:xmpp:occupant-id:0")
-                        .and_then(|e| e.attr("id"))
+                    if let Some(occ) =
+                        super::origin::only_child_id(pres, "occupant-id", "urn:xmpp:occupant-id:0")
                     {
-                        let _ = store.set_muc_self_occupant(conv, occ).await;
+                        let _ = store.set_muc_self_occupant(conv, &occ).await;
                     }
                 }
             }

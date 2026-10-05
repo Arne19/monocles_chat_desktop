@@ -164,8 +164,18 @@ fn serde_json_array(items: &[String]) -> String {
     s
 }
 
+/// A fresh stanza/session id: `prefix-` + 128 random bits. Must be unguessable — iq ids,
+/// MAM query ids and Jingle session ids are what a remote party would have to know to forge
+/// a reply into one of our exchanges.
 pub(crate) fn new_id(prefix: &str) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    format!("{prefix}-{n}")
+    use rand::RngCore;
+    let mut raw = [0u8; 16];
+    rand::rng().fill_bytes(&mut raw);
+    let mut id = String::with_capacity(prefix.len() + 33);
+    id.push_str(prefix);
+    id.push('-');
+    for b in raw {
+        id.push_str(&format!("{b:02x}"));
+    }
+    id
 }

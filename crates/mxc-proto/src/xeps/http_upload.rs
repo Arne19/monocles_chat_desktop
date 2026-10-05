@@ -116,15 +116,29 @@ async fn request_slot(
     let get = slot.get_child("get", NS_UPLOAD).ok_or_else(|| anyhow::anyhow!("no <get>"))?;
     let put_url = put.attr("url").ok_or_else(|| anyhow::anyhow!("no put url"))?.to_string();
     let get_url = get.attr("url").ok_or_else(|| anyhow::anyhow!("no get url"))?.to_string();
-    let headers = put
-        .children()
-        .filter(|c| c.name() == "header")
-        .filter_map(|h| h.attr("name").map(|n| (n.to_string(), h.text())))
-        .collect();
+    let headers = allowed_headers(put);
     Ok(Slot { put_url, get_url, headers })
 }
 
 /// AES-256-GCM encrypt; returns `(iv‖key combo (44 bytes), ciphertext‖tag)`.
+/// XEP-0363 §5: only `Authorization`, `Cookie` and `Expires` may be taken from the slot, and
+/// their values must not contain newlines (header injection). Everything else the service
+/// sends is dropped, like Conversations' `Put.ALLOWED_HEADERS`.
+fn allowed_headers(put: &Element) -> Vec<(String, String)> {
+    const ALLOWED: [&str; 3] = ["Authorization", "Cookie", "Expires"];
+    put.children()
+        .filter(|c| c.name() == "header")
+        .filter_map(|h| {
+            let name = ALLOWED.iter().find(|a| h.attr("name").is_some_and(|n| n.eq_ignore_ascii_case(a)))?;
+            let value = h.text();
+            if value.contains(['\r', '\n']) {
+                return None;
+            }
+            Some((name.to_string(), value))
+        })
+        .collect()
+}
+
 fn aesgcm_encrypt(plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     use rand::RngCore;
     let mut combo = [0u8; 44]; // 12-byte IV + 32-byte key
@@ -264,5 +278,26 @@ pub fn guess_mime(filename: &str) -> &'static str {
         "webm" => "video/webm",
         "zip" => "application/zip",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn only_allowed_headers_survive() {
+        let put: Element = "<put xmlns='urn:xmpp:http:upload:0' url='https://u/x'>\
+            <header name='authorization'>Basic abc</header>\
+            <header name='Cookie'>a=b</header>\
+            <header name='Host'>evil.example</header>\
+            <header name='Expires'>Tue\nX-Injected: 1</header>\
+            </put>"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            allowed_headers(&put),
+            vec![("Authorization".to_string(), "Basic abc".to_string()), ("Cookie".to_string(), "a=b".to_string())]
+        );
     }
 }

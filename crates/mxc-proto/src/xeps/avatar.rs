@@ -57,6 +57,31 @@ pub async fn fetch_best(
     let _ = events.send(Event::Avatar { account_id, jid: jid.to_string(), data }).await;
 }
 
+/// Lowercase hex SHA-1 — the identifier XEP-0084 and XEP-0153 use for avatar images.
+pub fn sha1_hex(data: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    Sha1::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Live update for a contact whose presence advertised avatar `hash` (XEP-0153): the PEP avatar
+/// (self-verifying via its id) or else the vCard photo, which must hash to `hash` — otherwise
+/// nothing is emitted and the current avatar stays (Conversations: "Hash in vCard update did
+/// not match").
+pub async fn fetch_for_hash(w: &Writer, events: &Sender<Event>, account_id: i64, jid: &str, hash: &str) {
+    let data = match pep_photo(w, jid).await {
+        Ok(Some(bytes)) => bytes,
+        _ => match vcard::fetch_photo(w, jid).await.ok().flatten() {
+            Some(bytes) if sha1_hex(&bytes).eq_ignore_ascii_case(hash) => bytes,
+            Some(_) => {
+                tracing::warn!(%jid, "vCard avatar does not match advertised hash; ignoring");
+                return;
+            }
+            None => return,
+        },
+    };
+    let _ = events.send(Event::Avatar { account_id, jid: jid.to_string(), data }).await;
+}
+
 pub const NODE_METADATA: &str = "urn:xmpp:avatar:metadata";
 pub const NODE_DATA: &str = "urn:xmpp:avatar:data";
 pub const NS_METADATA: &str = "urn:xmpp:avatar:metadata";
@@ -82,6 +107,11 @@ pub async fn pep_photo(w: &Writer, jid: &str) -> anyhow::Result<Option<Vec<u8>>>
             let raw = B64
                 .decode(payload.text().trim())
                 .map_err(|e| anyhow::anyhow!("avatar base64: {e}"))?;
+            // XEP-0084: the item id IS the SHA-1 of the image — verify it (Conversations
+            // rejects in-band avatars whose hash doesn't match).
+            if !sha1_hex(&raw).eq_ignore_ascii_case(id) {
+                anyhow::bail!("avatar hash mismatch for {jid}");
+            }
             return Ok(Some(raw));
         }
     }
@@ -137,8 +167,7 @@ pub async fn publish(
     width: u32,
     height: u32,
 ) -> anyhow::Result<()> {
-    use sha1::{Digest, Sha1};
-    let id: String = Sha1::digest(data).iter().map(|b| format!("{b:02x}")).collect();
+    let id = sha1_hex(data);
     let payload = minidom::Element::builder("data", NS_DATA).append(B64.encode(data)).build();
     pep::publish(w, NODE_DATA, Some(&id), payload, Some(pep::publish_options("open"))).await?;
 

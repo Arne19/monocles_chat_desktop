@@ -8,6 +8,8 @@ import QtWebEngine
 Window {
     id: win
     property string thread: ""
+    // The instance's private origin host (webxdc://<appHost>/ — one origin per app instance).
+    property string appHost: ""
     width: 420
     height: 640
     title: qsTr("WebXDC app")
@@ -20,23 +22,31 @@ Window {
         web.runJavaScript("window.__webxdcRealtimeData('" + b64 + "');")
     }
 
-    onClosing: backend.closeWebxdc()
+    // Destroy (not just hide) the window, or the app's page would keep running in the
+    // background after it was closed.
+    onClosing: {
+        backend.closeWebxdc()
+        win.destroy()
+    }
 
     WebEngineView {
         id: web
         anchors.fill: parent
-        url: "webxdc://app/index.html"
+        url: win.appHost ? "webxdc://" + win.appHost + "/index.html" : "about:blank"
         backgroundColor: "white"
         settings.playbackRequiresUserGesture: false
         settings.webGLEnabled: true
         settings.localContentCanAccessRemoteUrls: false
         settings.screenCaptureEnabled: false
 
-        // Keep the app offline: only our private scheme may navigate; real links open in the
-        // user's browser instead (matches monocles Android + the GTK client).
+        // Untrusted app: never grant camera/microphone/screen capture/location/notifications.
+        onPermissionRequested: (permission) => permission.deny()
+
+        // Keep the app offline and on its own origin: only its private host may navigate; real
+        // links open in the user's browser instead (matches monocles Android + the GTK client).
         onNavigationRequested: (request) => {
             const u = request.url.toString()
-            if (!u.startsWith("webxdc:") && u !== "about:blank") {
+            if (!u.startsWith("webxdc://" + win.appHost + "/") && u !== "about:blank") {
                 request.action = WebEngineNavigationRequest.IgnoreRequest
                 if (u.startsWith("http://") || u.startsWith("https://"))
                     Qt.openUrlExternally(request.url)

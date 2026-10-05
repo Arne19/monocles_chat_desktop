@@ -1178,6 +1178,8 @@ pub async fn handle_incoming(
     }
 
     // --- MAM (XEP-0313): <result><forwarded><delay/><message/></forwarded></result> ---
+    // Already vetted by `mam::screen_result` on the reader loop (queryid, archive `from`,
+    // and in-room inner `from` for MUC archives).
     if let Some(result) = msg.get_child("result", NS_MAM) {
         if let Some(fwd) = result.get_child("forwarded", NS_FORWARD) {
             if let Some(inner) = fwd.get_child("message", NS_CLIENT) {
@@ -1196,6 +1198,22 @@ pub async fn handle_incoming(
     let dir = direction_of(msg, cfg.bare());
     let ts = delay_stamp(msg);
     process_payload(w, store, cfg, events, msg, dir, ts, /*live=*/ true, None).await
+}
+
+/// Which stored messages an incoming correction/retraction may target: `(direction, occupant
+/// id filter)` for [`Store::find_from_sender`], or `None` if it may target none. Our own
+/// side may edit our own messages. A MUC participant is identified by their XEP-0421
+/// occupant id — without one a MUC edit can't be attributed and is refused (nicks are
+/// reusable), exactly like Conversations. In 1:1 / MUC-PM the conversation already pins the
+/// counterpart, so the direction suffices.
+fn sender_filter<'a>(kind: &str, own_side: bool, occupant_id: Option<&'a str>) -> Option<(&'static str, Option<&'a str>)> {
+    if own_side {
+        Some(("out", None))
+    } else if kind == "muc" {
+        occupant_id.map(|occ| ("in", Some(occ)))
+    } else {
+        Some(("in", None))
+    }
 }
 
 /// Tolerated skew for the SCE `<time>` binding (proto-XEP §4.6.2): ±7 days, generous
@@ -1310,6 +1328,7 @@ async fn persist_decrypt_failure(
     direction: Direction,
     ts: &str,
     occupant_id: Option<String>,
+    stanza_id: Option<String>,
     live: bool,
 ) {
     if msg.get_child("body", NS_CLIENT).is_none() {
@@ -1317,10 +1336,6 @@ async fn persist_decrypt_failure(
     }
     let origin_id =
         msg.get_child("origin-id", NS_SID).and_then(|e| e.attr("id").map(str::to_string));
-    let stanza_id = msg
-        .children()
-        .find(|c| c.name() == "stanza-id" && c.ns() == NS_SID)
-        .and_then(|e| e.attr("id").map(str::to_string));
     let row = NewMessage {
         conversation_id: conv,
         stanza_id,
@@ -1387,6 +1402,17 @@ async fn process_payload(
         (bare.as_str(), "chat")
     };
     let conv = store.conversation_id(cfg.account_id, conv_key, kind).await?;
+    // The canonical id for reactions/retractions/dedup is the `<stanza-id>` stamped by the
+    // *relevant* archive — the room for a MUC, our account otherwise — and only if that archive
+    // advertises XEP-0359 (else the sender could have forged it; see stanza_id.rs). Failing
+    // that, the MAM `<result id>` (already vetted by mam::screen_result). Never an arbitrary
+    // `<stanza-id>`: its `by` is sender-controlled. Note: a MUC message can also arrive via the
+    // account archive, where the MAM result id is the account id, *not* the room id —
+    // preferring the by=room `<stanza-id>` keeps everyone's reactions on the same key.
+    let want_by = if kind == "muc" { bare.as_str() } else { cfg.bare() };
+    // Delivered as a (screened) MAM result rather than live or as a carbon.
+    let from_archive = mam_id.is_some();
+    let stanza_id = super::stanza_id::trusted(msg, cfg.account_id, want_by).or(mam_id);
     // Effective message timestamp (delay-corrected) for the stored row.
     let ts = ts_override.unwrap_or_else(|| crate::xeps::rfc3339_now());
 
@@ -1395,9 +1421,8 @@ async fn process_payload(
 
     // XEP-0421 occupant id (MUC). If this stanza is from our own nick, it tells us our own
     // occupant id — remember it so we can attribute/toggle our own reactions consistently.
-    let occupant_id = msg
-        .get_child("occupant-id", NS_OCCUPANT)
-        .and_then(|e| e.attr("id").map(str::to_string));
+    // Only an unambiguous one (exactly one element) counts - see origin::only_child_id.
+    let occupant_id = super::origin::only_child_id(msg, "occupant-id", NS_OCCUPANT);
     // For an OMEMO MUC message the crypto sender is the occupant's *real* bare JID (we encrypt
     // to/decrypt under real JIDs, never the room JID). Resolve it from the message's
     // `<x muc#user><item jid>` (preferred — also refreshes our occupant cache) or, failing
@@ -1406,20 +1431,21 @@ async fn process_payload(
     let mut is_own_muc_echo = false;
     if kind == "muc" {
         let nick = from.split('/').nth(1).unwrap_or("").to_string();
-        // A real JID carried on this very stanza (live presence-bearing message or MAM copy).
-        let item_jid = msg
-            .get_child("x", NS_MUC_USER)
-            .and_then(|x| x.get_child("item", NS_MUC_USER))
-            .and_then(|item| item.attr("jid").map(str::to_string));
+        // A real JID carried on the stanza itself. Only the room's own archive attaches this
+        // authoritatively (the copy reached us via mam::screen_result, from the room); on a live
+        // message the `<x muc#user>` may have been written by the sending occupant — many
+        // services pass client payloads through — so it could claim anyone's real JID. Live
+        // messages resolve through the presence-derived occupant table instead (Conversations:
+        // the true counterpart is only read from a message for MAM results). It never updates
+        // that table: an archived nick→JID mapping may be stale.
+        let item_jid = if from_archive {
+            msg.get_child("x", NS_MUC_USER)
+                .and_then(|x| x.get_child("item", NS_MUC_USER))
+                .and_then(|item| item.attr("jid").map(str::to_string))
+        } else {
+            None
+        };
         if !nick.is_empty() {
-            if let Some(real) = &item_jid {
-                let real_bare = real.split('/').next().unwrap_or(real);
-                let aff = msg
-                    .get_child("x", NS_MUC_USER)
-                    .and_then(|x| x.get_child("item", NS_MUC_USER))
-                    .and_then(|item| item.attr("affiliation"));
-                let _ = store.upsert_muc_occupant(conv, &nick, Some(real_bare), aff).await;
-            }
             let resolved = item_jid
                 .as_deref()
                 .map(|j| j.split('/').next().unwrap_or(j).to_string())
@@ -1453,11 +1479,7 @@ async fn process_payload(
     // our own messages resolve. (Plaintext echoes still flow through the normal dedup below.)
     if is_own_muc_echo && msg.get_child("encrypted", omemo::NS_OMEMO2).is_some() {
         if let Some(origin) = msg.get_child("origin-id", NS_SID).and_then(|e| e.attr("id")) {
-            let stanza_id = msg
-                .children()
-                .find(|c| c.name() == "stanza-id" && c.ns() == NS_SID && c.attr("by") == Some(bare.as_str()))
-                .and_then(|e| e.attr("id"));
-            if let Some(sid) = stanza_id {
+            if let Some(sid) = &stanza_id {
                 let _ = store.backfill_stanza_id(conv, origin, sid, occupant_id.as_deref()).await;
             }
         }
@@ -1538,7 +1560,7 @@ async fn process_payload(
                                 tracing::warn!(%reason, "omemo SCE binding rejected");
                                 persist_decrypt_failure(
                                     store, cfg, events, msg, conv, &counterpart_full,
-                                    direction, &ts, occupant_id.clone(), live,
+                                    direction, &ts, occupant_id.clone(), stanza_id.clone(), live,
                                 )
                                 .await;
                                 return Ok(());
@@ -1551,7 +1573,7 @@ async fn process_payload(
                                     tracing::warn!(error = %e, "omemo SCE content parse failed");
                                     persist_decrypt_failure(
                                         store, cfg, events, msg, conv, &counterpart_full,
-                                        direction, &ts, occupant_id.clone(), live,
+                                        direction, &ts, occupant_id.clone(), stanza_id.clone(), live,
                                     )
                                     .await;
                                     return Ok(());
@@ -1562,7 +1584,7 @@ async fn process_payload(
                             tracing::warn!(error = %e, "omemo SCE parse failed");
                             persist_decrypt_failure(
                                 store, cfg, events, msg, conv, &counterpart_full,
-                                direction, &ts, occupant_id.clone(), live,
+                                direction, &ts, occupant_id.clone(), stanza_id.clone(), live,
                             )
                             .await;
                             return Ok(());
@@ -1575,7 +1597,7 @@ async fn process_payload(
                     // loss would hide tampering or session breakage from the user)…
                     persist_decrypt_failure(
                         store, cfg, events, msg, conv, &counterpart_full,
-                        direction, &ts, occupant_id.clone(), live,
+                        direction, &ts, occupant_id.clone(), stanza_id.clone(), live,
                     )
                     .await;
                     // …then recover: couldn't decrypt a message from this peer (e.g. a stale
@@ -1602,17 +1624,20 @@ async fn process_payload(
             (msg.clone(), "none", None)
         };
 
+    // Whether this stanza was sent by us (another of our devices, or our own MUC reflection,
+    // which arrives as Direction::In from our nick).
+    let own_side = direction == Direction::Out || is_own_muc_echo;
+
     // --- markers (0333) / receipts (0184) / chat-states (0085) from the content ---
-    if let Some(received) = content.get_child("received", NS_RECEIPTS) {
-        if let Some(id) = received.attr("id") {
-            store.set_message_state(id, "received").await?;
-            let _ = events.send(Event::MessageState { marker_id: id.into(), state: "received".into() }).await;
-        }
-    }
-    if let Some(displayed) = content.get_child("displayed", NS_MARKERS) {
-        if let Some(id) = displayed.attr("id") {
-            store.set_message_state(id, "displayed").await?;
-            let _ = events.send(Event::MessageState { marker_id: id.into(), state: "displayed".into() }).await;
+    // Only the counterpart (an incoming stanza in this conversation) can confirm delivery/read
+    // of one of *our* messages in this conversation. Our own devices' markers (carbons/echoes)
+    // say nothing about the peer, and an id from another conversation is never touched.
+    let from_peer = direction == Direction::In && !is_own_muc_echo;
+    for (el, ns, state) in [("received", NS_RECEIPTS, "received"), ("displayed", NS_MARKERS, "displayed")] {
+        if let Some(id) = content.get_child(el, ns).and_then(|e| e.attr("id")) {
+            if from_peer && store.mark_outgoing_state(conv, id, state).await? {
+                let _ = events.send(Event::MessageState { marker_id: id.into(), state: state.into() }).await;
+            }
         }
     }
     if live {
@@ -1673,12 +1698,35 @@ async fn process_payload(
     }
 
     // XEP-0424 retraction.
+    // Only the original sender may retract (find_from_sender); in a MUC the room itself may
+    // additionally moderate (XEP-0425: from the bare room JID, targeting the room stanza-id).
     if let Some(retract) = content.get_child("retract", NS_RETRACT) {
         if let Some(target) = retract.attr("id") {
-            if let Some((mid, old_body)) = store.retract_message(conv, target).await? {
-                let _ = events.send(Event::MessageRetracted {
-                    account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
-                }).await;
+            let is_moderation = kind == "muc"
+                && !from.contains('/')
+                && retract.children().any(|c| c.name() == "moderated");
+            let mid = if is_moderation {
+                store.find_by_stanza_id(conv, target).await?
+            } else {
+                match sender_filter(kind, own_side, occupant_id.as_deref()) {
+                    // Like corrections: an encrypted message can only be retracted under the
+                    // same OMEMO fingerprint, else the peer's server could forge a plaintext
+                    // retraction and delete it. (OMEMO2 retractions travel inside the SCE
+                    // envelope on both clients, so this costs no legitimate retraction.)
+                    Some((dir, occ)) => {
+                        store.find_from_sender(conv, target, dir, occ, Some(fingerprint.as_deref())).await?
+                    }
+                    None => None,
+                }
+            };
+            match mid {
+                Some(mid) => {
+                    let old_body = store.retract_message_id(mid).await?;
+                    let _ = events.send(Event::MessageRetracted {
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                    }).await;
+                }
+                None => tracing::debug!(%from, %target, "ignoring retraction: no message from this sender"),
             }
         }
         return Ok(());
@@ -1808,9 +1856,18 @@ async fn process_payload(
     };
 
     // XEP-0308 correction of an existing message.
+    // Only the original sender may correct (find_from_sender); a correction that matches no
+    // message of theirs falls through and is shown as a new message, like Conversations.
     if let Some(replace) = content.get_child("replace", NS_CORRECT) {
         if let Some(target) = replace.attr("id") {
-            if let Some(mid) = store.apply_correction(conv, target, &body).await? {
+            let mid = match sender_filter(kind, own_side, occupant_id.as_deref()) {
+                Some((dir, occ)) => {
+                    store.find_from_sender(conv, target, dir, occ, Some(fingerprint.as_deref())).await?
+                }
+                None => None,
+            };
+            if let Some(mid) = mid {
+                store.correct_message(mid, target, &body, encryption, fingerprint.as_deref()).await?;
                 if let Some(row) = fetch_row(store, conv, mid).await {
                     let _ = events.send(Event::MessageEdited {
                         account_id: cfg.account_id, conversation_id: conv, message: row,
@@ -1822,24 +1879,6 @@ async fn process_payload(
     }
 
     let origin_id = msg.get_child("origin-id", NS_SID).and_then(|e| e.attr("id").map(str::to_string));
-    // A stanza may carry several <stanza-id>s (e.g. one stamped by the MUC, one by our own
-    // account archive). Reactions reference the id assigned by the *relevant* archive — the
-    // room for a MUC, our account for 1:1 — so prefer the one whose `by` matches; fall back to
-    // the first if none is tagged.
-    let want_by = if kind == "muc" { bare.as_str() } else { cfg.bare() };
-    let stanza_ids = || msg.children().filter(|c| c.name() == "stanza-id" && c.ns() == NS_SID);
-    // The canonical id for reactions is the `<stanza-id>` stamped by the *relevant* archive —
-    // the room for a MUC, our account for 1:1 — so prefer that. Only if the message carries no
-    // such element do we fall back to the MAM `<result id>` (e.g. a forwarded copy that omitted
-    // its stanza-id), then to the first stanza-id. Note: a MUC message can also arrive via the
-    // account archive (e.g. a roster contact in a public room), where the MAM result id is the
-    // account id, *not* the room id — preferring the by=room `<stanza-id>` keeps everyone's
-    // reactions on the same key.
-    let stanza_id = stanza_ids()
-        .find(|c| c.attr("by") == Some(want_by))
-        .and_then(|e| e.attr("id").map(str::to_string))
-        .or(mam_id)
-        .or_else(|| stanza_ids().next().and_then(|e| e.attr("id").map(str::to_string)));
     let reply_to = content.get_child("reply", NS_REPLY).and_then(|e| e.attr("id").map(str::to_string));
 
     // For MUC notification filtering: is this incoming message a highlight (mentions our
@@ -2581,5 +2620,20 @@ mod file_caption_tests {
             "<fallback xmlns='{NS_FALLBACK}' for='{NS_SFS}'/>"
         ));
         assert_eq!(strip_fallback_spans(&content, "anything", &[NS_SFS]), "");
+    }
+}
+
+#[cfg(test)]
+mod sender_filter_tests {
+    use super::sender_filter;
+
+    #[test]
+    fn muc_edits_need_occupant_id() {
+        assert_eq!(sender_filter("muc", false, Some("occ")), Some(("in", Some("occ"))));
+        assert_eq!(sender_filter("muc", false, None), None);
+        assert_eq!(sender_filter("muc", true, None), Some(("out", None)));
+        assert_eq!(sender_filter("chat", false, None), Some(("in", None)));
+        assert_eq!(sender_filter("chat", true, None), Some(("out", None)));
+        assert_eq!(sender_filter("muc_pm", false, None), Some(("in", None)));
     }
 }

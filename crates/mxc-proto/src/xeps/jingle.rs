@@ -303,6 +303,35 @@ fn ack(w: &Writer, iq: &Element) {
     let _ = w.send(b.build());
 }
 
+/// Reject a Jingle IQ for a session that doesn't exist (or isn't the sender's) with
+/// `item-not-found` + `<unknown-session/>` (XEP-0166 §8).
+fn unknown_session(w: &Writer, iq: &Element) {
+    let mut b = Element::builder("iq", NS_CLIENT).attr(crate::ncname("type"), "error");
+    if let Some(from) = iq.attr("from") {
+        b = b.attr(crate::ncname("to"), from);
+    }
+    if let Some(id) = iq.attr("id") {
+        b = b.attr(crate::ncname("id"), id);
+    }
+    let error = Element::builder("error", NS_CLIENT)
+        .attr(crate::ncname("type"), "cancel")
+        .append(Element::builder("item-not-found", "urn:ietf:params:xml:ns:xmpp-stanzas").build())
+        .append(Element::builder("unknown-session", "urn:xmpp:jingle:errors:1").build())
+        .build();
+    let _ = w.send(b.append(error).build());
+}
+
+/// Whether a JMI message for `sid` comes from that call's peer (bare JID): the contact we
+/// rang, or who rang us. Session ids are only unguessable, not secret from the peer's server,
+/// so the sender must match too (Conversations keys sessions by (peer, sid)).
+fn jmi_from_peer(calls: &CallRegistry, sid: &str, from: &str) -> bool {
+    calls
+        .borrow()
+        .meta
+        .get(sid)
+        .is_some_and(|m| m.peer.eq_ignore_ascii_case(bare(from)))
+}
+
 /// Pull `(ufrag, pwd, mid)` out of our local SDP for addressing trickle `transport-info`.
 /// Takes the **first** of each: with BUNDLE the single ICE transport lives on the first m-line
 /// (the bundle owner, e.g. `audio0`); the later video m-line is `bundle-only` and must NOT be
@@ -822,6 +851,10 @@ pub async fn handle_message(
             emit(events, cfg.account_id, &sid, &peer_bare, video, CallState::Incoming).await;
         }
         "proceed" => {
+            if !jmi_from_peer(calls, &sid, &from) {
+                tracing::warn!(%sid, %from, "ignoring JMI proceed from someone we didn't call");
+                return true;
+            }
             // The peer accepted our call → bring up the caller engine (it offers).
             let proposed = calls.borrow_mut().proposed.remove(&sid);
             if let Some(video) = proposed {
@@ -831,6 +864,9 @@ pub async fn handle_message(
                 }
                 emit(events, cfg.account_id, &sid, &peer_bare, video, CallState::Connecting).await;
             }
+        }
+        "reject" | "retract" | "finish" if !jmi_from_peer(calls, &sid, &from) => {
+            tracing::warn!(%sid, %from, %action, "ignoring JMI from someone not in this call");
         }
         "reject" => {
             terminate_local(calls, &sid);
@@ -859,11 +895,38 @@ pub async fn handle_iq(
     let Some(jingle) = iq.get_child("jingle", jingle_sdp::NS_JINGLE) else {
         return false;
     };
-    ack(w, iq); // every Jingle IQ gets an empty result
     let action = jingle.attr("action").unwrap_or("");
-    let Some(sid) = jingle.attr("sid").map(str::to_string) else { return true };
+    let Some(sid) = jingle.attr("sid").map(str::to_string) else {
+        ack(w, iq);
+        return true;
+    };
     let from = iq.attr("from").unwrap_or_default().to_string();
     tracing::debug!(%action, %sid, %from, "Jingle session IQ received");
+
+    // SECURITY: a session is bound to the full JID it was negotiated with (Conversations keys
+    // sessions by (peer, sid)). Without this, anyone who learned a sid could answer our offer
+    // (session-accept → the call connects to them), inject ICE candidates or hang us up.
+    // The only session that may start here is a Muji leg, which has its own participant check
+    // below; a caller may also terminate a call that's still ringing in.
+    let bound = calls.borrow().active.get(&sid).map(|c| super::origin::jid_eq(&c.peer_full, &from));
+    let allowed = match bound {
+        Some(ok) => ok,
+        None => {
+            (action == "session-initiate" && jingle.get_child("muji", muji::NS_MUJI).is_some())
+                || (action == "session-terminate"
+                    && calls
+                        .borrow()
+                        .incoming
+                        .get(&sid)
+                        .is_some_and(|(caller, _)| super::origin::jid_eq(caller, &from)))
+        }
+    };
+    if !allowed {
+        tracing::warn!(%action, %sid, %from, "rejecting Jingle IQ for a session that isn't the sender's");
+        unknown_session(w, iq);
+        return true;
+    }
+    ack(w, iq); // every accepted Jingle IQ gets an empty result
 
     match action {
         "session-initiate" | "session-accept" => {

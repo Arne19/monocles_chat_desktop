@@ -372,9 +372,10 @@ ApplicationWindow {
         }
         // WebXDC: the opened app is extracted + served → create its window (dynamically, so
         // the app still runs on systems without QtWebEngine installed).
-        function onWebxdcReady(thread) {
+        function onWebxdcReady(thread, host) {
             if (window.webxdcWin) {
-                window.webxdcWin.close()
+                // destroy, not just close: a hidden app would keep running in the background
+                window.webxdcWin.destroy()
                 window.webxdcWin = null
             }
             var comp = Qt.createComponent("WebxdcWindow.qml")
@@ -382,7 +383,7 @@ ApplicationWindow {
                 console.warn("WebXDC unavailable:", comp.errorString())
                 return
             }
-            window.webxdcWin = comp.createObject(window, { thread: thread })
+            window.webxdcWin = comp.createObject(window, { thread: thread, appHost: host })
             if (window.webxdcWin)
                 window.webxdcWin.show()
         }

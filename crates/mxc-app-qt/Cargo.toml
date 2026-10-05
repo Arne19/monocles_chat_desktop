@@ -43,6 +43,8 @@ base64 = "0.22"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 # Parse the WebXDC JS bridge messages (sendUpdate/sendToChat payloads).
 serde_json = "1"
+# Per-instance WebXDC origin (webxdc::instance_host).
+sha2 = { workspace = true }
 # Render our own verification URI as a QR code (pure Rust, no image/SVG plugin needed: QML
 # draws the module matrix on a Canvas).
 qrcode = { version = "0.14", default-features = false }

@@ -271,7 +271,13 @@ impl CoreActor {
                                 }
                             };
                             // Resolve awaited iq replies first; otherwise dispatch.
-                            if xeps::iq::try_resolve(&stanza) {
+                            if xeps::iq::try_resolve(&stanza, cfg.bare()) {
+                                continue;
+                            }
+                            // Vet MAM results here, in stream order: their query is
+                            // unregistered as soon as its iq reply (resolved above) arrives,
+                            // which a spawned handler could otherwise race.
+                            if !xeps::mam::screen_result(&stanza, cfg.account_id, cfg.bare()) {
                                 continue;
                             }
                             // Spawn the handler so the reader loop stays free to deliver
@@ -955,7 +961,7 @@ impl CoreActor {
                 Ok(())
             }
             Command::RetractStory { account_id, uuid } => {
-                xeps::stories::retract(w, &self.store, &uuid).await?;
+                xeps::stories::retract(w, &self.store, cfg, &uuid).await?;
                 let _ = self.events.send(Event::StoriesUpdated { account_id }).await;
                 Ok(())
             }

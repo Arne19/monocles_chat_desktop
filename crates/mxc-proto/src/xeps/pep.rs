@@ -126,6 +126,28 @@ pub fn extract_items(reply: &Element) -> Vec<(Option<String>, Element)> {
     out
 }
 
+/// Like [`extract_items`], plus each item's service-stamped `publisher` attribute (present when
+/// the node has `pubsub#itempublisher` enabled): `(item id, publisher, payload)`.
+pub fn extract_items_with_publisher(reply: &Element) -> Vec<(Option<String>, Option<String>, Element)> {
+    let mut out = Vec::new();
+    let Some(items) = reply
+        .get_child("pubsub", NS_PUBSUB)
+        .and_then(|p| p.get_child("items", NS_PUBSUB))
+    else {
+        return out;
+    };
+    for item in items.children().filter(|c| c.name() == "item") {
+        if let Some(payload) = item.children().next() {
+            out.push((
+                item.attr("id").map(str::to_string),
+                item.attr("publisher").map(str::to_string),
+                payload.clone(),
+            ));
+        }
+    }
+    out
+}
+
 /// Build a `pubsub#publish-options` data form pinning an access model (e.g. "open").
 pub fn publish_options(access_model: &str) -> Element {
     let field_form_type = Element::builder("field", "jabber:x:data")
