@@ -97,6 +97,15 @@ fn main() {
     // via RUSTFLAGS in the Flatpak manifest) and the shim's includes resolve independently
     // (QT_INSTALL_HEADERS locally, -I/app/include in Flatpak), so the compile step is unaffected.
     // Emitted after build() so cxx-qt's static-shim link directive precedes these dynamic libs.
-    println!("cargo::rustc-link-lib=Qt6WebEngineQuick");
-    println!("cargo::rustc-link-lib=Qt6WebEngineCore");
+    //
+    // QtWebEngine ships as macOS *frameworks* (QtWebEngineQuick.framework /
+    // QtWebEngineCore.framework - no "6" in the bundle name), so `-lQt6WebEngine...`
+    // (the `lib...` convention used on Linux) can't resolve them.
+    let (quick, core) = if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        ("framework=QtWebEngineQuick", "framework=QtWebEngineCore")
+    } else {
+        ("Qt6WebEngineQuick", "Qt6WebEngineCore")
+    };
+    println!("cargo::rustc-link-lib={quick}");
+    println!("cargo::rustc-link-lib={core}");
 }
