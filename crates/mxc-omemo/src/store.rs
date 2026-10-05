@@ -293,7 +293,7 @@ impl KyberPreKeyStore for KyberPreKeyStoreImpl {
             {
                 return Err(SignalProtocolError::InvalidMessage(
                     libsignal_protocol::CiphertextMessageType::PreKey,
-                    "kyber last-resort prekey replayed",
+                    "kyber last-resort prekey replayed".to_owned(),
                 ));
             }
             self.store
