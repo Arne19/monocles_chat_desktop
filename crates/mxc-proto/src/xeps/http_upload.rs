@@ -364,7 +364,10 @@ pub fn guess_mime(filename: &str) -> &'static str {
         "ogg" | "oga" => "audio/ogg",
         "opus" => "audio/opus",
         "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "3gp" => "video/3gpp",
         "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
         "zip" => "application/zip",
         _ => "application/octet-stream",
     }

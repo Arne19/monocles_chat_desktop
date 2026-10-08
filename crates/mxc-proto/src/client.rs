@@ -331,7 +331,7 @@ impl CoreActor {
                             enum FailCtx {
                                 Msg { to: String, body: String },
                                 File { name: String },
-                                Story,
+                                Publish { what: &'static str },
                                 Other,
                             }
                             let fail_ctx = match &cmd {
@@ -357,7 +357,8 @@ impl CoreActor {
                                         n => format!("{n} files"),
                                     },
                                 },
-                                Command::PublishStory { .. } => FailCtx::Story,
+                                Command::PublishStory { .. } => FailCtx::Publish { what: "story" },
+                                Command::PublishPost { .. } => FailCtx::Publish { what: "post" },
                                 _ => FailCtx::Other,
                             };
                             let is_online = online.get();
@@ -378,10 +379,11 @@ impl CoreActor {
                                                 important: true,
                                             }).await;
                                         }
-                                        FailCtx::Story => {
-                                            let _ = actor.events.send(Event::Toast {
-                                                text: format!("Couldn't post story: {e}"),
-                                                important: true,
+                                        FailCtx::Publish { what } => {
+                                            let _ = actor.events.send(Event::PublishDone {
+                                                account_id: cfg.account_id,
+                                                what: what.to_string(),
+                                                error: Some(format!("{e:#}")),
                                             }).await;
                                         }
                                         FailCtx::Other => {
@@ -934,17 +936,15 @@ impl CoreActor {
                 Ok(())
             }
             Command::PublishStory { account_id, path, title } => {
-                let bytes = tokio::fs::read(&path).await?;
-                let filename = std::path::Path::new(&path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "story".into());
-                let mime = xeps::http_upload::guess_mime(&filename);
-                let url = xeps::http_upload::upload_plain(w, cfg, &bytes, &filename, mime).await?;
-                xeps::stories::publish(w, cfg, &url, mime, &title).await?;
-                // Refresh our own stories so the new one shows.
+                let (url, mime) = upload_broadcast_media(w, cfg, &path).await?;
+                xeps::stories::publish(w, cfg, &url, &mime, &title).await?;
+                // Don't depend on the PEP echo (+notify) to show our own story.
                 xeps::stories::fetch(w, &self.store, cfg, None).await;
                 let _ = self.events.send(Event::StoriesUpdated { account_id }).await;
+                let _ = self
+                    .events
+                    .send(Event::PublishDone { account_id, what: "story".into(), error: None })
+                    .await;
                 Ok(())
             }
             Command::FetchStories { account_id } => {
@@ -966,59 +966,75 @@ impl CoreActor {
                 Ok(())
             }
             Command::FetchFeed { account_id, jid } => {
-                let posts = xeps::microblog::fetch(w, Some(&jid), &jid).await;
-                let _ = self.events.send(Event::FeedPosts { account_id, jid, posts }).await;
+                xeps::microblog::refresh(w, &self.store, account_id, &self.events, Some(&jid), &jid).await;
                 Ok(())
             }
-            Command::PublishPost { account_id, title, content } => {
-                xeps::microblog::publish_post(w, cfg, &title, &content).await?;
+            Command::PublishPost { account_id, title, content, attachment_path, attachment, link, edit } => {
+                let attachment = if attachment_path.is_empty() {
+                    attachment
+                } else {
+                    Some(upload_broadcast_media(w, cfg, &attachment_path).await?)
+                };
+                let extras = xeps::microblog::PostExtras {
+                    attachment,
+                    link: Some(link).filter(|l| !l.trim().is_empty()),
+                    edit,
+                };
+                xeps::microblog::publish_post(w, cfg, &title, &content, &extras).await?;
                 // Re-fetch our own feed so the new post shows up.
-                let posts = xeps::microblog::fetch(w, None, cfg.bare()).await;
+                xeps::microblog::refresh(w, &self.store, account_id, &self.events, None, cfg.bare()).await;
                 let _ = self
                     .events
-                    .send(Event::FeedPosts { account_id, jid: cfg.bare().to_string(), posts })
+                    .send(Event::PublishDone { account_id, what: "post".into(), error: None })
                     .await;
                 Ok(())
             }
-            Command::FetchComments { account_id, post_author, post_id } => {
-                let comments = xeps::microblog::fetch_comments(w, &post_author, &post_id).await;
-                let _ = self
-                    .events
-                    .send(Event::FeedComments { account_id, post_id, comments })
-                    .await;
+            Command::FetchComments { account_id, service, node } => {
+                let comments = xeps::microblog::fetch_comments(w, &service, &node).await;
+                let _ = self.events.send(Event::FeedComments { account_id, service, node, comments }).await;
                 Ok(())
             }
-            Command::PublishComment { account_id, post_author, post_id, content } => {
-                xeps::microblog::publish_comment(w, cfg, &post_author, &post_id, &content).await?;
-                // Re-fetch the post's comments so the new one shows up.
-                let comments = xeps::microblog::fetch_comments(w, &post_author, &post_id).await;
-                let _ = self
-                    .events
-                    .send(Event::FeedComments { account_id, post_id, comments })
-                    .await;
+            Command::PublishComment { account_id, service, node, content } => {
+                xeps::microblog::publish_comment(w, cfg, &service, &node, &content).await?;
+                // Re-fetch the comments so the new one shows up.
+                let comments = xeps::microblog::fetch_comments(w, &service, &node).await;
+                let _ = self.events.send(Event::FeedComments { account_id, service, node, comments }).await;
                 Ok(())
             }
             Command::RetractPost { account_id, post_id } => {
                 xeps::pep::retract(w, xeps::microblog::NS_MICROBLOG, &post_id).await?;
-                let posts = xeps::microblog::fetch(w, None, cfg.bare()).await;
-                let _ = self
-                    .events
-                    .send(Event::FeedPosts { account_id, jid: cfg.bare().to_string(), posts })
-                    .await;
+                let _ = self.store.delete_feed_post(account_id, cfg.bare(), &post_id).await;
+                xeps::microblog::refresh(w, &self.store, account_id, &self.events, None, cfg.bare()).await;
                 Ok(())
             }
-            Command::RetractComment { account_id, post_author, post_id, comment_id } => {
-                xeps::microblog::retract_comment(w, &post_author, &post_id, &comment_id).await?;
-                let comments = xeps::microblog::fetch_comments(w, &post_author, &post_id).await;
-                let _ = self
-                    .events
-                    .send(Event::FeedComments { account_id, post_id, comments })
-                    .await;
+            Command::RetractComment { account_id, service, node, comment_id } => {
+                xeps::microblog::retract_comment(w, &service, &node, &comment_id).await?;
+                let comments = xeps::microblog::fetch_comments(w, &service, &node).await;
+                let _ = self.events.send(Event::FeedComments { account_id, service, node, comments }).await;
                 Ok(())
             }
             Command::Connect { .. } | Command::Disconnect { .. } | Command::Shutdown => Ok(()),
         }
     }
+}
+
+/// Prepare and upload a file for a public broadcast (Story / feed post attachment): read it,
+/// strip its metadata (refusing media that can't be cleaned, see [`crate::media_strip`]) and
+/// upload it unencrypted under a random name — the original file name can identify too.
+/// Returns the URL and the uploaded type.
+async fn upload_broadcast_media(w: &Writer, cfg: &AccountConfig, path: &str) -> anyhow::Result<(String, String)> {
+    let bytes = tokio::fs::read(path).await?;
+    let ext = std::path::Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| "bin".into());
+    let fallback = xeps::http_upload::guess_mime(&format!("x.{ext}"));
+    let (bytes, mime) =
+        tokio::task::spawn_blocking(move || crate::media_strip::prepare_for_broadcast(bytes, fallback)).await??;
+    let name = format!("{}.{ext}", xeps::microblog::uuid_v4());
+    let url = xeps::http_upload::upload_plain(w, cfg, &bytes, &name, &mime).await?;
+    Ok((url, mime))
 }
 
 /// The fingerprint to display for one OMEMO2 device: the *hybrid* (classical + ML-DSA-87)

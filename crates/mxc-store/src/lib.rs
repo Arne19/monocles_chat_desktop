@@ -18,6 +18,7 @@ const DB_KEY_ACCOUNT: &str = "@local";
 
 pub mod accounts;
 pub mod calls;
+pub mod feeds;
 pub mod roster;
 pub mod messages;
 pub mod omemo;
@@ -28,6 +29,7 @@ pub mod webxdc;
 
 pub use accounts::Account;
 pub use calls::CallLogEntry;
+pub use feeds::FeedPostRow;
 pub use messages::{
     Conversation, Direction, MamCursor, MessageRow, MessageSearchRow, NewMessage, PendingMessage,
 };

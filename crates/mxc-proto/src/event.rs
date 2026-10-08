@@ -5,8 +5,8 @@
 
 use mxc_store::{Conversation, MessageRow, RosterItem};
 
-/// One microblog (XEP-0277) post in a social feed.
-#[derive(Debug, Clone)]
+/// One microblog (XEP-0277) post in a social feed, or one comment on a post.
+#[derive(Debug, Clone, Default)]
 pub struct FeedPost {
     /// PubSub item id (or the entry's atom uuid) — stable id for the post.
     pub id: String,
@@ -21,6 +21,10 @@ pub struct FeedPost {
     /// An attached media URL (atom `<link rel="enclosure">`) + its MIME, or empty.
     pub attachment_url: String,
     pub attachment_type: String,
+    /// The post's comments node (from its `<link rel="replies">`): the service's bare JID and
+    /// the node. Empty if the post has none (comments then can't be shown or written).
+    pub comments_jid: String,
+    pub comments_node: String,
 }
 
 /// One of our own OMEMO2 devices, for the key-management UI.
@@ -285,12 +289,26 @@ pub enum Event {
     StoriesUpdated { account_id: i64 },
 
     /// A microblog feed's posts, in reply to `Command::FetchFeed` (or after publishing). `jid`
-    /// is the feed owner's bare JID; `posts` is newest-first.
-    FeedPosts { account_id: i64, jid: String, posts: Vec<FeedPost> },
+    /// is the feed owner's bare JID; `posts` is newest-first. `public`: the feed is readable by
+    /// anyone (access model "open"), so links to its posts may be shared.
+    FeedPosts { account_id: i64, jid: String, posts: Vec<FeedPost>, public: bool },
 
-    /// A post's comments (separate `…:comments/<post_id>` node), in reply to
-    /// `Command::FetchComments` / after `Command::PublishComment`. Oldest-first.
-    FeedComments { account_id: i64, post_id: String, comments: Vec<FeedPost> },
+    /// The comments of the comments node `node` on `service` (a post's `<link rel="replies">`),
+    /// in reply to `Command::FetchComments` / after `Command::PublishComment`. Oldest-first.
+    FeedComments { account_id: i64, service: String, node: String, comments: Vec<FeedPost> },
+
+    /// A contact (or we) published or edited a post (PEP notification, XEP-0472).
+    FeedPostReceived { account_id: i64, post: FeedPost },
+
+    /// `author` retracted their post `post_id` (ids are only unique per author).
+    FeedPostRetracted { account_id: i64, author: String, post_id: String },
+
+    /// Something changed on the comments node `node` of `service`: refetch it if shown.
+    FeedCommentsChanged { account_id: i64, service: String, node: String },
+
+    /// A Story or feed post the user started has been published (`error` None) or failed.
+    /// `what` is "story" or "post".
+    PublishDone { account_id: i64, what: String, error: Option<String> },
 
     /// Non-fatal notice surfaced to the user. `important` toasts (e.g. a failed file send the
     /// user explicitly started) are shown; non-important ones (background fetch failures) are

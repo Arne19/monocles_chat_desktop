@@ -54,3 +54,4 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 # so those crates are no longer referenced directly here.
 # Wipe the in-memory password on drop.
 zeroize = "1"
+pulldown-cmark = { version = "0.13", default-features = false }

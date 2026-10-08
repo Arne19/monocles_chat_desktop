@@ -19,18 +19,36 @@ const ROLE_OWN: i32 = 263;
 const ROLE_COMMENTS: i32 = 264;
 const ROLE_LIKES: i32 = 265;
 const ROLE_LIKED: i32 = 266;
+const ROLE_ATTACHMENT_TYPE: i32 = 267;
+const ROLE_ATTACHMENT_PATH: i32 = 268;
+const ROLE_AVATAR: i32 = 269;
+const ROLE_CAN_COMMENT: i32 = 270;
+const ROLE_CONTENT_HTML: i32 = 271;
+const ROLE_PUBLIC: i32 = 272;
 
 /// One feed item (post or comment), resolved for display.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct FeedEntry {
     pub id: String,
     pub author: String,
     pub title: String,
     pub content: String,
+    /// `content` (Markdown) rendered as sanitized rich text: structure and http(s)/xmpp links
+    /// only, raw HTML escaped, images as links (nothing loads by itself).
+    pub content_html: String,
     pub published: i64,
     pub link: String,
     pub attachment_url: String,
+    /// The attachment's MIME type, and its cached file (images only; empty until downloaded).
+    pub attachment_type: String,
+    pub attachment_path: String,
+    /// The author's cached avatar, or empty.
+    pub avatar_path: String,
     pub own: bool,
+    /// Whether the post names a comments node (otherwise it can't be commented on or liked).
+    pub can_comment: bool,
+    /// Whether the post's feed is readable by anyone (else its link isn't offered for sharing).
+    pub public: bool,
     /// Number of replies (top-level posts only), excluding likes.
     pub comment_count: i64,
     /// Number of "♥" likes on the post, and whether we've liked it.
@@ -55,6 +73,9 @@ pub mod qobject {
 
         include!("cxx-qt-lib/qstring.h");
         type QString = cxx_qt_lib::QString;
+
+        include!("cxx-qt-lib/qlist.h");
+        type QList_i32 = cxx_qt_lib::QList<i32>;
     }
 
     extern "RustQt" {
@@ -75,10 +96,17 @@ pub mod qobject {
         #[qinvokable]
         fn reload(self: Pin<&mut FeedModel>, jid: &QString);
 
-        /// Show the replies (comments) of post `post_id`, oldest first.
+        /// The `role` (a role name, e.g. "contentHtml") of `author`'s post `post_id` as shown
+        /// now, or an invalid QVariant if it isn't listed — lets an open post dialog pick up a
+        /// downloaded image or an edit.
+        #[qinvokable]
+        #[cxx_name = "fieldOf"]
+        fn field_of(self: &FeedModel, author: &QString, post_id: &QString, role: &QString) -> QVariant;
+
+        /// Show the replies (comments) of `author`'s post `post_id`, oldest first.
         #[qinvokable]
         #[cxx_name = "loadComments"]
-        fn load_comments(self: Pin<&mut FeedModel>, post_id: &QString);
+        fn load_comments(self: Pin<&mut FeedModel>, author: &QString, post_id: &QString);
     }
 
     extern "RustQt" {
@@ -104,6 +132,18 @@ pub mod qobject {
         #[inherit]
         #[rust_name = "end_reset_model"]
         fn endResetModel(self: Pin<&mut FeedModel>);
+        // For in-place row updates (same posts): a reset recreates every delegate, which made
+        // the post images blink on each comment-count update.
+        #[inherit]
+        fn index(self: &FeedModel, row: i32, column: i32, parent: &QModelIndex) -> QModelIndex;
+        #[inherit]
+        #[rust_name = "data_changed"]
+        fn dataChanged(
+            self: Pin<&mut FeedModel>,
+            top_left: &QModelIndex,
+            bottom_right: &QModelIndex,
+            roles: &QList_i32,
+        );
     }
 }
 
@@ -132,21 +172,67 @@ impl qobject::FeedModel {
         self.as_mut().set_unseen_count(0);
     }
 
-    pub fn load_comments(self: Pin<&mut Self>, post_id: &QString) {
-        let items = crate::session::feed_comments(&post_id.to_string());
+    fn field_of(&self, author: &QString, post_id: &QString, role: &QString) -> QVariant {
+        let (author, post_id, role) = (author.to_string(), post_id.to_string(), role.to_string());
+        let Some(row) = self.items.iter().position(|p| p.id == post_id && p.author.eq_ignore_ascii_case(&author)) else {
+            return QVariant::default();
+        };
+        let Some(role_id) = self
+            .role_names()
+            .iter()
+            .find(|(_, name)| name.to_string() == role)
+            .map(|(id, _)| *id)
+        else {
+            return QVariant::default();
+        };
+        Self::value(&self.items[row], role_id)
+    }
+
+    pub fn load_comments(self: Pin<&mut Self>, author: &QString, post_id: &QString) {
+        let items = crate::session::feed_comments(&author.to_string(), &post_id.to_string());
         self.reset(items);
     }
 
+    /// Show `items`. When they are the same posts in the same order (the usual case: a comment
+    /// count, a like or a downloaded image changed), only the rows that differ are updated, so
+    /// the list's delegates (and their images) stay as they are.
     pub fn reset(mut self: Pin<&mut Self>, items: Vec<FeedEntry>) {
-        self.as_mut().begin_reset_model();
+        let same_rows = self.items.len() == items.len()
+            && self
+                .items
+                .iter()
+                .zip(&items)
+                .all(|(a, b)| a.id == b.id && a.author.eq_ignore_ascii_case(&b.author));
+        if !same_rows {
+            self.as_mut().begin_reset_model();
+            self.as_mut().rust_mut().items = items;
+            self.as_mut().end_reset_model();
+            return;
+        }
+        let changed: Vec<i32> = self
+            .items
+            .iter()
+            .zip(&items)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, _)| i as i32)
+            .collect();
         self.as_mut().rust_mut().items = items;
-        self.as_mut().end_reset_model();
+        let parent = QModelIndex::default();
+        for row in changed {
+            let idx = self.as_ref().index(row, 0, &parent);
+            self.as_mut().data_changed(&idx, &idx, &cxx_qt_lib::QList::<i32>::default());
+        }
     }
 
     fn data(&self, index: &QModelIndex, role: i32) -> QVariant {
-        let Some(item) = self.items.get(index.row() as usize) else {
-            return QVariant::default();
-        };
+        match self.items.get(index.row() as usize) {
+            Some(item) => Self::value(item, role),
+            None => QVariant::default(),
+        }
+    }
+
+    fn value(item: &FeedEntry, role: i32) -> QVariant {
         match role {
             ROLE_ID => QVariant::from(&QString::from(item.id.as_str())),
             ROLE_AUTHOR => QVariant::from(&QString::from(item.author.as_str())),
@@ -159,6 +245,12 @@ impl qobject::FeedModel {
             ROLE_COMMENTS => QVariant::from(&item.comment_count),
             ROLE_LIKES => QVariant::from(&item.like_count),
             ROLE_LIKED => QVariant::from(&item.liked),
+            ROLE_ATTACHMENT_TYPE => QVariant::from(&QString::from(item.attachment_type.as_str())),
+            ROLE_ATTACHMENT_PATH => QVariant::from(&QString::from(item.attachment_path.as_str())),
+            ROLE_AVATAR => QVariant::from(&QString::from(item.avatar_path.as_str())),
+            ROLE_CAN_COMMENT => QVariant::from(&item.can_comment),
+            ROLE_PUBLIC => QVariant::from(&item.public),
+            ROLE_CONTENT_HTML => QVariant::from(&QString::from(item.content_html.as_str())),
             _ => QVariant::default(),
         }
     }
@@ -180,6 +272,12 @@ impl qobject::FeedModel {
         roles.insert(ROLE_COMMENTS, QByteArray::from("commentCount"));
         roles.insert(ROLE_LIKES, QByteArray::from("likeCount"));
         roles.insert(ROLE_LIKED, QByteArray::from("liked"));
+        roles.insert(ROLE_ATTACHMENT_TYPE, QByteArray::from("attachmentType"));
+        roles.insert(ROLE_ATTACHMENT_PATH, QByteArray::from("attachmentPath"));
+        roles.insert(ROLE_AVATAR, QByteArray::from("avatarPath"));
+        roles.insert(ROLE_CAN_COMMENT, QByteArray::from("canComment"));
+        roles.insert(ROLE_PUBLIC, QByteArray::from("isPublic"));
+        roles.insert(ROLE_CONTENT_HTML, QByteArray::from("contentHtml"));
         roles
     }
 }

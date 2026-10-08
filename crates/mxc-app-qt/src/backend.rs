@@ -23,6 +23,10 @@ pub mod qobject {
         #[qml_element]
         #[qproperty(QString, status)]
         #[qproperty(bool, connected)]
+        /// Stories / feed posts still being prepared, uploaded and published.
+        #[qproperty(i32, publishing)]
+        /// Contacts whose feed could be followed (newline-joined bare JIDs).
+        #[qproperty(QString, feed_suggestions, cxx_name = "feedSuggestions")]
         /// The logged-in account's bare JID — set when a session starts (manual or auto-login),
         /// so QML can flip to the shell on auto-login without a button press.
         #[qproperty(QString, account_jid, cxx_name = "accountJid")]
@@ -271,10 +275,27 @@ pub mod qobject {
         #[cxx_name = "retractComment"]
         fn retract_comment(self: Pin<&mut Backend>, post_author: &QString, post_id: &QString, comment_id: &QString);
 
-        /// Publish a feed post / a comment on a post.
+        /// Publish a feed post (Markdown `content`, optional local `attachment` file to upload
+        /// and related `link`) / edit our post `post_id` (attachment kept unless a new file is
+        /// given) / publish a comment on a post.
         #[qinvokable]
         #[cxx_name = "publishPost"]
-        fn publish_post(self: Pin<&mut Backend>, title: &QString, content: &QString);
+        fn publish_post(self: Pin<&mut Backend>, title: &QString, content: &QString, attachment: &QString, link: &QString);
+        #[qinvokable]
+        #[cxx_name = "editPost"]
+        fn edit_post(
+            self: Pin<&mut Backend>,
+            post_id: &QString,
+            title: &QString,
+            content: &QString,
+            attachment: &QString,
+            link: &QString,
+        );
+
+        /// `xmpp:` URI of a post, to share it.
+        #[qinvokable]
+        #[cxx_name = "postUri"]
+        fn post_uri(self: &Backend, author: &QString, post_id: &QString) -> QString;
         #[qinvokable]
         #[cxx_name = "publishComment"]
         fn publish_comment(self: Pin<&mut Backend>, post_author: &QString, post_id: &QString, content: &QString);
@@ -648,6 +669,8 @@ pub mod qobject {
 pub struct BackendRust {
     status: QString,
     connected: bool,
+    publishing: i32,
+    feed_suggestions: QString,
     account_jid: QString,
     own_fingerprint: QString,
     own_verification_uri: QString,
@@ -692,6 +715,8 @@ impl Default for BackendRust {
         Self {
             status: QString::from("Disconnected"),
             connected: false,
+            publishing: 0,
+            feed_suggestions: QString::default(),
             account_jid: QString::default(),
             own_fingerprint: QString::default(),
             own_verification_uri: QString::default(),
@@ -901,8 +926,11 @@ impl qobject::Backend {
     }
 
     /// QML entry point — publish a story.
-    pub fn publish_story(self: Pin<&mut Self>, path: &QString, title: &QString) {
-        crate::session::publish_story(path.to_string(), title.to_string());
+    pub fn publish_story(mut self: Pin<&mut Self>, path: &QString, title: &QString) {
+        if crate::session::publish_story(path.to_string(), title.to_string()) {
+            let pending = self.publishing() + 1;
+            self.as_mut().set_publishing(pending);
+        }
     }
 
     /// QML entry point — fetch stories.
@@ -928,8 +956,33 @@ impl qobject::Backend {
     pub fn retract_comment(self: Pin<&mut Self>, post_author: &QString, post_id: &QString, comment_id: &QString) {
         crate::session::retract_comment(post_author.to_string(), post_id.to_string(), comment_id.to_string());
     }
-    pub fn publish_post(self: Pin<&mut Self>, title: &QString, content: &QString) {
-        crate::session::publish_post(title.to_string(), content.to_string());
+    pub fn publish_post(mut self: Pin<&mut Self>, title: &QString, content: &QString, attachment: &QString, link: &QString) {
+        if crate::session::publish_post(title.to_string(), content.to_string(), attachment.to_string(), link.to_string()) {
+            let pending = self.publishing() + 1;
+            self.as_mut().set_publishing(pending);
+        }
+    }
+    pub fn edit_post(
+        mut self: Pin<&mut Self>,
+        post_id: &QString,
+        title: &QString,
+        content: &QString,
+        attachment: &QString,
+        link: &QString,
+    ) {
+        if crate::session::edit_post(
+            post_id.to_string(),
+            title.to_string(),
+            content.to_string(),
+            attachment.to_string(),
+            link.to_string(),
+        ) {
+            let pending = self.publishing() + 1;
+            self.as_mut().set_publishing(pending);
+        }
+    }
+    pub fn post_uri(&self, author: &QString, post_id: &QString) -> QString {
+        QString::from(&crate::session::post_uri(&author.to_string(), &post_id.to_string()))
     }
     pub fn publish_comment(self: Pin<&mut Self>, post_author: &QString, post_id: &QString, content: &QString) {
         crate::session::publish_comment(post_author.to_string(), post_id.to_string(), content.to_string());

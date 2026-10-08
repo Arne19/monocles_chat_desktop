@@ -20,6 +20,7 @@
 //! Stream management (0198), ping (0199), CSI (0352), SASL2/Bind2 (0388) are handled by
 //! tokio-xmpp during negotiation.
 
+pub mod atom_text;
 pub mod avatar;
 pub mod bob;
 pub mod bookmarks;

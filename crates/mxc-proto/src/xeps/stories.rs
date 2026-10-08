@@ -4,7 +4,8 @@
 //! A story is a PEP item on the publisher's own node, carrying an Atom `<entry>` with an
 //! `<link rel="enclosure">` to the (plaintext-uploaded) media. The node is presence-access
 //! and items expire after 24h. We subscribe via caps `+notify` to receive contacts' stories,
-//! fetch on demand, and cache them in [`mxc_store`].
+//! fetch on demand, and cache them in [`mxc_store`]. Uploaded media is stripped of metadata
+//! first (see [`crate::media_strip`]).
 
 use async_channel::Sender;
 use minidom::Element;
@@ -18,10 +19,11 @@ use crate::xeps::pep;
 pub const NS_STORIES: &str = "urn:xmpp:pubsub-social-feed:stories:0";
 const NS_ATOM: &str = "http://www.w3.org/2005/Atom";
 const NS_XDATA: &str = "jabber:x:data";
-const NS_PUBSUB_PUBLISH_OPTIONS: &str = "http://jabber.org/protocol/pubsub#publish-options";
+const NS_RSM: &str = "http://jabber.org/protocol/rsm";
 
-/// `<x type=submit>` publish-options matching Android: presence access, 24h expiry, persisted.
-fn publish_options() -> Element {
+/// Node config matching Android's `defaultStoriesConfiguration`: presence access, items expire
+/// after 24h.
+fn node_config() -> Element {
     let field = |var: &str, value: &str| {
         Element::builder("field", NS_XDATA)
             .attr(crate::ncname("var"), var)
@@ -30,16 +32,41 @@ fn publish_options() -> Element {
     };
     Element::builder("x", NS_XDATA)
         .attr(crate::ncname("type"), "submit")
-        .append(field("FORM_TYPE", NS_PUBSUB_PUBLISH_OPTIONS))
+        .append(field("FORM_TYPE", "http://jabber.org/protocol/pubsub#node_config"))
+        .append(field("pubsub#node_type", "leaf"))
+        .append(field("pubsub#type", NS_STORIES))
         .append(field("pubsub#access_model", "presence"))
-        .append(field("pubsub#persist_items", "true"))
-        .append(field("pubsub#max_items", "120"))
         .append(field("pubsub#item_expire", "86400"))
+        .append(field("pubsub#persist_items", "1"))
+        .append(field("pubsub#max_items", "120"))
+        .append(field("pubsub#notify_retract", "1"))
         .append(field("pubsub#send_last_published_item", "on_sub_and_presence"))
+        .append(field("pubsub#publish_model", "publishers"))
         .build()
 }
 
-/// Publish a story: an Atom `<entry>` linking to `url` (already uploaded). Returns the item id.
+/// Create our stories node with [`node_config`]. An existing node (conflict) is fine.
+async fn ensure_node(w: &Writer, cfg: &AccountConfig) {
+    let pubsub = Element::builder("pubsub", pep::NS_PUBSUB)
+        .append(Element::builder("create", pep::NS_PUBSUB).attr(crate::ncname("node"), NS_STORIES).build())
+        .append(Element::builder("configure", pep::NS_PUBSUB).append(node_config()).build())
+        .build();
+    let req = Element::builder("iq", "jabber:client")
+        .attr(crate::ncname("type"), "set")
+        .attr(crate::ncname("id"), crate::xeps::roster::new_id("pep-create"))
+        .attr(crate::ncname("to"), cfg.bare())
+        .append(pubsub)
+        .build();
+    match crate::xeps::iq::request(w, req).await {
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("conflict") => {}
+        Err(e) => tracing::debug!(error = %e, "could not create stories node"),
+    }
+}
+
+/// Publish a story: an Atom `<entry>` linking to `url` (already uploaded). The node is created
+/// with its 24h-expiry config first; the publish itself carries no options (as on Android), so
+/// a node configured differently by another client doesn't make it fail.
 pub async fn publish(
     w: &Writer,
     cfg: &AccountConfig,
@@ -47,10 +74,11 @@ pub async fn publish(
     media_type: &str,
     title: &str,
 ) -> anyhow::Result<()> {
-    let uuid = crate::xeps::roster::new_id("story");
+    ensure_node(w, cfg).await;
+    let uuid = crate::xeps::microblog::uuid_v4();
     let ts = crate::xeps::rfc3339_now();
     let effective_title = if title.trim().is_empty() {
-        format!("Story {}", chrono::Utc::now().format("%Y-%m-%d %H:%M"))
+        format!("Story {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
     } else {
         title.to_string()
     };
@@ -75,7 +103,7 @@ pub async fn publish(
         )
         .build();
 
-    pep::publish(w, NS_STORIES, Some(&uuid), entry, Some(publish_options())).await?;
+    pep::publish(w, NS_STORIES, Some(&uuid), entry, None).await?;
     Ok(())
 }
 
@@ -98,9 +126,9 @@ fn parse_item(item_id: Option<&str>, entry: &Element, contact: &str) -> Option<P
         .and_then(|a| a.get_child("uri", NS_ATOM))
         .map(|u| u.text())
     {
-        if let Some(jid) = uri.strip_prefix("xmpp:") {
-            let jid_bare = jid.split('/').next().unwrap_or(jid);
-            if !jid_bare.eq_ignore_ascii_case(contact) {
+        if let Some(jid) = uri.trim().strip_prefix("xmpp:") {
+            let jid_bare = jid.split(['/', '?']).next().unwrap_or(jid);
+            if !jid_bare.replace("%40", "@").eq_ignore_ascii_case(contact) {
                 return None;
             }
         }
@@ -110,8 +138,16 @@ fn parse_item(item_id: Option<&str>, entry: &Element, contact: &str) -> Option<P
     let link = entry
         .children()
         .find(|c| c.name() == "link" && c.attr("rel") == Some("enclosure"))?;
-    let url = link.attr("href")?.to_string();
-    let media_type = link.attr("type").unwrap_or("application/octet-stream").to_string();
+    let url = link.attr("href")?.trim().to_string();
+    if url.is_empty() {
+        return None;
+    }
+    // Other clients may omit the enclosure type; don't treat every such video as an image.
+    let media_type = link
+        .attr("type")
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::xeps::microblog::mime_from_url(&url));
     let title = entry.get_child("title", NS_ATOM).map(|t| t.text()).filter(|t| !t.is_empty());
 
     // published/updated timestamp → unix seconds (fall back to now).
@@ -157,10 +193,32 @@ async fn store_items(store: &Store, account_id: i64, contact: &str, items: &[(Op
 }
 
 /// Fetch `jid`'s stories (None = our own) and cache them. Best-effort.
+///
+/// Also drops cached stories of that publisher that are no longer on its node: a retraction we
+/// missed (offline, or a node without notify_retract) otherwise kept a deleted story around as
+/// an extra, usually unloadable, entry until it expired. Only a complete listing is trusted: a
+/// paged (RSM) result may simply not contain the item.
 pub async fn fetch(w: &Writer, store: &Store, cfg: &AccountConfig, jid: Option<&str>) {
     let contact = jid.unwrap_or(cfg.bare()).to_string();
-    let Ok(reply) = pep::items(w, jid, NS_STORIES, None).await else { return };
+    let reply = match pep::items(w, jid, NS_STORIES, None).await {
+        Ok(reply) => reply,
+        // No node at all: the publisher has no stories (any we have were retracted).
+        Err(e) if e.to_string().contains("item-not-found") => {
+            let _ = store.retain_stories(cfg.account_id, &contact, &[]).await;
+            return;
+        }
+        Err(_) => return,
+    };
     let items = pep::extract_items(&reply);
+    let pubsub = reply.get_child("pubsub", pep::NS_PUBSUB);
+    let paged = pubsub.is_some_and(|p| p.get_child("set", NS_RSM).is_some());
+    if pubsub.is_some() && !paged {
+        let present: Vec<String> = items.iter().filter_map(|(id, _)| id.clone()).collect();
+        match store.retain_stories(cfg.account_id, &contact, &present).await {
+            Ok(n) if n > 0 => tracing::debug!(%contact, n, "dropped stories no longer on the node"),
+            _ => {}
+        }
+    }
     store_items(store, cfg.account_id, &contact, &items).await;
 }
 

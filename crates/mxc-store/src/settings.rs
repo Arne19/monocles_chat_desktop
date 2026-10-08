@@ -33,6 +33,28 @@ impl Store {
         Ok(())
     }
 
+    // ---- one-shot flags (e.g. migrations done once per account) ----
+
+    /// Whether the flag `key` has been set.
+    pub async fn flag(&self, key: &str) -> Result<bool> {
+        let row = sqlx::query_as::<_, (String,)>("SELECT value FROM settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.is_some_and(|(v,)| v == "1"))
+    }
+
+    /// Set the flag `key`.
+    pub async fn set_flag(&self, key: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?1, '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     // ---- default monocles support-room entry (Contacts tab) ----
 
     /// Whether the user removed the default support-room entry (per account).

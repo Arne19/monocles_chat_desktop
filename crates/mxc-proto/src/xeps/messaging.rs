@@ -1210,6 +1210,11 @@ pub async fn handle_incoming(
         return Ok(());
     }
 
+    // --- Feed (XEP-0472 microblog / comments) notifications.
+    if super::microblog::handle_event(w, store, cfg, events, msg).await {
+        return Ok(());
+    }
+
     // --- carbons (XEP-0280): only trusted if outer-from is our bare JID ---
     if let Some((inner, kind)) = carbons::unwrap(msg, cfg.bare()) {
         let dir = match kind {

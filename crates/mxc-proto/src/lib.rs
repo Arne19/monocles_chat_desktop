@@ -10,6 +10,7 @@ pub mod client;
 pub mod command;
 mod directtls;
 pub mod event;
+pub mod media_strip;
 pub mod uri;
 pub mod xeps;
 

@@ -245,20 +245,32 @@ pub enum Command {
 
     /// Fetch a JID's microblog (XEP-0277) feed posts. Replies with `Event::FeedPosts`.
     FetchFeed { account_id: i64, jid: String },
-    /// Publish a microblog post (title + content) to our own social-feed node.
-    PublishPost { account_id: i64, title: String, content: String },
-    /// Fetch a post's comments (the `…:comments/<post_id>` node on `post_author`). Replies with
+    /// Publish a microblog post (title + Markdown content) to our own social-feed node.
+    /// `attachment_path` is a local file to upload (metadata stripped) and attach, or empty;
+    /// `attachment` an already uploaded one (URL, MIME) kept when editing. `link` is a related
+    /// web link or empty. `edit` (post id, original publish time) replaces that post.
+    PublishPost {
+        account_id: i64,
+        title: String,
+        content: String,
+        attachment_path: String,
+        attachment: Option<(String, String)>,
+        link: String,
+        edit: Option<(String, i64)>,
+    },
+    /// Fetch the comments node `node` on `service` (a post's replies link). Replies with
     /// `Event::FeedComments`.
-    FetchComments { account_id: i64, post_author: String, post_id: String },
-    /// Publish a comment on `post_author`'s post `post_id` (to the post's comments node).
-    PublishComment { account_id: i64, post_author: String, post_id: String, content: String },
+    FetchComments { account_id: i64, service: String, node: String },
+    /// Publish a comment to the comments node `node` on `service`.
+    PublishComment { account_id: i64, service: String, node: String, content: String },
     /// Retract one of our own feed posts (from our `urn:xmpp:microblog:0` node).
     RetractPost { account_id: i64, post_id: String },
-    /// Retract a comment `comment_id` from `post_author`'s post `post_id` comments node (allowed
-    /// if we authored the comment or own the post).
-    RetractComment { account_id: i64, post_author: String, post_id: String, comment_id: String },
+    /// Retract comment `comment_id` from the comments node `node` on `service` (allowed if we
+    /// authored the comment or own the post).
+    RetractComment { account_id: i64, service: String, node: String, comment_id: String },
 
-    /// Publish a Story: upload `path` (plaintext) and publish it to our social-feed node.
+    /// Publish a Story: upload `path` (plaintext, metadata stripped) and publish it to our
+    /// stories node.
     PublishStory { account_id: i64, path: String, title: String },
     /// Fetch stories from ourselves + all subscribed contacts. Replies with `StoriesUpdated`.
     FetchStories { account_id: i64 },

@@ -130,6 +130,7 @@ ApplicationWindow {
             composer.clear()
             return
         }
+        messageList.stickToEnd = true
         backend.sendMessage(window.currentPeerJid, composer.text, window.currentPeerEncrypted, window.replyToMarker)
         composer.clear()
         window.clearReply()
@@ -203,9 +204,27 @@ ApplicationWindow {
         return Math.floor(d / 86400) + qsTr("d ago")
     }
 
-    // Open the sequential story viewer starting at feed row `index`.
-    function openStoryViewer(index) {
-        storyViewer.openAt(index)
+    // Open the story viewer on `contact`'s stories (oldest first, as on Android), starting at
+    // the story `uuid`.
+    function openStoryViewer(contact, uuid) {
+        storyViewer.openFor(contact, uuid)
+    }
+
+    // Open a link from feed content: only web and xmpp: links (never file: or other schemes a
+    // post could smuggle in).
+    function openSafeUrl(url) {
+        var u = String(url).trim()
+        if (/^(https?:\/\/|xmpp:)/i.test(u))
+            Qt.openUrlExternally(u)
+    }
+
+    // Copy `text` to the clipboard (via an off-screen editor; QML has no clipboard API).
+    TextEdit { id: clipboardHelper; visible: false }
+    function copyText(text) {
+        clipboardHelper.text = text
+        clipboardHelper.selectAll()
+        clipboardHelper.copy()
+        clipboardHelper.text = ""
     }
 
     // Small red counter bubble for the nav rail (unread chats / new calls / stories / posts).
@@ -221,6 +240,7 @@ ApplicationWindow {
         border.color: Qt.darker(Material.background, 1.12)
         Label {
             id: badgeLabel
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: parent.count > 99 ? "99+" : parent.count
             color: "white"
@@ -252,24 +272,106 @@ ApplicationWindow {
         detailsDialog.open()
     }
 
-    // Currently-open feed post (for the detail/comments dialog).
+    // Currently-open feed post (for the detail/comments dialog). Copied from the feed row,
+    // which a model reset may invalidate.
     property string feedPostId: ""
     property string feedPostAuthor: ""
     property string feedPostTitle: ""
     property string feedPostContent: ""
+    property string feedPostHtml: ""
     property double feedPostPublished: 0
     property bool feedPostOwn: false
-    function openPost(id, author, title, content, published, own) {
-        window.feedPostId = id
-        window.feedPostAuthor = author
-        window.feedPostTitle = title
-        window.feedPostContent = content
-        window.feedPostPublished = published
-        window.feedPostOwn = own
-        commentModel.loadComments(id)
+    property string feedPostLink: ""
+    property string feedPostAttachmentUrl: ""
+    property string feedPostAttachmentType: ""
+    property string feedPostAttachmentPath: ""
+    property bool feedPostCanComment: false
+    property int feedPostLikes: 0
+    property bool feedPostLiked: false
+    // Public feed (open to anyone): only then is the post's link offered for sharing.
+    property bool feedPostPublic: false
+    function openPost(m) {
+        window.feedPostId = m.postId
+        window.feedPostAuthor = m.author
+        window.feedPostTitle = m.title
+        window.feedPostContent = m.content
+        window.feedPostHtml = m.contentHtml
+        window.feedPostPublished = m.published
+        window.feedPostOwn = m.own
+        window.feedPostLink = m.link
+        window.feedPostAttachmentUrl = m.attachmentUrl
+        window.feedPostAttachmentType = m.attachmentType
+        window.feedPostAttachmentPath = m.attachmentPath
+        window.feedPostCanComment = m.canComment
+        window.feedPostLikes = m.likeCount
+        window.feedPostLiked = m.liked
+        window.feedPostPublic = m.isPublic
+        commentModel.loadComments(m.author, m.postId)
+        postScroll.contentY = 0
+        postScroll.followNewComment = false
         postDetailDialog.open()
-        // Pull this post's comments from its separate comments node (feedsChanged reloads them).
-        backend.fetchComments(author, id)
+        // Pull this post's comments from its comments node (feedsChanged reloads them).
+        backend.fetchComments(m.author, m.postId)
+    }
+
+    // Followed feeds / follow suggestions (Feeds section) and which list is expanded.
+    property var followedList: []
+    readonly property var suggestionList: backend.feedSuggestions.length > 0 ? backend.feedSuggestions.split("\n") : []
+    property string feedPanel: ""
+    function refreshFollowed() {
+        var f = backend.followedFeeds()
+        window.followedList = f.length > 0 ? f.split("\n") : []
+        if (window.feedPanel === "following" && window.followedList.length === 0)
+            window.feedPanel = ""
+    }
+
+    // Update the open post from the feed (an image finished downloading, the post was edited).
+    function refreshOpenPost() {
+        var a = window.feedPostAuthor, id = window.feedPostId
+        var html = feedModel.fieldOf(a, id, "contentHtml")
+        if (html === undefined)
+            return    // not listed (any more)
+        window.feedPostTitle = feedModel.fieldOf(a, id, "title")
+        window.feedPostContent = feedModel.fieldOf(a, id, "content")
+        window.feedPostHtml = html
+        window.feedPostLink = feedModel.fieldOf(a, id, "link")
+        window.feedPostAttachmentUrl = feedModel.fieldOf(a, id, "attachmentUrl")
+        window.feedPostAttachmentType = feedModel.fieldOf(a, id, "attachmentType")
+        window.feedPostAttachmentPath = feedModel.fieldOf(a, id, "attachmentPath")
+        window.feedPostCanComment = feedModel.fieldOf(a, id, "canComment")
+        window.feedPostLikes = feedModel.fieldOf(a, id, "likeCount")
+        window.feedPostLiked = feedModel.fieldOf(a, id, "liked")
+        window.feedPostPublic = feedModel.fieldOf(a, id, "isPublic")
+    }
+
+    // Post composer state: empty = a new post, else the id of our post being edited.
+    property string editingPostId: ""
+    property string pendingPostAttachment: ""
+    property string editingPostAttachment: ""
+    function openComposer(m) {
+        window.pendingPostAttachment = ""
+        if (m) {
+            window.editingPostId = m.postId
+            window.editingPostAttachment = m.attachmentUrl
+            newPostTitle.text = m.title
+            newPostContent.text = m.content
+            newPostLink.text = m.link
+        } else {
+            window.editingPostId = ""
+            window.editingPostAttachment = ""
+            newPostTitle.text = ""
+            newPostContent.text = ""
+            newPostLink.text = ""
+        }
+        newPostDialog.open()
+    }
+
+    // Small "uploading" note while stories / posts are being prepared and published.
+    component PublishingNote: RowLayout {
+        visible: backend.publishing > 0
+        spacing: 6
+        BusyIndicator { running: parent.visible; implicitWidth: 18; implicitHeight: 18 }
+        Label { textFormat: Text.PlainText; text: qsTr("Publishing…"); opacity: 0.7; font.pixelSize: 11 }
     }
 
     // Rust-backed objects (see src/backend.rs, src/model.rs, src/messages.rs, src/roster.rs).
@@ -284,6 +386,7 @@ ApplicationWindow {
     DeviceModel { id: ownDevices }       // our own devices (account keys dialog)
     CallLogModel { id: callLogModel }    // call history (Calls section)
     StoryModel { id: storyModel }        // social-feed stories (Stories section)
+    StoryModel { id: viewerStories }     // one publisher's stories, oldest first (story viewer)
     FeedModel { id: feedModel }          // XEP-0472 feed: top-level posts (Feeds section)
     FeedModel { id: commentModel }       // a post's replies (post detail)
 
@@ -432,12 +535,17 @@ ApplicationWindow {
         function onStoriesChanged() {
             if (window.accountJid.length > 0)
                 storyModel.reload(window.accountJid)
+            if (storyViewer.opened)
+                viewerStories.reloadSelf()
         }
         function onFeedsChanged() {
+            window.refreshFollowed()
             if (window.accountJid.length > 0)
                 feedModel.reload(window.accountJid)
             if (postDetailDialog.visible && window.feedPostId.length > 0)
-                commentModel.loadComments(window.feedPostId)
+                window.refreshOpenPost()
+            if (postDetailDialog.visible && window.feedPostId.length > 0)
+                commentModel.loadComments(window.feedPostAuthor, window.feedPostId)
         }
     }
 
@@ -535,6 +643,7 @@ ApplicationWindow {
                     sourceSize.height: 260
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Sign in to your XMPP account")
                     opacity: 0.7
                     Layout.alignment: Qt.AlignHCenter
@@ -809,6 +918,7 @@ ApplicationWindow {
                                 onClicked: shell.sectionIndex = (shell.sectionIndex === 1 ? 0 : 1)
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 Layout.fillWidth: true
                                 color: "white"
                                 font.bold: true
@@ -895,6 +1005,7 @@ ApplicationWindow {
                                                 presence: ""
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: window.searchScopeName
                                                 font.pixelSize: 12
                                                 elide: Text.ElideRight
@@ -977,12 +1088,14 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         spacing: 0
                                         Label {
+                                            textFormat: Text.PlainText
                                             text: model.name
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
                                         }
                                         // Kind caption — distinguishes groups + private group msgs from 1:1.
                                         Label {
+                                            textFormat: Text.PlainText
                                             visible: model.kind !== "chat"
                                             text: model.kind === "muc" ? qsTr("Group")
                                                 : model.kind === "muc_pm" ? qsTr("Private · ") + model.jid.split('/')[0].split('@')[0]
@@ -995,6 +1108,7 @@ ApplicationWindow {
                                         }
                                     }
                                     Label {
+                                        textFormat: Text.PlainText
                                         visible: model.encrypted
                                         text: "🔒"
                                         opacity: 0.7
@@ -1007,6 +1121,7 @@ ApplicationWindow {
                                         implicitWidth: Math.max(22, unreadLabel.implicitWidth + 12)
                                         Label {
                                             id: unreadLabel
+                                            textFormat: Text.PlainText
                                             anchors.centerIn: parent
                                             text: model.unread
                                             color: "white"
@@ -1016,6 +1131,7 @@ ApplicationWindow {
                                 }
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 anchors.centerIn: parent
                                 visible: convList.count === 0
                                 text: qsTr("No conversations yet")
@@ -1054,18 +1170,21 @@ ApplicationWindow {
                                             Layout.fillWidth: true
                                             spacing: 6
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: model.name
                                                 font.bold: true
                                                 elide: Text.ElideRight
                                                 Layout.fillWidth: true
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: window.msgTime(model.timestamp)
                                                 opacity: 0.55
                                                 font.pixelSize: 11
                                             }
                                         }
                                         Label {
+                                            textFormat: Text.PlainText
                                             Layout.fillWidth: true
                                             // "You:" / sender prefix, like the chat-list previews.
                                             text: (model.outgoing ? qsTr("You: ")
@@ -1081,6 +1200,7 @@ ApplicationWindow {
                                 }
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 anchors.centerIn: parent
                                 width: parent.width - 32
                                 horizontalAlignment: Text.AlignHCenter
@@ -1106,10 +1226,12 @@ ApplicationWindow {
                             contentItem: ColumnLayout {
                                 spacing: 4
                                 Label {
+                                    textFormat: Text.PlainText
                                     text: qsTr("Support monocles ♥")
                                     font.bold: true
                                 }
                                 Label {
+                                    textFormat: Text.PlainText
                                     text: qsTr("monocles is free and open source. A small donation helps keep the project alive.")
                                     wrapMode: Text.Wrap
                                     opacity: 0.7
@@ -1221,11 +1343,13 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         spacing: 0
                                         Label {
+                                            textFormat: Text.PlainText
                                             text: supportRoomEntry.displayName
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
                                         }
                                         Label {
+                                            textFormat: Text.PlainText
                                             text: qsTr("Support group · tap to join")
                                             color: "#7188C3"
                                             font.pixelSize: 11
@@ -1287,6 +1411,7 @@ ApplicationWindow {
                                         presence: model.presence
                                     }
                                     Label {
+                                        textFormat: Text.PlainText
                                         text: model.name
                                         elide: Text.ElideRight
                                         Layout.fillWidth: true
@@ -1294,6 +1419,7 @@ ApplicationWindow {
                                 }
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 anchors.centerIn: parent
                                 visible: rosterList.count === 0
                                 text: contactSearchField.text.length > 0 ? qsTr("No matching contacts")
@@ -1333,12 +1459,14 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                         spacing: 0
                                         Label {
+                                            textFormat: Text.PlainText
                                             text: model.peer.split('@')[0]
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
                                             color: missed ? "#e53935" : Material.foreground
                                         }
                                         Label {
+                                            textFormat: Text.PlainText
                                             text: (model.video ? qsTr("Video") : qsTr("Audio"))
                                                   + (missed ? " · " + qsTr("Missed")
                                                             : (unanswered ? " · " + qsTr("Not answered") : ""))
@@ -1372,6 +1500,7 @@ ApplicationWindow {
                                 }
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 anchors.centerIn: parent
                                 visible: callsList.count === 0
                                 text: qsTr("No calls yet")
@@ -1389,6 +1518,7 @@ ApplicationWindow {
                                 enabled: backend.connected
                                 onClicked: storyFileDialog.open()
                             }
+                            PublishingNote { Layout.leftMargin: 8 }
                             ListView {
                                 FastScroll {}
                                 id: storiesList
@@ -1399,7 +1529,7 @@ ApplicationWindow {
                                 ScrollBar.vertical: ThinScrollBar {}
                                 delegate: ItemDelegate {
                                     width: ListView.view.width
-                                    onClicked: window.openStoryViewer(index)
+                                    onClicked: window.openStoryViewer(model.contact, model.uuid)
                                     contentItem: RowLayout {
                                         spacing: 8
                                         Avatar {
@@ -1413,12 +1543,14 @@ ApplicationWindow {
                                             Layout.fillWidth: true
                                             spacing: 0
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: model.own ? qsTr("My story") : model.contact.split('@')[0]
                                                 font.bold: true
                                                 elide: Text.ElideRight
                                                 Layout.fillWidth: true
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: (model.mime.indexOf("video") === 0 ? "🎬 " : "📷 ")
                                                       + (model.title.length > 0 ? model.title + " · " : "")
                                                       + window.agoText(model.published)
@@ -1433,11 +1565,12 @@ ApplicationWindow {
                                             text: "✕"
                                             ToolTip.text: qsTr("Delete story")
                                             ToolTip.visible: hovered
-                                            onClicked: backend.retractStory(model.uuid)
+                                            onClicked: { storyDeleteDialog.uuid = model.uuid; storyDeleteDialog.open() }
                                         }
                                     }
                                 }
                                 Label {
+                                    textFormat: Text.PlainText
                                     anchors.centerIn: parent
                                     visible: storiesList.count === 0
                                     text: qsTr("No stories")
@@ -1457,12 +1590,74 @@ ApplicationWindow {
                                     Layout.fillWidth: true
                                     text: qsTr("New post")
                                     enabled: backend.connected
-                                    onClicked: { newPostTitle.text = ""; newPostContent.text = ""; newPostDialog.open() }
+                                    onClicked: window.openComposer(null)
                                 }
                                 Button {
                                     text: qsTr("Follow…")
                                     enabled: backend.connected
                                     onClicked: { followJidField.text = ""; followDialog.open() }
+                                }
+                            }
+                            PublishingNote { Layout.leftMargin: 8 }
+
+                            // Followed feeds (unfollow) and suggestions (Android: contacts sharing presence both
+                            // ways whose feed isn't followed yet), each collapsible.
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.leftMargin: 6
+                                Layout.rightMargin: 6
+                                spacing: 6
+                                Button {
+                                    flat: true
+                                    visible: window.followedList.length > 0
+                                    text: (window.feedPanel === "following" ? "▾ " : "▸ ") + qsTr("Following (%1)").arg(window.followedList.length)
+                                    onClicked: window.feedPanel = window.feedPanel === "following" ? "" : "following"
+                                }
+                                Button {
+                                    flat: true
+                                    visible: window.suggestionList.length > 0
+                                    text: (window.feedPanel === "suggestions" ? "▾ " : "▸ ") + qsTr("Suggestions (%1)").arg(window.suggestionList.length)
+                                    onClicked: window.feedPanel = window.feedPanel === "suggestions" ? "" : "suggestions"
+                                }
+                                Item { Layout.fillWidth: true }
+                            }
+                            ListView {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: Math.min(contentHeight, 200)
+                                visible: window.feedPanel !== "" && count > 0
+                                clip: true
+                                model: window.feedPanel === "following" ? window.followedList
+                                     : window.feedPanel === "suggestions" ? window.suggestionList : []
+                                ScrollBar.vertical: ThinScrollBar {}
+                                delegate: ItemDelegate {
+                                    width: ListView.view.width
+                                    contentItem: RowLayout {
+                                        spacing: 8
+                                        Avatar {
+                                            implicitWidth: 28
+                                            implicitHeight: 28
+                                            name: modelData.split('@')[0]
+                                            avatarPath: ""
+                                            presence: ""
+                                        }
+                                        Label {
+                                            textFormat: Text.PlainText
+                                            Layout.fillWidth: true
+                                            text: modelData
+                                            elide: Text.ElideRight
+                                        }
+                                        Button {
+                                            text: window.feedPanel === "following" ? qsTr("Unfollow") : qsTr("Follow")
+                                            enabled: backend.connected || window.feedPanel === "following"
+                                            onClicked: {
+                                                if (window.feedPanel === "following")
+                                                    backend.unfollowFeed(modelData)
+                                                else
+                                                    backend.followFeed(modelData)
+                                                window.refreshFollowed()
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             ListView {
@@ -1476,34 +1671,38 @@ ApplicationWindow {
                                 ScrollBar.vertical: ThinScrollBar {}
                                 delegate: ItemDelegate {
                                     width: ListView.view.width
-                                    onClicked: window.openPost(model.postId, model.author, model.title, model.content, model.published, model.own)
+                                    onClicked: window.openPost(model)
                                     contentItem: RowLayout {
                                         spacing: 8
                                         Avatar {
+                                            Layout.alignment: Qt.AlignTop
                                             implicitWidth: 40
                                             implicitHeight: 40
                                             name: model.own ? qsTr("Me") : model.author.split('@')[0]
-                                            avatarPath: ""
+                                            avatarPath: model.avatarPath
                                             presence: ""
                                         }
                                         ColumnLayout {
                                             Layout.fillWidth: true
-                                            spacing: 1
+                                            spacing: 2
                                             RowLayout {
                                                 Layout.fillWidth: true
                                                 Label {
+                                                    textFormat: Text.PlainText
                                                     text: model.own ? qsTr("Me") : model.author.split('@')[0]
                                                     font.bold: true
                                                     elide: Text.ElideRight
                                                     Layout.fillWidth: true
                                                 }
                                                 Label {
+                                                    textFormat: Text.PlainText
                                                     text: window.agoText(model.published)
                                                     opacity: 0.6
                                                     font.pixelSize: 10
                                                 }
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 visible: model.title.length > 0
                                                 text: model.title
                                                 font.bold: true
@@ -1511,20 +1710,54 @@ ApplicationWindow {
                                                 wrapMode: Text.Wrap
                                                 Layout.fillWidth: true
                                             }
+                                            // Markdown rendered in Rust to sanitized rich text
+                                            // (no images or raw HTML, http(s)/xmpp links only).
                                             Label {
                                                 visible: model.content.length > 0
-                                                text: model.content
+                                                text: model.contentHtml
+                                                textFormat: Text.RichText
                                                 wrapMode: Text.Wrap
-                                                maximumLineCount: 3
-                                                elide: Text.ElideRight
+                                                maximumLineCount: 4
+                                                clip: true
                                                 Layout.fillWidth: true
                                                 font.pixelSize: 12
+                                                onLinkActivated: (url) => window.openSafeUrl(url)
+                                            }
+                                            // Image attachment (cached), else a note.
+                                            Image {
+                                                visible: model.attachmentPath.length > 0
+                                                source: visible ? "file:" + model.attachmentPath : ""
+                                                Layout.fillWidth: true
+                                                Layout.maximumHeight: 220
+                                                Layout.preferredHeight: visible && implicitWidth > 0
+                                                    ? Math.min(220, width * implicitHeight / implicitWidth) : 0
+                                                fillMode: Image.PreserveAspectFit
+                                                horizontalAlignment: Image.AlignLeft
+                                                asynchronous: true
+                                                // Cached: the file is named by its URL's hash, so it never
+                                                // changes under a path — and a re-created row then shows
+                                                // the image at once instead of blanking while it reloads.
+                                                cache: true
+                                                // Decode at display size, not the full photo.
+                                                sourceSize.width: 800
+                                            }
+                                            Label {
+                                                textFormat: Text.PlainText
+                                                visible: model.attachmentUrl.length > 0 && model.attachmentPath.length === 0
+                                                text: (model.attachmentType.indexOf("video") === 0 ? "🎬 " : "📎 ")
+                                                      + decodeURIComponent(model.attachmentUrl.split('/').pop())
+                                                elide: Text.ElideMiddle
+                                                opacity: 0.7
+                                                font.pixelSize: 11
+                                                Layout.fillWidth: true
                                             }
                                             RowLayout {
                                                 Layout.fillWidth: true
                                                 spacing: 12
                                                 // Heart "like" (a "♥" comment, like the Android app).
                                                 Label {
+                                                    textFormat: Text.PlainText
+                                                    visible: model.canComment
                                                     text: (model.liked ? "♥ " : "♡ ") + model.likeCount
                                                     color: model.liked ? "#e0245e" : Material.foreground
                                                     opacity: model.liked ? 1.0 : 0.6
@@ -1532,26 +1765,49 @@ ApplicationWindow {
                                                     MouseArea {
                                                         anchors.fill: parent
                                                         cursorShape: Qt.PointingHandCursor
+                                                        enabled: backend.connected
                                                         onClicked: backend.toggleLike(model.author, model.postId)
                                                     }
                                                 }
                                                 Label {
-                                                    text: "💬 " + model.commentCount + (model.link.length > 0 ? "   🔗" : "")
+                                                    textFormat: Text.PlainText
+                                                    visible: model.canComment
+                                                    text: "💬 " + model.commentCount
+                                                    opacity: 0.6
+                                                    font.pixelSize: 12
+                                                }
+                                                Label {
+                                                    textFormat: Text.PlainText
+                                                    visible: model.link.length > 0
+                                                    text: "🔗"
                                                     opacity: 0.6
                                                     font.pixelSize: 12
                                                 }
                                             }
                                         }
-                                        ToolButton {
+                                        ColumnLayout {
+                                            Layout.alignment: Qt.AlignTop
                                             visible: model.own
-                                            text: "✕"
-                                            ToolTip.text: qsTr("Delete post")
-                                            ToolTip.visible: hovered
-                                            onClicked: backend.retractPost(model.postId)
+                                            spacing: 0
+                                            ToolButton {
+                                                text: "✎"
+                                                enabled: backend.connected
+                                                ToolTip.text: qsTr("Edit post")
+                                                ToolTip.visible: hovered
+                                                onClicked: window.openComposer(model)
+                                            }
+                                            ToolButton {
+                                                text: "✕"
+                                                enabled: backend.connected
+                                                ToolTip.text: qsTr("Delete post")
+                                                ToolTip.visible: hovered
+                                                onClicked: { postDeleteDialog.postId = model.postId; postDeleteDialog.open() }
+                                            }
                                         }
                                     }
                                 }
                                 Label {
+                                    textFormat: Text.PlainText
                                     anchors.centerIn: parent
                                     width: parent.width - 24
                                     visible: feedList.count === 0
@@ -1579,6 +1835,7 @@ ApplicationWindow {
 
                     // Placeholder when nothing is open.
                     Label {
+                        textFormat: Text.PlainText
                         anchors.centerIn: parent
                         visible: window.currentPeerJid.length === 0
                         text: qsTr("Select a conversation")
@@ -1618,6 +1875,7 @@ ApplicationWindow {
                                     TapHandler { onTapped: window.openDetails() }
                                 }
                                 Label {
+                                    textFormat: Text.PlainText
                                     text: window.currentPeerName
                                     color: "white"
                                     font.bold: true
@@ -1807,6 +2065,7 @@ ApplicationWindow {
                                                         presence: model.presence
                                                     }
                                                     Label {
+                                                        textFormat: Text.PlainText
                                                         text: model.nick
                                                         elide: Text.ElideRight
                                                         Layout.fillWidth: true
@@ -1814,6 +2073,7 @@ ApplicationWindow {
                                                 }
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 anchors.centerIn: parent
                                                 visible: occList.count === 0
                                                 text: qsTr("No occupants")
@@ -1826,14 +2086,81 @@ ApplicationWindow {
                         }
 
                         ListView {
-                            FastScroll {}
+                            FastScroll { onScrolled: messageList.userScrolled() }
                             id: messageList
                             Layout.fillWidth: true
                             Layout.fillHeight: true
                             clip: true
                             spacing: 2
                             model: msgModel
-                            ScrollBar.vertical: ThinScrollBar {}
+                            ScrollBar.vertical: ThinScrollBar {
+                                id: msgScrollBar
+                                onPressedChanged: if (!pressed) messageList.stickToEnd = messageList.nearEnd
+                            }
+
+                            // Keep the newest message in view while the user is at the bottom:
+                            // new/sent messages and bubbles that grow while they lay out (images,
+                            // estimated heights) would otherwise leave the view short of the end
+                            // and it would visibly settle. Only the user's own scrolling (wheel /
+                            // touchpad via FastScroll, drag, scroll bar) unsticks it; layout
+                            // changes can only re-stick (reaching the end).
+                            property bool stickToEnd: true
+                            // Set while we position the view ourselves.
+                            property bool positioning: false
+                            // Within 2px of the end: with variable-height bubbles `atYEnd` can
+                            // miss the end by a fraction.
+                            readonly property bool nearEnd: contentY + height >= originY + contentHeight - 2
+                            // The view is hidden while a freshly opened chat is first positioned,
+                            // so it never shows the oldest messages before snapping to the end.
+                            property bool settling: false
+                            opacity: settling ? 0 : 1
+                            function followEnd() {
+                                if (stickToEnd && olderAnchor === -1 && pendingJumpMarker.length === 0 && count > 0) {
+                                    positioning = true
+                                    positionViewAtEnd()
+                                    positioning = false
+                                }
+                            }
+                            function userScrolled() {
+                                stickToEnd = nearEnd
+                                maybeLoadOlder()
+                            }
+                            // Deferred: a re-position from inside the view's own layout pass
+                            // doesn't take, and the view settled short of the end.
+                            function layoutChanged() {
+                                if (!positioning && nearEnd)
+                                    stickToEnd = true
+                                Qt.callLater(followEnd)
+                            }
+                            onContentHeightChanged: layoutChanged()
+                            onOriginYChanged: layoutChanged()
+                            onHeightChanged: Qt.callLater(followEnd)
+                            onMovementEnded: stickToEnd = nearEnd
+                            // A freshly opened chat is shown once its messages have arrived and
+                            // been positioned (see onModelReset below) - not after a fixed delay,
+                            // which showed the previous chat and then redrew when loading took
+                            // longer. The fallback covers an open that doesn't reset the model.
+                            function finishSettling() {
+                                followEnd()
+                                settleTimer.restart()
+                            }
+                            Timer {
+                                id: settleTimer
+                                interval: 30
+                                onTriggered: {
+                                    // A search jump reveals the chat itself once it scrolled.
+                                    if (messageList.pendingJumpMarker.length > 0)
+                                        return
+                                    messageList.followEnd()
+                                    messageList.settling = false
+                                    settleFallback.stop()
+                                }
+                            }
+                            Timer {
+                                id: settleFallback
+                                interval: 1500
+                                onTriggered: { messageList.followEnd(); messageList.settling = false }
+                            }
 
                             // Date separators: group consecutive messages by local day.
                             section.property: "day"
@@ -1849,6 +2176,7 @@ ApplicationWindow {
                                     implicitWidth: daySepLabel.implicitWidth + 20
                                     Label {
                                         id: daySepLabel
+                                        textFormat: Text.PlainText
                                         anchors.centerIn: parent
                                         text: window.dayLabel(section)
                                         font.pixelSize: 11
@@ -1873,7 +2201,7 @@ ApplicationWindow {
                                 Material.foreground: "white"
                                 ToolTip.text: qsTr("Scroll to latest")
                                 ToolTip.visible: hovered
-                                onClicked: messageList.positionViewAtEnd()
+                                onClicked: { messageList.stickToEnd = true; messageList.positionViewAtEnd() }
                             }
 
                             // Row index captured when a page-up is requested; lets us restore
@@ -1892,6 +2220,10 @@ ApplicationWindow {
                                 function onCurrentPeerJidChanged() {
                                     messageList.noMoreHistory = false
                                     messageList.olderAnchor = -1
+                                    messageList.stickToEnd = true
+                                    messageList.settling = true
+                                    settleTimer.stop()
+                                    settleFallback.restart()
                                     // A plain open cancels any in-flight search jump; the search
                                     // path re-sets this right after changing the peer.
                                     messageList.pendingJumpMarker = ""
@@ -1914,6 +2246,7 @@ ApplicationWindow {
                                 onTriggered: {
                                     var idx = msgModel.indexOfMarker(messageList.pendingJumpMarker)
                                     if (idx >= 0) {
+                                        messageList.stickToEnd = false
                                         messageList.positionViewAtIndex(idx, ListView.Center)
                                         messageList.flashIndex = idx
                                         flashClear.restart()
@@ -1921,15 +2254,30 @@ ApplicationWindow {
                                         messageList.positionViewAtEnd()
                                     }
                                     messageList.pendingJumpMarker = ""
+                                    // Search jump: reveal the chat once it is positioned.
+                                    messageList.settling = false
+                                    settleFallback.stop()
                                 }
                             }
 
-                            onContentYChanged: {
+                            // Reaching the top by the user's own scrolling loads an older page.
+                            // Not on any contentY change: a model reset (opening a chat) briefly
+                            // puts the view at the top, and that used to load history, reload the
+                            // whole view and hold it at the top until the page arrived.
+                            function maybeLoadOlder() {
                                 if (atYBeginning && olderAnchor === -1 && !noMoreHistory
                                         && contentHeight > height + 1) {
                                     olderAnchor = count
                                     msgModel.loadOlder()
                                     olderResetTimer.restart()
+                                }
+                            }
+                            onContentYChanged: {
+                                // Only the user's own scrolling (drag/wheel/scroll bar) counts —
+                                // not layout changes or our own positioning.
+                                if (!positioning && (moving || msgScrollBar.pressed)) {
+                                    stickToEnd = nearEnd
+                                    maybeLoadOlder()
                                 }
                             }
                             onCountChanged: {
@@ -1940,8 +2288,31 @@ ApplicationWindow {
                                     olderResetTimer.stop()
                                 } else if (pendingJumpMarker.length > 0) {
                                     // A search jump is in flight — jumpTimer positions the view.
-                                } else if (olderAnchor === -1) {
-                                    positionViewAtEnd()
+                                } else {
+                                    followEnd()
+                                }
+                            }
+                            // A reset (another chat) recreates the delegates; position once the
+                            // view has processed it.
+                            // Our own new message (sent, or from another device) always brings
+                            // the view to the end — independent of how it was scrolled before.
+                            Connections {
+                                target: msgModel
+                                function onOwnMessageAppended() {
+                                    if (messageList.pendingJumpMarker.length > 0)
+                                        return
+                                    messageList.olderAnchor = -1
+                                    messageList.stickToEnd = true
+                                    Qt.callLater(messageList.followEnd)
+                                }
+                            }
+                            Connections {
+                                target: msgModel
+                                function onModelReset() {
+                                    if (messageList.settling)
+                                        Qt.callLater(messageList.finishSettling)
+                                    else
+                                        Qt.callLater(messageList.followEnd)
                                 }
                             }
                             Component.onCompleted: positionViewAtEnd()
@@ -2097,6 +2468,7 @@ ApplicationWindow {
 
                                         // Sender nick (incoming MUC messages only).
                                         Label {
+                                            textFormat: Text.PlainText
                                             visible: window.currentPeerIsMuc && !model.outgoing && model.sender.length > 0
                                             width: Math.min(implicitWidth, msgDelegate.maxw)
                                             text: model.sender
@@ -2127,6 +2499,7 @@ ApplicationWindow {
 
                                             Label {
                                                 id: quoteText
+                                                textFormat: Text.PlainText
                                                 x: 14
                                                 y: 6
                                                 width: Math.min(implicitWidth, msgDelegate.maxw - 22)
@@ -2146,6 +2519,7 @@ ApplicationWindow {
                                                 onClicked: {
                                                     var idx = msgModel.indexOfMarker(model.replyTo)
                                                     if (idx >= 0) {
+                                                        messageList.stickToEnd = false
                                                         messageList.positionViewAtIndex(idx, ListView.Center)
                                                         messageList.flashIndex = idx
                                                         flashClear.restart()
@@ -2201,6 +2575,7 @@ ApplicationWindow {
                                                         visible: !attachmentTile.inlineImage
                                                         Item { Layout.fillHeight: true }
                                                         Label {
+                                                            textFormat: Text.PlainText
                                                             Layout.alignment: Qt.AlignHCenter
                                                             text: modelData.kind === "image" ? "🖼"
                                                                 : modelData.kind === "audio" ? "🎤" : "📄"
@@ -2209,6 +2584,7 @@ ApplicationWindow {
                                                             renderType: Text.NativeRendering
                                                         }
                                                         Label {
+                                                            textFormat: Text.PlainText
                                                             Layout.fillWidth: true
                                                             horizontalAlignment: Text.AlignHCenter
                                                             text: modelData.name
@@ -2217,6 +2593,7 @@ ApplicationWindow {
                                                             elide: Text.ElideMiddle
                                                         }
                                                         Label {
+                                                            textFormat: Text.PlainText
                                                             Layout.alignment: Qt.AlignHCenter
                                                             visible: !attachmentTile.cached
                                                             text: qsTr("Download")
@@ -2338,6 +2715,7 @@ ApplicationWindow {
                                                     Behavior on value { NumberAnimation { duration: 120 } }
                                                 }
                                                 Label {
+                                                    textFormat: Text.PlainText
                                                     text: "🎤 " + window.fmtSecs(Math.floor(audioRow.posMs / 1000))
                                                           + (audioRow.durMs > 0 ? " / " + window.fmtSecs(Math.floor(audioRow.durMs / 1000)) : "")
                                                     color: "white"
@@ -2352,6 +2730,7 @@ ApplicationWindow {
                                             visible: model.webxdc
                                             spacing: 10
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: "🧩"
                                                 font.family: "Noto Color Emoji"
                                                 font.pixelSize: 26
@@ -2360,6 +2739,7 @@ ApplicationWindow {
                                             ColumnLayout {
                                                 spacing: 4
                                                 Label {
+                                                    textFormat: Text.PlainText
                                                     text: qsTr("WebXDC app")
                                                     color: "white"
                                                     font.bold: true
@@ -2382,6 +2762,7 @@ ApplicationWindow {
                                             visible: model.fileUrl.length > 0
                                             spacing: 10
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: "📄"
                                                 font.family: "Noto Color Emoji"
                                                 font.pixelSize: 26
@@ -2390,6 +2771,7 @@ ApplicationWindow {
                                             ColumnLayout {
                                                 spacing: 4
                                                 Label {
+                                                    textFormat: Text.PlainText
                                                     text: model.fileName.length > 0 ? model.fileName
                                                                                     : qsTr("File")
                                                     color: "white"
@@ -2407,6 +2789,7 @@ ApplicationWindow {
 
                                         Label {
                                             id: bubbleText
+                                            textFormat: Text.PlainText
                                             visible: model.body.length > 0
                                             // A caption wraps to the width of the media above it
                                             // (image / audio / file) so it never stretches the
@@ -2442,16 +2825,25 @@ ApplicationWindow {
                                                     color: Qt.rgba(1, 1, 1, 0.18)
                                                     implicitHeight: 20
                                                     implicitWidth: chipRow.implicitWidth + 12
-                                                    // Reactor names (3rd tab field), shown on hover.
-                                                    ToolTip.text: modelData.split("\t")[2] || ""
-                                                    ToolTip.visible: chipMouse.containsMouse && ToolTip.text.length > 0
-                                                    ToolTip.delay: 300
+                                                    // Reactor names (3rd tab field), shown on hover —
+                                                    // as plain text: they are chosen by other users.
+                                                    ToolTip {
+                                                        id: chipTip
+                                                        text: modelData.split("\t")[2] || ""
+                                                        visible: chipMouse.containsMouse && text.length > 0
+                                                        delay: 300
+                                                        contentItem: Label {
+                                                            textFormat: Text.PlainText
+                                                            text: chipTip.text
+                                                            wrapMode: Text.Wrap
+                                                        }
+                                                    }
                                                     Row {
                                                         id: chipRow
                                                         anchors.centerIn: parent
                                                         spacing: 3
-                                                        Label { text: modelData.split("\t")[0]; font.family: "Noto Color Emoji"; font.pixelSize: 13; renderType: Text.NativeRendering }
-                                                        Label { text: modelData.split("\t")[1]; font.pixelSize: 11; color: "white"; opacity: 0.85 }
+                                                        Label { textFormat: Text.PlainText; text: modelData.split("\t")[0]; font.family: "Noto Color Emoji"; font.pixelSize: 13; renderType: Text.NativeRendering }
+                                                        Label { textFormat: Text.PlainText; text: modelData.split("\t")[1]; font.pixelSize: 11; color: "white"; opacity: 0.85 }
                                                     }
                                                     MouseArea {
                                                         id: chipMouse
@@ -2468,6 +2860,7 @@ ApplicationWindow {
                                         RowLayout {
                                             spacing: 4
                                             Label {
+                                                textFormat: Text.PlainText
                                                 visible: model.edited && !model.retracted
                                                 text: qsTr("edited")
                                                 color: "white"
@@ -2476,6 +2869,7 @@ ApplicationWindow {
                                                 font.italic: true
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 text: window.msgTime(model.timestamp)
                                                 color: "white"
                                                 opacity: 0.55
@@ -2490,6 +2884,7 @@ ApplicationWindow {
                                                 opacity: 0.7
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 visible: model.outgoing && model.state.length > 0
                                                 text: model.state === "displayed" || model.state === "received" ? "✓✓"
                                                     : model.state === "sent" ? "✓"
@@ -2528,6 +2923,7 @@ ApplicationWindow {
                                     }
                                     Label {
                                         id: replyPreviewText
+                                        textFormat: Text.PlainText
                                         x: 14
                                         y: 6
                                         width: parent.width - 22
@@ -2552,8 +2948,9 @@ ApplicationWindow {
                             padding: 4
                             contentItem: RowLayout {
                                 spacing: 6
-                                Label { text: "✎"; opacity: 0.7 }
+                                Label { textFormat: Text.PlainText; text: "✎"; opacity: 0.7 }
                                 Label {
+                                    textFormat: Text.PlainText
                                     Layout.fillWidth: true
                                     text: qsTr("Editing: %1").arg(window.editOriginalText)
                                     elide: Text.ElideRight
@@ -2599,6 +2996,7 @@ ApplicationWindow {
                                                 }
                                             }
                                             Label {
+                                                textFormat: Text.PlainText
                                                 Layout.fillWidth: true
                                                 text: qsTr("Recording… ") + window.fmtSecs(window.recordSecs)
                                             }
@@ -2775,7 +3173,7 @@ ApplicationWindow {
                                                             width: 76
                                                             height: 76
                                                             onClicked: {
-                                                                backend.sendSticker(window.currentPeerJid, modelData)
+                                                                { messageList.stickToEnd = true; backend.sendSticker(window.currentPeerJid, modelData) }
                                                                 emojiPopup.close()
                                                             }
                                                             contentItem: AnimatedImage {
@@ -2789,6 +3187,7 @@ ApplicationWindow {
                                                         }
                                                     }
                                                     Label {
+                                                        textFormat: Text.PlainText
                                                         anchors.centerIn: parent
                                                         width: parent.width - 24
                                                         visible: window.stickerList.length === 0
@@ -3022,15 +3421,18 @@ ApplicationWindow {
         width: 360
         standardButtons: Dialog.Ok | Dialog.Cancel
         onAccepted: {
-            if (window.pendingAttachPaths.length > 0 && window.currentPeerJid.length > 0)
+            if (window.pendingAttachPaths.length > 0 && window.currentPeerJid.length > 0) {
+                messageList.stickToEnd = true
                 backend.sendFiles(window.currentPeerJid, window.pendingAttachPaths.join("\n"),
                                   attachCaptionField.text.trim())
+            }
             window.pendingAttachPaths = []
         }
         onRejected: window.pendingAttachPaths = []
         contentItem: ColumnLayout {
             spacing: 8
             Label {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: window.pendingAttachPaths.map(function (p) {
                     return p.split('/').pop()
@@ -3051,7 +3453,8 @@ ApplicationWindow {
     FileDialog {
         id: storyFileDialog
         title: qsTr("Choose a photo or video")
-        nameFilters: [qsTr("Media (*.png *.jpg *.jpeg *.gif *.webp *.mp4 *.webm *.mov *.mkv)")]
+        // Formats whose location/device metadata can be removed before publishing.
+        nameFilters: [qsTr("Media (*.png *.jpg *.jpeg *.gif *.webp *.mp4 *.m4v *.mov *.3gp *.webm *.mkv)")]
         onAccepted: {
             window.pendingStoryPath = selectedFile.toString().replace(/^file:\/\//, "")
             storyTitleField.text = ""
@@ -3073,6 +3476,7 @@ ApplicationWindow {
         contentItem: ColumnLayout {
             spacing: 8
             Label {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: window.pendingStoryPath.split('/').pop()
                 elide: Text.ElideMiddle
@@ -3083,11 +3487,32 @@ ApplicationWindow {
                 placeholderText: qsTr("Caption (optional)")
                 Layout.fillWidth: true
             }
+            Label {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: qsTr("Visible to your contacts for 24 hours. Location and device data are removed from the file.")
+                wrapMode: Text.Wrap
+                opacity: 0.6
+                font.pixelSize: 11
+            }
         }
     }
-    // Sequential story viewer: plays through all stories with segmented progress bars and a
-    // 6s auto-advance per item (Instagram/WhatsApp-style). Images show in-app; video items show
-    // a Play button (system player) and pause the timer.
+    Dialog {
+        id: storyDeleteDialog
+        property string uuid: ""
+        title: qsTr("Delete story?")
+        anchors.centerIn: parent
+        modal: true
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: if (uuid.length > 0) backend.retractStory(uuid)
+        onClosed: storyViewer.dialogOpen = false
+        Label { textFormat: Text.PlainText; text: qsTr("It will be removed for all your contacts.") }
+    }
+    // Story viewer: plays one publisher's stories oldest first (as on Android) with segmented
+    // progress bars and a 6s auto-advance per image. The timer only runs while the image is
+    // loaded, the window is active, no dialog is open and the user isn't holding it (press
+    // and hold pauses). Videos are downloaded when they come up, then show a Play button (system
+    // player; there is no Qt Multimedia here) and wait for a tap.
     Popup {
         id: storyViewer
         parent: Overlay.overlay
@@ -3100,37 +3525,125 @@ ApplicationWindow {
 
         readonly property int seconds: 6
         property real progress: 0
-        readonly property bool currentIsVideo: pager.currentIndex >= 0
-            && storyModel.mimeAt(pager.currentIndex).indexOf("video") === 0
+        // The shown story, kept across model resets (a media download reloads the model).
+        property string contact: ""
+        property string uuid: ""
+        property string shownUuid: ""
+        property string currentPath: ""
+        property string currentMime: ""
+        property double currentPublished: 0
+        property bool held: false
+        property bool dialogOpen: false
+        readonly property bool currentIsVideo: currentMime.indexOf("video") === 0
+        // Runs once the image is on screen (as on Android), not merely downloaded.
+        readonly property bool playing: opened && !currentIsVideo && currentPath.length > 0
+            && pager.currentItem !== null && pager.currentItem.mediaShown
+            && !held && !dialogOpen && Qt.application.state === Qt.ApplicationActive
 
-        function openAt(i) {
+        function openFor(c, u) {
+            contact = c
+            uuid = u
+            shownUuid = ""
+            progressAnim.stop()
+            progress = 0
+            currentPath = ""
+            currentMime = ""
             open()
-            pager.positionViewAtIndex(i, ListView.SnapPosition)
+            viewerStories.loadContact(window.accountJid, c)
+        }
+        // The model was (re)loaded (opened, a media download landed, a story was removed).
+        // `visible`, not `opened`: the stories usually arrive while the open transition still
+        // runs, and skipping them then left the timer stopped until some later reload.
+        function resync() {
+            if (!visible)
+                return
+            if (pager.count === 0) {
+                close()
+                return
+            }
+            var i = viewerStories.indexOf(contact, uuid)
+            if (i < 0)
+                i = Math.min(Math.max(pager.currentIndex, 0), pager.count - 1)
+            if (pager.currentIndex !== i)
+                pager.currentIndex = i
+            else
+                refreshCurrent()
+        }
+        // `uuid` is the story to show; it only changes by navigation. A ListView moves its
+        // currentIndex on a model reset, so an index that doesn't match is moved back (or, if
+        // that story is gone, accepted).
+        function refreshCurrent() {
+            var i = pager.currentIndex
+            if (!visible || i < 0)
+                return
+            var u = viewerStories.uuidAt(i)
+            if (u !== uuid) {
+                var j = viewerStories.indexOf(contact, uuid)
+                if (j >= 0 && j !== i) {
+                    pager.currentIndex = j
+                    return
+                }
+                uuid = u
+            }
+            var changed = u !== shownUuid
+            shownUuid = u
+            currentMime = viewerStories.mimeAt(i)
+            currentPath = viewerStories.pathAt(i)
+            currentPublished = viewerStories.publishedAt(i)
+            if (changed)
+                restartProgress()
+            else
+                updatePlayback()
+        }
+        function goTo(i) {
+            uuid = viewerStories.uuidAt(i)
             pager.currentIndex = i
-            restartProgress()
         }
         function goNext() {
             if (pager.currentIndex + 1 < pager.count)
-                pager.currentIndex += 1
+                goTo(pager.currentIndex + 1)
             else
                 storyViewer.close()
         }
         function goPrev() {
             if (pager.currentIndex > 0)
-                pager.currentIndex -= 1
+                goTo(pager.currentIndex - 1)
             else
                 restartProgress()
         }
-        // Run the countdown for images; pause it on video items so they aren't skipped.
         function restartProgress() {
             progressAnim.stop()
-            storyViewer.progress = 0
-            if (!currentIsVideo)
-                progressAnim.start()
+            progress = 0
+            updatePlayback()
+        }
+        function updatePlayback() {
+            if (playing) {
+                if (progressAnim.paused)
+                    progressAnim.resume()
+                else if (!progressAnim.running)
+                    progressAnim.start()
+            } else if (progressAnim.running && !progressAnim.paused) {
+                progressAnim.pause()
+            }
         }
 
-        onOpened: restartProgress()
-        onClosed: progressAnim.stop()
+        onPlayingChanged: updatePlayback()
+        onOpened: resync()
+        onClosed: {
+            progressAnim.stop()
+            held = false
+            contact = ""
+            uuid = ""
+            shownUuid = ""
+        }
+
+        // Deferred: the ListView handles the same reset after us and would undo a selection
+        // made here (it restores its cleared currentIndex), leaving the timer stopped until
+        // some later reload.
+        Connections {
+            target: viewerStories
+            function onModelReset() { Qt.callLater(storyViewer.resync) }
+        }
 
         NumberAnimation {
             id: progressAnim
@@ -3138,13 +3651,12 @@ ApplicationWindow {
             property: "progress"
             from: 0; to: 1
             duration: storyViewer.seconds * 1000
-            onFinished: storyViewer.goNext()
+            onFinished: if (storyViewer.progress >= 1) storyViewer.goNext()
         }
 
         contentItem: Item {
             // One story per page (driven by currentIndex; nav via the tap zones below).
             ListView {
-                FastScroll {}
                 id: pager
                 anchors.fill: parent
                 orientation: ListView.Horizontal
@@ -3152,62 +3664,74 @@ ApplicationWindow {
                 highlightRangeMode: ListView.StrictlyEnforceRange
                 highlightMoveDuration: 150
                 interactive: false
-                model: storyModel
-                onCurrentIndexChanged: if (storyViewer.opened) storyViewer.restartProgress()
+                model: viewerStories
+                onCurrentIndexChanged: storyViewer.refreshCurrent()
+                // Also covers a selection lost to a reset (see the Connections above).
+                onCountChanged: if (storyViewer.visible) Qt.callLater(storyViewer.resync)
 
                 delegate: Item {
                     width: pager.width
                     height: pager.height
                     readonly property bool isVideo: model.mime.indexOf("video") === 0
+                    // Read by the overlay controls above the tap zones.
+                    readonly property string storyPath: model.localPath
+                    readonly property bool storyLoading: model.downloading
+                    readonly property bool storyFailed: model.failed
+                    readonly property bool mediaShown: isVideo || storyImage.status === Image.Ready
+                    // Videos are downloaded when they come up (images are prefetched).
+                    readonly property bool wantsFetch: ListView.isCurrentItem && storyViewer.visible
+                        && model.localPath.length === 0 && !model.downloading && !model.failed
+                    onWantsFetchChanged: if (wantsFetch) viewerStories.fetchMedia(index)
+                    Component.onCompleted: if (wantsFetch) viewerStories.fetchMedia(index)
 
-                    Image {
+                    AnimatedImage {
+                        id: storyImage
                         anchors.fill: parent
                         anchors.margins: 8
                         fillMode: Image.PreserveAspectFit
                         cache: false
+                        playing: storyViewer.opened
                         visible: !isVideo && model.localPath.length > 0
                         source: (!isVideo && model.localPath.length > 0) ? "file:" + model.localPath : ""
                     }
-                    // Video / still-loading placeholder.
-                    ColumnLayout {
-                        anchors.centerIn: parent
-                        spacing: 10
-                        visible: isVideo || model.localPath.length === 0
-                        Label {
-                            Layout.alignment: Qt.AlignHCenter
-                            text: isVideo ? "🎬" : "⏳"
-                            font.pixelSize: 56
-                            color: "white"
-                        }
-                        Button {
-                            Layout.alignment: Qt.AlignHCenter
-                            visible: isVideo && model.localPath.length > 0
-                            text: qsTr("Play video")
-                            onClicked: Qt.openUrlExternally("file://" + model.localPath)
-                        }
-                    }
-                    // Author + caption overlay.
                     Label {
+                        textFormat: Text.PlainText
+                        anchors.centerIn: parent
+                        anchors.verticalCenterOffset: -70
+                        visible: isVideo
+                        text: "🎬"
+                        font.pixelSize: 56
+                        color: "white"
+                    }
+                    // Caption overlay.
+                    Label {
+                        textFormat: Text.PlainText
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.bottom: parent.bottom
                         anchors.margins: 18
-                        text: (model.own ? qsTr("My story") : model.contact.split('@')[0])
-                              + (model.title.length > 0 ? " · " + model.title : "")
+                        visible: model.title.length > 0
+                        text: model.title
                         color: "white"
                         wrapMode: Text.Wrap
                         font.pixelSize: 14
+                        style: Text.Outline
+                        styleColor: "#80000000"
                     }
                 }
             }
 
             // Navigation tap zones (above the pager): left third = previous, right = next.
+            // Press and hold anywhere pauses.
             MouseArea {
                 anchors.left: parent.left
                 anchors.top: parent.top
                 anchors.bottom: parent.bottom
                 width: parent.width * 0.33
                 onClicked: storyViewer.goPrev()
+                onPressAndHold: storyViewer.held = true
+                onReleased: storyViewer.held = false
+                onCanceled: storyViewer.held = false
             }
             MouseArea {
                 anchors.right: parent.right
@@ -3215,42 +3739,116 @@ ApplicationWindow {
                 anchors.bottom: parent.bottom
                 width: parent.width * 0.67
                 onClicked: storyViewer.goNext()
+                onPressAndHold: storyViewer.held = true
+                onReleased: storyViewer.held = false
+                onCanceled: storyViewer.held = false
             }
 
-            // Segmented progress bars (one per story); the active one animates over 6s.
+            // Loading / retry / play controls of the current story. Declared after (above) the
+            // tap zones, so they get the clicks.
+            ColumnLayout {
+                id: storyControls
+                anchors.centerIn: parent
+                z: 6
+                spacing: 10
+                readonly property var cur: pager.currentItem
+                readonly property bool ready: cur !== null && cur.storyPath.length > 0
+                readonly property bool failed: cur !== null && !ready && cur.storyFailed
+                BusyIndicator {
+                    Layout.alignment: Qt.AlignHCenter
+                    visible: storyControls.cur !== null && !storyControls.ready && !storyControls.failed
+                    running: visible
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    Layout.alignment: Qt.AlignHCenter
+                    visible: storyControls.failed
+                    text: qsTr("This story couldn't be loaded")
+                    color: "white"
+                }
+                Button {
+                    Layout.alignment: Qt.AlignHCenter
+                    visible: storyControls.failed
+                    text: qsTr("Retry")
+                    onClicked: viewerStories.fetchMedia(pager.currentIndex)
+                }
+                Button {
+                    Layout.alignment: Qt.AlignHCenter
+                    visible: storyControls.ready && storyViewer.currentIsVideo
+                    text: qsTr("▶ Play video")
+                    font.pixelSize: 16
+                    highlighted: true
+                    onClicked: Qt.openUrlExternally("file://" + storyControls.cur.storyPath)
+                }
+            }
+
+            // Segmented progress bars (one per story); the active one fills over 6s.
             Row {
+                id: progressRow
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.margins: 8
                 spacing: 4
                 Repeater {
-                    model: storyModel
+                    model: viewerStories
                     delegate: Rectangle {
                         height: 3
                         radius: 1.5
                         color: Qt.rgba(1, 1, 1, 0.3)
-                        width: (pager.width - 16 - Math.max(0, pager.count - 1) * 4) / Math.max(1, pager.count)
+                        width: (progressRow.width - Math.max(0, pager.count - 1) * 4) / Math.max(1, pager.count)
                         Rectangle {
                             height: parent.height
                             radius: 1.5
                             color: "white"
                             width: parent.width * (index < pager.currentIndex ? 1
-                                                  : (index === pager.currentIndex ? storyViewer.progress : 0))
+                                                  : (index === pager.currentIndex
+                                                     ? (storyViewer.currentIsVideo ? 1 : storyViewer.progress) : 0))
                         }
                     }
                 }
             }
 
-            // Close (above the tap zones).
-            ToolButton {
-                anchors.top: parent.top
+            // Header: publisher + age, delete (own), close — above the tap zones.
+            RowLayout {
+                anchors.top: progressRow.bottom
+                anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.topMargin: 14
+                anchors.margins: 8
                 z: 5
-                text: "✕"
-                Material.foreground: "white"
-                onClicked: storyViewer.close()
+                spacing: 8
+                Label {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: pager.currentIndex < 0 ? ""
+                          : (storyViewer.contact.toLowerCase() === window.accountJid.toLowerCase()
+                             ? qsTr("My story") : storyViewer.contact.split('@')[0])
+                            + " · " + window.agoText(storyViewer.currentPublished)
+                    color: "white"
+                    font.bold: true
+                    elide: Text.ElideRight
+                    style: Text.Outline
+                    styleColor: "#80000000"
+                }
+                ToolButton {
+                    visible: storyViewer.contact.toLowerCase() === window.accountJid.toLowerCase()
+                             && pager.currentIndex >= 0
+                    enabled: backend.connected
+                    text: "🗑"
+                    Material.foreground: "white"
+                    ToolTip.text: qsTr("Delete story")
+                    ToolTip.visible: hovered
+                    onClicked: {
+                        storyViewer.dialogOpen = true
+                        storyDeleteDialog.uuid = storyViewer.uuid
+                        storyDeleteDialog.open()
+                    }
+                }
+                ToolButton {
+                    text: "✕"
+                    Material.foreground: "white"
+                    onClicked: storyViewer.close()
+                }
             }
         }
     }
@@ -3280,6 +3878,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     spacing: 1
                     Label {
+                        textFormat: Text.PlainText
                         text: window.currentPeerName
                         font.bold: true
                         font.pixelSize: 18
@@ -3287,6 +3886,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                     }
                     Label {
+                        textFormat: Text.PlainText
                         text: window.currentPeerJid
                         opacity: 0.6
                         font.pixelSize: 11
@@ -3313,8 +3913,9 @@ ApplicationWindow {
                         delegate: ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 0
-                            Label { text: modelData.label; font.bold: true; font.pixelSize: 11; opacity: 0.65 }
+                            Label { textFormat: Text.PlainText; text: modelData.label; font.bold: true; font.pixelSize: 11; opacity: 0.65 }
                             Label {
+                                textFormat: Text.PlainText
                                 text: modelData.value
                                 wrapMode: Text.Wrap
                                 Layout.fillWidth: true
@@ -3322,6 +3923,7 @@ ApplicationWindow {
                         }
                     }
                     Label {
+                        textFormat: Text.PlainText
                         visible: window.detailsFields.length === 0
                         text: qsTr("No profile information yet…")
                         opacity: 0.6
@@ -3331,6 +3933,7 @@ ApplicationWindow {
                     // unsubscribe), "Send" = they see us (from/both, sends (un)subscribed).
                     MenuSeparator { Layout.fillWidth: true; visible: !window.currentPeerIsMuc }
                     Label {
+                        textFormat: Text.PlainText
                         visible: !window.currentPeerIsMuc
                         text: qsTr("Presence")
                         font.bold: true
@@ -3343,8 +3946,9 @@ ApplicationWindow {
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 1
-                            Label { text: qsTr("Receive presence updates"); font.pixelSize: 13 }
+                            Label { textFormat: Text.PlainText; text: qsTr("Receive presence updates"); font.pixelSize: 13 }
                             Label {
+                                textFormat: Text.PlainText
                                 text: window.presAskPending
                                       ? qsTr("Requested — waiting for them to allow it")
                                       : qsTr("See when this contact is online")
@@ -3367,8 +3971,9 @@ ApplicationWindow {
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 1
-                            Label { text: qsTr("Send presence updates"); font.pixelSize: 13 }
+                            Label { textFormat: Text.PlainText; text: qsTr("Send presence updates"); font.pixelSize: 13 }
                             Label {
+                                textFormat: Text.PlainText
                                 text: qsTr("Let this contact see when you're online")
                                 font.pixelSize: 11
                                 opacity: 0.6
@@ -3385,6 +3990,7 @@ ApplicationWindow {
                     // Encryption keys (1:1 only) — verify/trust the contact's devices.
                     MenuSeparator { Layout.fillWidth: true; visible: !window.currentPeerIsMuc }
                     Label {
+                        textFormat: Text.PlainText
                         visible: !window.currentPeerIsMuc
                         text: qsTr("Encryption keys")
                         font.bold: true
@@ -3399,6 +4005,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 spacing: 1
                                 Label {
+                                    textFormat: Text.PlainText
                                     text: model.isOwn ? qsTr("This device")
                                         : (model.active ? qsTr("Device %1").arg(model.deviceId)
                                                         : qsTr("Device %1 (inactive)").arg(model.deviceId))
@@ -3406,6 +4013,7 @@ ApplicationWindow {
                                     font.pixelSize: 12
                                 }
                                 Label {
+                                    textFormat: Text.PlainText
                                     Layout.fillWidth: true
                                     text: model.fingerprint
                                     font.family: "monospace"
@@ -3493,6 +4101,7 @@ ApplicationWindow {
         height: toastLabel.implicitHeight + 16
         Label {
             id: toastLabel
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: window.toastText
             color: "white"
@@ -3640,6 +4249,7 @@ ApplicationWindow {
                     sourceSize.height: 192
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: "monocles chat"
                     font.pixelSize: 20
                     font.bold: true
@@ -3654,6 +4264,7 @@ ApplicationWindow {
                     implicitHeight: versionLabel.implicitHeight + 8
                     Label {
                         id: versionLabel
+                        textFormat: Text.PlainText
                         anchors.centerIn: parent
                         text: backend.appVersion
                         color: "white"
@@ -3662,6 +4273,7 @@ ApplicationWindow {
                     }
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("A native desktop client for monocles chat — XMPP messaging with PQ OMEMO2 (post-quantum) end-to-end encryption.")
                     wrapMode: Text.Wrap
                     horizontalAlignment: Text.AlignHCenter
@@ -3669,6 +4281,7 @@ ApplicationWindow {
                     opacity: 0.8
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: "© 2020–2026 Arne-Brün Vogelsang"
                     Layout.alignment: Qt.AlignHCenter
                     font.pixelSize: 12
@@ -3690,10 +4303,12 @@ ApplicationWindow {
                 MenuSeparator { Layout.fillWidth: true }
 
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("License")
                     font.bold: true
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("This application is licensed under the GNU GPL v3 or later. It bundles the AGPLv3 libsignal library, so the combined work is distributed under the terms of the GNU AGPL v3.")
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
@@ -3702,6 +4317,7 @@ ApplicationWindow {
                 }
 
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Legal")
                     font.bold: true
                     Layout.topMargin: 6
@@ -3722,6 +4338,7 @@ ApplicationWindow {
                 }
 
                 Label {
+                    textFormat: Text.PlainText
                     text: qsTr("Built with")
                     font.bold: true
                     Layout.topMargin: 6
@@ -3771,6 +4388,7 @@ ApplicationWindow {
         contentItem: ColumnLayout {
             spacing: 6
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("Chat background")
                 font.bold: true
             }
@@ -3809,6 +4427,7 @@ ApplicationWindow {
                 }
             }
             Label {
+                textFormat: Text.PlainText
                 visible: backend.chatBgMode === "custom" && backend.chatBgCustomPath.length > 0
                 Layout.fillWidth: true
                 Layout.leftMargin: 12
@@ -3825,10 +4444,12 @@ ApplicationWindow {
             }
             // --- Camera (video calls) ---
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("Camera")
                 font.bold: true
             }
             Label {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: qsTr("Used for video calls. “Automatic” picks a working color camera and skips infrared / depth sensors.")
                 wrapMode: Text.Wrap
@@ -3850,6 +4471,7 @@ ApplicationWindow {
                 color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
             }
             Label {
+                textFormat: Text.PlainText
                 text: qsTr("More settings are coming soon.")
                 opacity: 0.6
                 font.pixelSize: 12
@@ -4108,16 +4730,33 @@ ApplicationWindow {
     }
 
     // --- Feeds (XEP-0472): compose post, follow a feed, view a post + comments -----
+    FileDialog {
+        id: postAttachmentDialog
+        title: qsTr("Attach a file")
+        nameFilters: [qsTr("Media (*.png *.jpg *.jpeg *.gif *.webp *.mp4 *.m4v *.mov *.3gp *.webm *.mkv)"),
+                      qsTr("All files (*)")]
+        onAccepted: window.pendingPostAttachment = selectedFile.toString().replace(/^file:\/\//, "")
+    }
     Dialog {
         id: newPostDialog
-        title: qsTr("New post")
+        title: window.editingPostId.length > 0 ? qsTr("Edit post") : qsTr("New post")
         anchors.centerIn: parent
         modal: true
-        width: 400
+        width: 440
         standardButtons: Dialog.Ok | Dialog.Cancel
         onAccepted: {
-            if (newPostTitle.text.trim().length > 0 || newPostContent.text.trim().length > 0)
-                backend.publishPost(newPostTitle.text.trim(), newPostContent.text.trim())
+            var title = newPostTitle.text.trim()
+            var content = newPostContent.text.trim()
+            var link = newPostLink.text.trim()
+            var hasAttachment = window.pendingPostAttachment.length > 0 || window.editingPostAttachment.length > 0
+            if (title.length > 0 || content.length > 0 || hasAttachment) {
+                if (window.editingPostId.length > 0)
+                    backend.editPost(window.editingPostId, title, content, window.pendingPostAttachment, link)
+                else
+                    backend.publishPost(title, content, window.pendingPostAttachment, link)
+            }
+            window.pendingPostAttachment = ""
+            window.editingPostId = ""
         }
         contentItem: ColumnLayout {
             spacing: 8
@@ -4128,12 +4767,59 @@ ApplicationWindow {
             }
             TextArea {
                 id: newPostContent
-                placeholderText: qsTr("What's on your mind?")
+                placeholderText: qsTr("What's on your mind? (Markdown and #hashtags work)")
                 wrapMode: TextArea.Wrap
                 Layout.fillWidth: true
-                Layout.preferredHeight: 120
+                Layout.preferredHeight: 140
+            }
+            TextField {
+                id: newPostLink
+                placeholderText: qsTr("Link (optional)")
+                inputMethodHints: Qt.ImhUrlCharactersOnly
+                Layout.fillWidth: true
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Button {
+                    text: window.pendingPostAttachment.length > 0 || window.editingPostAttachment.length > 0
+                          ? qsTr("Replace attachment…") : qsTr("Attach…")
+                    onClicked: postAttachmentDialog.open()
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: window.pendingPostAttachment.length > 0
+                          ? window.pendingPostAttachment.split('/').pop()
+                          : decodeURIComponent(window.editingPostAttachment.split('/').pop())
+                    elide: Text.ElideMiddle
+                    opacity: 0.7
+                }
+                ToolButton {
+                    visible: window.pendingPostAttachment.length > 0
+                    text: "✕"
+                    onClicked: window.pendingPostAttachment = ""
+                }
+            }
+            Label {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                visible: window.pendingPostAttachment.length > 0
+                text: qsTr("Location and device data are removed from photos and videos before upload.")
+                wrapMode: Text.Wrap
+                opacity: 0.6
+                font.pixelSize: 11
             }
         }
+    }
+    Dialog {
+        id: postDeleteDialog
+        property string postId: ""
+        title: qsTr("Delete post?")
+        anchors.centerIn: parent
+        modal: true
+        standardButtons: Dialog.Yes | Dialog.No
+        onAccepted: if (postId.length > 0) backend.retractPost(postId)
+        Label { textFormat: Text.PlainText; text: qsTr("It will be removed for everyone who follows you.") }
     }
     Dialog {
         id: followDialog
@@ -4142,10 +4828,15 @@ ApplicationWindow {
         modal: true
         width: 380
         standardButtons: Dialog.Ok | Dialog.Cancel
-        onAccepted: if (followJidField.text.trim().length > 0) backend.followFeed(followJidField.text.trim())
+        onAccepted: {
+            if (followJidField.text.trim().length > 0)
+                backend.followFeed(followJidField.text.trim())
+            window.refreshFollowed()
+        }
         contentItem: ColumnLayout {
             spacing: 8
             Label {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: qsTr("Enter the bare JID whose social feed you want to follow.")
                 wrapMode: Text.Wrap
@@ -4164,87 +4855,192 @@ ApplicationWindow {
         id: postDetailDialog
         anchors.centerIn: parent
         modal: true
-        width: Math.min(window.width - 80, 540)
-        height: Math.min(window.height - 80, 620)
+        width: Math.min(window.width - 80, 600)
+        height: Math.min(window.height - 80, 800)
         standardButtons: Dialog.Close
         title: window.feedPostTitle.length > 0 ? window.feedPostTitle
                                                : qsTr("%1's post").arg(window.feedPostAuthor.split('@')[0])
+        // The title is the author's text: shown as plain text (the default header would
+        // interpret markup, e.g. load remote images).
+        header: Label {
+            textFormat: Text.PlainText
+            text: postDetailDialog.title
+            font.bold: true
+            font.pixelSize: 16
+            elide: Text.ElideRight
+            padding: 20
+            bottomPadding: 0
+        }
         contentItem: ColumnLayout {
             spacing: 8
-            Label {
-                text: window.feedPostAuthor.split('@')[0] + " · " + window.agoText(window.feedPostPublished)
-                opacity: 0.6
-                font.pixelSize: 11
-            }
-            // Post body — capped + scrollable so a long post never squeezes out the comments.
-            Flickable {
-                FastScroll {}
+            RowLayout {
                 Layout.fillWidth: true
-                visible: window.feedPostContent.length > 0
-                Layout.preferredHeight: Math.min(postBodyLabel.implicitHeight, postDetailDialog.height * 0.35)
-                contentWidth: width
-                contentHeight: postBodyLabel.implicitHeight
-                clip: true
-                ScrollBar.vertical: ThinScrollBar {}
                 Label {
-                    id: postBodyLabel
-                    width: parent.width
-                    text: window.feedPostContent
-                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: window.feedPostAuthor.split('@')[0] + " · " + window.agoText(window.feedPostPublished)
+                    opacity: 0.6
+                    font.pixelSize: 11
                 }
-            }
-            MenuSeparator { Layout.fillWidth: true }
-            Label { text: qsTr("Comments"); font.bold: true; opacity: 0.8 }
-            ListView {
-                FastScroll {}
-                id: commentList
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                clip: true
-                spacing: 4
-                model: commentModel
-                ScrollBar.vertical: ThinScrollBar {}
-                delegate: ItemDelegate {
-                    width: ListView.view.width
-                    contentItem: ColumnLayout {
-                        spacing: 0
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Label {
-                                text: model.own ? qsTr("Me") : model.author.split('@')[0]
-                                font.bold: true
-                                font.pixelSize: 12
-                                elide: Text.ElideRight
-                                Layout.fillWidth: true
-                            }
-                            Label { text: window.agoText(model.published); opacity: 0.5; font.pixelSize: 10 }
-                            ToolButton {
-                                visible: model.own || window.feedPostOwn
-                                text: "✕"
-                                implicitWidth: 24
-                                implicitHeight: 24
-                                ToolTip.text: qsTr("Delete comment")
-                                ToolTip.visible: hovered
-                                onClicked: backend.retractComment(window.feedPostAuthor, window.feedPostId, model.postId)
-                            }
-                        }
-                        Label {
-                            text: model.content
-                            wrapMode: Text.Wrap
-                            font.pixelSize: 12
-                            Layout.fillWidth: true
-                        }
+                ToolButton {
+                    // A link to a contacts-only post would only work for those who see it anyway.
+                    visible: window.feedPostPublic
+                    text: "🔗"
+                    ToolTip.text: qsTr("Copy link to post")
+                    ToolTip.visible: hovered
+                    onClicked: {
+                        window.copyText(backend.postUri(window.feedPostAuthor, window.feedPostId))
+                        window.toastText = qsTr("Link copied")
+                        toastTimer.restart()
                     }
                 }
-                Label {
-                    anchors.centerIn: parent
-                    visible: commentList.count === 0
-                    text: qsTr("No comments yet")
-                    opacity: 0.6
+            }
+            // The post and its comments scroll together (as on Android); only the reply field
+            // below stays put, so it's reachable however large the post's image is.
+            Flickable {
+                id: postScroll
+                FastScroll {}
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                contentWidth: width
+                contentHeight: postBodyColumn.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ThinScrollBar {}
+                // After sending a comment, follow the list down to it once it arrives.
+                property bool followNewComment: false
+                onContentHeightChanged: {
+                    if (followNewComment && contentHeight > height) {
+                        contentY = contentHeight - height
+                        followNewComment = false
+                    }
+                }
+                ColumnLayout {
+                    id: postBodyColumn
+                    // Leave room for the scroll bar.
+                    width: postScroll.width - 10
+                    spacing: 6
+                    Label {
+                        id: postBody
+                        visible: window.feedPostContent.length > 0
+                        Layout.fillWidth: true
+                        text: window.feedPostHtml
+                        textFormat: Text.RichText
+                        wrapMode: Text.Wrap
+                        onLinkActivated: (url) => window.openSafeUrl(url)
+                    }
+                    Image {
+                        id: postImage
+                        visible: window.feedPostAttachmentPath.length > 0
+                        source: visible ? "file:" + window.feedPostAttachmentPath : ""
+                        Layout.fillWidth: true
+                        // At most half the visible area, so the comments start on screen; click
+                        // for the full image.
+                        Layout.preferredHeight: visible && implicitWidth > 0
+                            ? Math.min(postScroll.height * 0.5, width * implicitHeight / implicitWidth) : 0
+                        fillMode: Image.PreserveAspectFit
+                        horizontalAlignment: Image.AlignLeft
+                        asynchronous: true
+                        cache: true
+                        sourceSize.width: 1200
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: { imageViewer.path = window.feedPostAttachmentPath; imageViewer.open() }
+                        }
+                    }
+                    Label {
+                        id: postFile
+                        visible: window.feedPostAttachmentUrl.length > 0 && window.feedPostAttachmentPath.length === 0
+                        Layout.fillWidth: true
+                        text: "<a href=\"" + window.feedPostAttachmentUrl.replace(/"/g, "%22") + "\">"
+                              + (window.feedPostAttachmentType.indexOf("video") === 0 ? "🎬 " : "📎 ")
+                              + qsTr("Open attachment") + "</a>"
+                        textFormat: Text.StyledText
+                        onLinkActivated: (url) => window.openSafeUrl(url)
+                    }
+                    Label {
+                        id: postLink
+                        visible: window.feedPostLink.length > 0
+                        Layout.fillWidth: true
+                        text: "🔗 <a href=\"" + window.feedPostLink.replace(/"/g, "%22") + "\">"
+                              + window.feedPostLink.replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</a>"
+                        textFormat: Text.StyledText
+                        elide: Text.ElideRight
+                        onLinkActivated: (url) => window.openSafeUrl(url)
+                    }
+                    // Heart "like" (a "♥" comment, as in the list and on Android).
+                    ToolButton {
+                        visible: window.feedPostCanComment
+                        enabled: backend.connected
+                        text: (window.feedPostLiked ? "♥ " : "♡ ") + window.feedPostLikes
+                        font.pixelSize: 15
+                        Material.foreground: window.feedPostLiked ? "#e0245e" : window.Material.foreground
+                        ToolTip.text: window.feedPostLiked ? qsTr("Unlike") : qsTr("Like")
+                        ToolTip.visible: hovered
+                        onClicked: backend.toggleLike(window.feedPostAuthor, window.feedPostId)
+                    }
+                    MenuSeparator { Layout.fillWidth: true }
+                    Label {
+                        textFormat: Text.PlainText
+                        text: window.feedPostCanComment
+                              ? qsTr("Comments (%1)").arg(commentRepeater.count)
+                              : qsTr("This post doesn't accept comments")
+                        font.bold: window.feedPostCanComment
+                        opacity: 0.8
+                    }
+                    Repeater {
+                        id: commentRepeater
+                        model: commentModel
+                        delegate: ItemDelegate {
+                            Layout.fillWidth: true
+                            contentItem: ColumnLayout {
+                                spacing: 0
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Label {
+                                        textFormat: Text.PlainText
+                                        text: model.own ? qsTr("Me") : model.author.split('@')[0]
+                                        font.bold: true
+                                        font.pixelSize: 12
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                    }
+                                    Label { textFormat: Text.PlainText; text: window.agoText(model.published); opacity: 0.5; font.pixelSize: 10 }
+                                    ToolButton {
+                                        visible: (model.own || window.feedPostOwn) && backend.connected
+                                        text: "✕"
+                                        implicitWidth: 24
+                                        implicitHeight: 24
+                                        ToolTip.text: qsTr("Delete comment")
+                                        ToolTip.visible: hovered
+                                        onClicked: backend.retractComment(window.feedPostAuthor, window.feedPostId, model.postId)
+                                    }
+                                }
+                                Label {
+                                    text: model.contentHtml
+                                    textFormat: Text.RichText
+                                    wrapMode: Text.Wrap
+                                    font.pixelSize: 12
+                                    Layout.fillWidth: true
+                                    onLinkActivated: (url) => window.openSafeUrl(url)
+                                }
+                            }
+                        }
+                    }
+                    Label {
+                        textFormat: Text.PlainText
+                        Layout.alignment: Qt.AlignHCenter
+                        Layout.topMargin: 8
+                        visible: commentRepeater.count === 0 && window.feedPostCanComment
+                        text: qsTr("No comments yet")
+                        opacity: 0.6
+                    }
                 }
             }
             RowLayout {
                 Layout.fillWidth: true
+                visible: window.feedPostCanComment
                 spacing: 6
                 TextField {
                     id: replyField
@@ -4259,6 +5055,7 @@ ApplicationWindow {
                     onClicked: {
                         backend.publishComment(window.feedPostAuthor, window.feedPostId, replyField.text.trim())
                         replyField.clear()
+                        postScroll.followNewComment = true
                     }
                 }
             }
@@ -4276,6 +5073,7 @@ ApplicationWindow {
         contentItem: ColumnLayout {
             spacing: 8
             Label {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: qsTr("Compare these fingerprints with %1 over a trusted channel. Turn a device off to stop encrypting to it.").arg(window.currentPeerName)
                 wrapMode: Text.Wrap
@@ -4294,6 +5092,7 @@ ApplicationWindow {
                 delegate: deviceRow
             }
             Label {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 visible: keysList.count === 0
                 text: qsTr("No devices seen yet — send a message first to fetch their keys.")
@@ -4381,7 +5180,7 @@ ApplicationWindow {
                         height: 20
                         radius: 10
                         color: Material.accent
-                        Label { anchors.centerIn: parent; text: "📷"; font.pixelSize: 10; font.family: "Noto Color Emoji"; renderType: Text.NativeRendering }
+                        Label { textFormat: Text.PlainText; anchors.centerIn: parent; text: "📷"; font.pixelSize: 10; font.family: "Noto Color Emoji"; renderType: Text.NativeRendering }
                     }
                     MouseArea {
                         anchors.fill: parent
@@ -4396,6 +5195,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     spacing: 1
                     Label {
+                        textFormat: Text.PlainText
                         text: backend.ownNick.length > 0 ? backend.ownNick
                                                          : window.accountJid.split("@")[0]
                         font.bold: true
@@ -4404,6 +5204,7 @@ ApplicationWindow {
                         Layout.fillWidth: true
                     }
                     Label {
+                        textFormat: Text.PlainText
                         text: window.accountJid
                         opacity: 0.6
                         font.pixelSize: 11
@@ -4423,7 +5224,7 @@ ApplicationWindow {
             MenuSeparator { Layout.fillWidth: true }
 
             // Status: availability + free-text message, broadcast to all contacts.
-            Label { text: qsTr("Status"); font.bold: true; opacity: 0.8 }
+            Label { textFormat: Text.PlainText; text: qsTr("Status"); font.bold: true; opacity: 0.8 }
             ComboBox {
                 id: ownShowBox
                 Layout.fillWidth: true
@@ -4440,7 +5241,7 @@ ApplicationWindow {
             }
             MenuSeparator { Layout.fillWidth: true }
 
-            Label { text: qsTr("Encryption"); font.bold: true; opacity: 0.8 }
+            Label { textFormat: Text.PlainText; text: qsTr("Encryption"); font.bold: true; opacity: 0.8 }
             // Blind-trust toggle (XEP-0384 trust management).
             RowLayout {
                 Layout.fillWidth: true
@@ -4448,8 +5249,9 @@ ApplicationWindow {
                 ColumnLayout {
                     Layout.fillWidth: true
                     spacing: 1
-                    Label { text: qsTr("Auto-trust new keys"); font.bold: true }
+                    Label { textFormat: Text.PlainText; text: qsTr("Auto-trust new keys"); font.bold: true }
                     Label {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         text: qsTr("Automatically trust new devices (blind trust). Turn off to approve each device manually.")
                         wrapMode: Text.Wrap
@@ -4471,8 +5273,9 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 spacing: 6
                 visible: backend.ownVerificationUri !== ""
-                Label { text: qsTr("Verification code"); font.bold: true }
+                Label { textFormat: Text.PlainText; text: qsTr("Verification code"); font.bold: true }
                 Label {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     text: qsTr("Let a contact scan this in monocles chat to verify this device's key. The same key, as a link, is below.")
                     wrapMode: Text.Wrap
@@ -4588,8 +5391,9 @@ ApplicationWindow {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 2
-                Label { text: qsTr("Reset encryption keys"); font.bold: true }
+                Label { textFormat: Text.PlainText; text: qsTr("Reset encryption keys"); font.bold: true }
                 Label {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     text: qsTr("Forget all stored contact device keys and sessions and rebuild them as you exchange messages. Your own key (fingerprint) is kept. Use this only if encryption gets stuck.")
                     wrapMode: Text.Wrap
@@ -4607,8 +5411,9 @@ ApplicationWindow {
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 2
-                Label { text: qsTr("Regenerate own identity (last resort)"); font.bold: true; color: "#d32f2f" }
+                Label { textFormat: Text.PlainText; text: qsTr("Regenerate own identity (last resort)"); font.bold: true; color: "#d32f2f" }
                 Label {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     text: qsTr("Generate a completely new encryption identity for this device. Your fingerprint changes and all your contacts have to verify you again. Use this only if you suspect your keys were compromised.")
                     wrapMode: Text.Wrap
@@ -4666,12 +5471,14 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 spacing: 2
                 Label {
+                    textFormat: Text.PlainText
                     text: model.isOwn ? qsTr("This device")
                         : (model.active ? qsTr("Device %1").arg(model.deviceId)
                                         : qsTr("Device %1 (inactive)").arg(model.deviceId))
                     font.bold: true
                 }
                 Label {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     text: model.fingerprint
                     font.family: "monospace"
@@ -4786,6 +5593,7 @@ ApplicationWindow {
                         visible: backend.remoteFrame.length > 0
                     }
                     Label {
+                        textFormat: Text.PlainText
                         anchors.centerIn: parent
                         visible: backend.remoteFrame.length === 0
                         text: qsTr("Waiting for video…")
@@ -4828,6 +5636,7 @@ ApplicationWindow {
                                 color: "white"
                             }
                             Label {
+                                textFormat: Text.PlainText
                                 Layout.alignment: Qt.AlignHCenter
                                 text: qsTr("Camera off")
                                 color: "white"
@@ -4850,6 +5659,7 @@ ApplicationWindow {
             }
 
             Label {
+                textFormat: Text.PlainText
                 Layout.alignment: Qt.AlignHCenter
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignHCenter
@@ -4859,6 +5669,7 @@ ApplicationWindow {
                 elide: Text.ElideRight
             }
             Label {
+                textFormat: Text.PlainText
                 Layout.alignment: Qt.AlignHCenter
                 opacity: 0.7
                 text: backend.callState === "incoming"
@@ -4885,6 +5696,7 @@ ApplicationWindow {
                     color: parent.trustColor
                 }
                 Label {
+                    textFormat: Text.PlainText
                     text: parent.callVerified ? qsTr("Verified · PQ OMEMO2")
                                               : qsTr("Encrypted · PQ OMEMO2")
                     color: parent.trustColor
@@ -4919,6 +5731,7 @@ ApplicationWindow {
                 contentItem: ColumnLayout {
                     spacing: 8
                     Label {
+                        textFormat: Text.PlainText
                         Layout.fillWidth: true
                         horizontalAlignment: Text.AlignHCenter
                         wrapMode: Text.Wrap
@@ -5130,6 +5943,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 spacing: 2
                 Label {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     horizontalAlignment: Text.AlignHCenter
                     font.pixelSize: 18
@@ -5138,6 +5952,7 @@ ApplicationWindow {
                     text: backend.conferenceRoom.split('@')[0]
                 }
                 Label {
+                    textFormat: Text.PlainText
                     Layout.fillWidth: true
                     horizontalAlignment: Text.AlignHCenter
                     opacity: 0.7
@@ -5205,6 +6020,7 @@ ApplicationWindow {
                         }
                         // Name + state caption over the bottom of the tile.
                         Label {
+                            textFormat: Text.PlainText
                             anchors.left: parent.left
                             anchors.right: parent.right
                             anchors.bottom: parent.bottom
@@ -5235,6 +6051,7 @@ ApplicationWindow {
                             opacity: model.state === "active" ? 1.0 : 0.5
                         }
                         Label {
+                            textFormat: Text.PlainText
                             Layout.alignment: Qt.AlignHCenter
                             Layout.maximumWidth: confGrid.cellWidth - 12
                             horizontalAlignment: Text.AlignHCenter
@@ -5242,6 +6059,7 @@ ApplicationWindow {
                             text: model.name
                         }
                         Label {
+                            textFormat: Text.PlainText
                             Layout.alignment: Qt.AlignHCenter
                             horizontalAlignment: Text.AlignHCenter
                             font.pixelSize: 11
@@ -5256,6 +6074,7 @@ ApplicationWindow {
 
                 // "Waiting" placeholder when we're the only one so far.
                 Label {
+                    textFormat: Text.PlainText
                     anchors.centerIn: parent
                     visible: confGrid.count === 0
                     opacity: 0.6

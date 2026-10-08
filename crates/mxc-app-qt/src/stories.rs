@@ -15,6 +15,8 @@ const ROLE_PUBLISHED: i32 = 260;
 const ROLE_OWN: i32 = 261;
 const ROLE_LOCAL_PATH: i32 = 262;
 const ROLE_AVATAR: i32 = 263;
+const ROLE_DOWNLOADING: i32 = 264;
+const ROLE_FAILED: i32 = 265;
 
 /// One story row, resolved for display.
 #[derive(Clone, Default)]
@@ -32,6 +34,11 @@ pub struct StoryEntry {
     pub local_path: String,
     /// Publisher's cached avatar path, or empty.
     pub avatar_path: String,
+    /// The media URL.
+    pub url: String,
+    /// Whether the media is being downloaded / its last download failed.
+    pub downloading: bool,
+    pub failed: bool,
 }
 
 #[cxx_qt::bridge]
@@ -66,9 +73,20 @@ pub mod qobject {
         #[cxx_name = "markSeen"]
         fn mark_seen(self: Pin<&mut StoryModel>);
 
-        /// (Re)load non-expired stories for the account.
+        /// (Re)load non-expired stories for the account, newest first.
         #[qinvokable]
         fn reload(self: Pin<&mut StoryModel>, jid: &QString);
+
+        /// (Re)load only `contact`'s non-expired stories, oldest first — the viewer plays one
+        /// publisher's stories in chronological order, as on Android.
+        #[qinvokable]
+        #[cxx_name = "loadContact"]
+        fn load_contact(self: Pin<&mut StoryModel>, jid: &QString, contact: &QString);
+
+        /// Row of the story `uuid` of `contact`, or -1.
+        #[qinvokable]
+        #[cxx_name = "indexOf"]
+        fn index_of(self: &StoryModel, contact: &QString, uuid: &QString) -> i32;
 
         /// Re-read for the last-loaded JID (after a media download completes).
         #[qinvokable]
@@ -83,6 +101,19 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "pathAt"]
         fn path_at(self: &StoryModel, index: i32) -> QString;
+        /// Id / publish time (unix seconds) of the story at `index`; empty / 0 if out of range.
+        #[qinvokable]
+        #[cxx_name = "uuidAt"]
+        fn uuid_at(self: &StoryModel, index: i32) -> QString;
+        #[qinvokable]
+        #[cxx_name = "publishedAt"]
+        fn published_at(self: &StoryModel, index: i32) -> i64;
+
+        /// Download the media of the story at `index` (videos are fetched on demand, and a
+        /// failed download is retried this way). Up to the manual-download size limit.
+        #[qinvokable]
+        #[cxx_name = "fetchMedia"]
+        fn fetch_media(self: Pin<&mut StoryModel>, index: i32);
     }
 
     extern "RustQt" {
@@ -117,6 +148,8 @@ pub mod qobject {
 #[derive(Default)]
 pub struct StoryModelRust {
     jid: String,
+    /// Only this publisher's stories, oldest first (the viewer); empty = all, newest first.
+    contact: String,
     items: Vec<StoryEntry>,
     unseen_count: i32,
 }
@@ -124,14 +157,30 @@ pub struct StoryModelRust {
 impl qobject::StoryModel {
     pub fn reload(mut self: Pin<&mut Self>, jid: &QString) {
         self.as_mut().rust_mut().jid = jid.to_string();
-        crate::session::load_stories(jid.to_string(), self.qt_thread());
+        self.as_mut().rust_mut().contact.clear();
+        crate::session::load_stories(jid.to_string(), None, self.qt_thread());
+    }
+
+    pub fn load_contact(mut self: Pin<&mut Self>, jid: &QString, contact: &QString) {
+        self.as_mut().rust_mut().jid = jid.to_string();
+        self.as_mut().rust_mut().contact = contact.to_string();
+        crate::session::load_stories(jid.to_string(), Some(contact.to_string()), self.qt_thread());
     }
 
     pub fn reload_self(self: Pin<&mut Self>) {
         let jid = self.jid.clone();
         if !jid.is_empty() {
-            crate::session::load_stories(jid, self.qt_thread());
+            let contact = Some(self.contact.clone()).filter(|c| !c.is_empty());
+            crate::session::load_stories(jid, contact, self.qt_thread());
         }
+    }
+
+    fn index_of(&self, contact: &QString, uuid: &QString) -> i32 {
+        let (contact, uuid) = (contact.to_string(), uuid.to_string());
+        self.items
+            .iter()
+            .position(|s| s.uuid == uuid && s.contact.eq_ignore_ascii_case(&contact))
+            .map_or(-1, |i| i as i32)
     }
 
     fn mime_at(&self, index: i32) -> QString {
@@ -146,6 +195,29 @@ impl qobject::StoryModel {
             .get(index as usize)
             .map(|s| QString::from(s.local_path.as_str()))
             .unwrap_or_default()
+    }
+
+    fn uuid_at(&self, index: i32) -> QString {
+        self.items
+            .get(index as usize)
+            .map(|s| QString::from(s.uuid.as_str()))
+            .unwrap_or_default()
+    }
+
+    fn published_at(&self, index: i32) -> i64 {
+        self.items.get(index as usize).map_or(0, |s| s.published)
+    }
+
+    fn fetch_media(self: Pin<&mut Self>, index: i32) {
+        let Some(s) = self.items.get(index as usize).filter(|s| s.local_path.is_empty()) else { return };
+        crate::session::prefetch_story_media(
+            s.url.clone(),
+            s.mime.clone(),
+            mxc_proto::xeps::http_upload::MANUAL_DOWNLOAD_LIMIT,
+            &self.qt_thread(),
+        );
+        // Show it as downloading (and no longer failed).
+        self.reload_self();
     }
 
     pub fn reset(mut self: Pin<&mut Self>, items: Vec<StoryEntry>) {
@@ -179,6 +251,8 @@ impl qobject::StoryModel {
             ROLE_OWN => QVariant::from(&item.own),
             ROLE_LOCAL_PATH => QVariant::from(&QString::from(item.local_path.as_str())),
             ROLE_AVATAR => QVariant::from(&QString::from(item.avatar_path.as_str())),
+            ROLE_DOWNLOADING => QVariant::from(&item.downloading),
+            ROLE_FAILED => QVariant::from(&item.failed),
             _ => QVariant::default(),
         }
     }
@@ -197,6 +271,8 @@ impl qobject::StoryModel {
         roles.insert(ROLE_OWN, QByteArray::from("own"));
         roles.insert(ROLE_LOCAL_PATH, QByteArray::from("localPath"));
         roles.insert(ROLE_AVATAR, QByteArray::from("avatarPath"));
+        roles.insert(ROLE_DOWNLOADING, QByteArray::from("downloading"));
+        roles.insert(ROLE_FAILED, QByteArray::from("failed"));
         roles
     }
 }

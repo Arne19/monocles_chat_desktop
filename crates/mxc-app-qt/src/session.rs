@@ -369,20 +369,32 @@ fn unix_now() -> i64 {
         .unwrap_or_default()
 }
 
-/// Load non-expired stories and reset the model; image media is fetched + cached lazily.
-pub fn load_stories(jid: String, qt: CxxQtThread<StoryModel>) {
+/// Load non-expired stories (all newest first, or only `contact`'s oldest first) and reset the
+/// model; media is fetched + cached lazily.
+pub fn load_stories(jid: String, contact: Option<String>, qt: CxxQtThread<StoryModel>) {
     runtime().spawn(async move {
         let Ok(store) = store().await else { return };
         let Ok(account_id) = store.upsert_account(&jid).await else { return };
-        let rows = store.recent_stories(account_id, unix_now()).await.unwrap_or_default();
+        let mut rows = store.recent_stories(account_id, unix_now()).await.unwrap_or_default();
+        if let Some(contact) = &contact {
+            rows.retain(|s| s.contact.eq_ignore_ascii_case(contact));
+            rows.reverse();
+        }
+        // Keyed by (publisher, id) so a story can never be listed twice.
+        let mut seen = HashSet::new();
+        rows.retain(|s| seen.insert((s.contact.to_lowercase(), s.uuid.clone())));
         let mut items = Vec::with_capacity(rows.len());
         for s in &rows {
-            let cached = image_cache_path(&s.url);
+            let cached = story_cache_path(&s.url, &s.r#type);
             let local_path = if cached.is_file() {
                 cached.to_string_lossy().into_owned()
             } else {
-                // Fetch image + video media so the viewer (inline image / external player) is ready.
-                prefetch_story_media(s.url.clone(), &qt);
+                // Images are fetched right away; videos (larger) only when the viewer reaches
+                // them (`StoryModel::fetchMedia`), as Android streams them on view. A failed
+                // download is only retried on request, or every reload would retry it.
+                if !s.r#type.starts_with("video/") && !STORY_MEDIA_FAILED.lock().unwrap().contains(&s.url) {
+                    prefetch_story_media(s.url.clone(), s.r#type.clone(), mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT, &qt);
+                }
                 String::new()
             };
             request_avatar(&s.contact, false);
@@ -395,52 +407,81 @@ pub fn load_stories(jid: String, qt: CxxQtThread<StoryModel>) {
                 own: s.contact.eq_ignore_ascii_case(&jid),
                 local_path,
                 avatar_path: avatar_path_for(&s.contact),
+                url: s.url.clone(),
+                downloading: IMAGE_REQUESTED.lock().unwrap().contains(&s.url),
+                failed: STORY_MEDIA_FAILED.lock().unwrap().contains(&s.url),
             });
         }
         let _ = qt.queue(move |model: Pin<&mut StoryModel>| model.reset(items));
     });
 }
 
-/// Download + cache a story's (plaintext/encrypted) media once, then reload the story model.
-fn prefetch_story_media(url: String, qt: &CxxQtThread<StoryModel>) {
-    let path = image_cache_path(&url);
+/// Story media URLs whose last download failed (the viewer offers a retry).
+static STORY_MEDIA_FAILED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Where a story's media is cached. Like [`image_cache_path`], but a video whose URL has no
+/// usable extension gets one from its type — the cached file is handed to the system player,
+/// which can't play a `.img`.
+pub(crate) fn story_cache_path(url: &str, mime: &str) -> PathBuf {
+    let path = image_cache_path(url);
+    let ext = match mime {
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "video/x-matroska" => "mkv",
+        "video/3gpp" => "3gp",
+        _ => return path,
+    };
+    if path.extension().is_some_and(|e| e == "img") { path.with_extension(ext) } else { path }
+}
+
+/// Download + cache a story's media once (at most `limit` bytes), then reload the story model
+/// (also to show a failure).
+pub(crate) fn prefetch_story_media(url: String, mime: String, limit: u64, qt: &CxxQtThread<StoryModel>) {
+    let path = story_cache_path(&url, &mime);
     if path.is_file() {
         return;
     }
     if !IMAGE_REQUESTED.lock().unwrap().insert(url.clone()) {
         return;
     }
+    STORY_MEDIA_FAILED.lock().unwrap().remove(&url);
     let qt = qt.clone();
     runtime().spawn(async move {
-        let result = mxc_proto::xeps::http_upload::download_any(
-            &url,
-            mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT,
-        )
-        .await;
+        let result = mxc_proto::xeps::http_upload::download_any(&url, limit).await;
+        let stored = match result {
+            Ok(bytes) => {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                // Written under a temporary name: the player must never get a partial file.
+                let tmp = path.with_extension("part");
+                std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)).is_ok()
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "story media download failed");
+                false
+            }
+        };
         IMAGE_REQUESTED.lock().unwrap().remove(&url);
-        if let Ok(bytes) = result {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if std::fs::write(&path, &bytes).is_ok() {
-                let _ = qt.queue(|model: Pin<&mut StoryModel>| model.reload_self());
-            }
+        if !stored {
+            STORY_MEDIA_FAILED.lock().unwrap().insert(url);
         }
+        let _ = qt.queue(|model: Pin<&mut StoryModel>| model.reload_self());
     });
 }
 
-/// Publish a story (upload `path` + publish to our social-feed node).
-pub fn publish_story(path: String, title: String) {
+/// Publish a story (upload `path` with its metadata stripped + publish it to our stories
+/// node). Returns whether it was queued (a `PublishDone` event then follows).
+pub fn publish_story(path: String, title: String) -> bool {
     if path.is_empty() {
-        return;
+        return false;
     }
     let guard = CLIENT.lock().unwrap();
-    let Some(ctx) = guard.as_ref() else { return };
-    let _ = ctx.commands.try_send(Command::PublishStory {
-        account_id: ctx.account_id,
-        path,
-        title,
-    });
+    let Some(ctx) = guard.as_ref() else { return false };
+    ctx.commands
+        .try_send(Command::PublishStory { account_id: ctx.account_id, path, title })
+        .is_ok()
 }
 
 /// Fetch stories from ourselves + subscribed contacts (replies via `StoriesUpdated`).
@@ -483,13 +524,24 @@ pub(crate) fn is_own_bare(jid: &str) -> bool {
 /// Display label for a 1:1 chat with our own account.
 pub(crate) const NOTE_TO_SELF: &str = "Note to self";
 
-/// Fetched top-level posts per owner JID (in-memory).
+/// Fetched top-level posts per owner bare JID (lower-cased; in-memory). Item ids are only
+/// unique per author, so a post is identified by (author, id).
 static FEED_POSTS: LazyLock<Mutex<HashMap<String, Vec<FeedPost>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Fetched comments per post id (separate `…:comments/<id>` node).
-static FEED_COMMENTS: LazyLock<Mutex<HashMap<String, Vec<FeedPost>>>> =
+/// Fetched comments per comments node: (service bare JID lower-cased, node) — the node a post
+/// names in its replies link, which needn't be on the author's own service.
+type CommentsByNode = HashMap<(String, String), Vec<FeedPost>>;
+static FEED_COMMENTS: LazyLock<Mutex<CommentsByNode>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Authors (bare JID, lower-cased) whose feed was found to be open to anyone. Anything else,
+/// including not (yet) known, counts as private.
+static PUBLIC_FEEDS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn comments_key(service: &str, node: &str) -> (String, String) {
+    (service.to_lowercase(), node.to_string())
+}
 
 /// Bare JIDs whose feeds we follow (persisted to a text file in the data dir).
 static FOLLOWED: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(load_followed()));
@@ -545,19 +597,52 @@ fn save_followed(list: &[String]) {
 }
 
 /// A "like" is a comment whose body is exactly this heart (matches monocles Android).
-const HEART: &str = "♥";
+const HEART: &str = mxc_proto::xeps::microblog::HEART;
+
+/// The cached post `post_id` of `author`.
+fn find_post(author: &str, post_id: &str) -> Option<FeedPost> {
+    FEED_POSTS
+        .lock()
+        .unwrap()
+        .get(&author.to_lowercase())
+        .and_then(|posts| posts.iter().find(|p| p.id == post_id).cloned())
+}
+
+/// The comments node (service, node) of `author`'s post `post_id`, if it has one.
+fn comments_node_of(author: &str, post_id: &str) -> Option<(String, String)> {
+    find_post(author, post_id)
+        .filter(|p| !p.comments_jid.is_empty() && !p.comments_node.is_empty())
+        .map(|p| (p.comments_jid, p.comments_node))
+}
+
+fn is_image(mime: &str) -> bool {
+    matches!(mime, "image/jpeg" | "image/png" | "image/gif" | "image/webp")
+}
 
 fn to_entry(p: &FeedPost, comment_count: i64, like_count: i64, liked: bool) -> FeedEntry {
     let own = p.author.eq_ignore_ascii_case(&OWN_JID.lock().unwrap());
+    // Only cached images are shown inline; anything else is a link to open.
+    let attachment_path = if is_image(&p.attachment_type) {
+        let cached = image_cache_path(&p.attachment_url);
+        if cached.is_file() { cached.to_string_lossy().into_owned() } else { String::new() }
+    } else {
+        String::new()
+    };
     FeedEntry {
         id: p.id.clone(),
         author: p.author.clone(),
         title: p.title.clone(),
         content: p.content.clone(),
+        content_html: String::from(&mxc_proto::xeps::atom_text::markdown_to_xhtml_div(&p.content)),
         published: p.published,
         link: p.link.clone(),
         attachment_url: p.attachment_url.clone(),
+        attachment_type: p.attachment_type.clone(),
+        attachment_path,
+        avatar_path: if p.author.is_empty() { String::new() } else { avatar_path_for(&p.author) },
         own,
+        can_comment: !p.comments_node.is_empty(),
+        public: PUBLIC_FEEDS.lock().unwrap().contains(&p.author.to_lowercase()),
         comment_count,
         like_count,
         liked,
@@ -565,17 +650,19 @@ fn to_entry(p: &FeedPost, comment_count: i64, like_count: i64, liked: bool) -> F
 }
 
 /// Merged top-level posts across all fetched feeds, newest first, with reply + like counts
-/// (from the per-post comments cache). Likes ("♥" comments) are tallied separately.
+/// (from the comments cache). Likes ("♥" comments) are tallied separately.
 pub fn feed_posts(_account_jid: &str) -> Vec<FeedEntry> {
     let own_jid = OWN_JID.lock().unwrap().clone();
     let comments = FEED_COMMENTS.lock().unwrap();
     let map = FEED_POSTS.lock().unwrap();
+    let mut seen = HashSet::new();
     let mut items: Vec<FeedEntry> = map
         .values()
         .flat_map(|posts| posts.iter())
+        .filter(|p| seen.insert((p.author.to_lowercase(), p.id.clone())))
         .map(|p| {
             let (mut cc, mut lc, mut liked) = (0i64, 0i64, false);
-            if let Some(cs) = comments.get(&p.id) {
+            if let Some(cs) = comments.get(&comments_key(&p.comments_jid, &p.comments_node)) {
                 for c in cs {
                     if c.content.trim() == HEART {
                         lc += 1;
@@ -590,17 +677,18 @@ pub fn feed_posts(_account_jid: &str) -> Vec<FeedEntry> {
             to_entry(p, cc, lc, liked)
         })
         .collect();
-    items.sort_by(|a, b| b.published.cmp(&a.published));
-    items.dedup_by(|a, b| a.id == b.id);
+    items.sort_by_key(|p| std::cmp::Reverse(p.published));
     items
 }
 
-/// A post's comments, oldest first — excluding "♥" likes (those drive the like button).
-pub fn feed_comments(post_id: &str) -> Vec<FeedEntry> {
+/// `author`'s post `post_id`'s comments, oldest first — excluding "♥" likes (those drive the
+/// like button).
+pub fn feed_comments(author: &str, post_id: &str) -> Vec<FeedEntry> {
+    let Some((service, node)) = comments_node_of(author, post_id) else { return Vec::new() };
     FEED_COMMENTS
         .lock()
         .unwrap()
-        .get(post_id)
+        .get(&comments_key(&service, &node))
         .map(|cs| {
             cs.iter()
                 .filter(|c| c.content.trim() != HEART)
@@ -612,60 +700,136 @@ pub fn feed_comments(post_id: &str) -> Vec<FeedEntry> {
 
 /// Toggle our "♥" like on a post: retract our like comment if present, else publish one.
 pub fn toggle_like(post_author: String, post_id: String) {
-    if post_author.is_empty() || post_id.is_empty() {
-        return;
-    }
+    let Some((service, node)) = comments_node_of(&post_author, &post_id) else { return };
     let own = OWN_JID.lock().unwrap().clone();
-    let my_like = FEED_COMMENTS.lock().unwrap().get(&post_id).and_then(|cs| {
+    let my_like = FEED_COMMENTS.lock().unwrap().get(&comments_key(&service, &node)).and_then(|cs| {
         cs.iter()
             .find(|c| c.content.trim() == HEART && c.author.eq_ignore_ascii_case(&own))
             .map(|c| c.id.clone())
     });
     let guard = CLIENT.lock().unwrap();
     let Some(ctx) = guard.as_ref() else { return };
-    match my_like {
-        Some(comment_id) => {
-            let _ = ctx.commands.try_send(Command::RetractComment {
-                account_id: ctx.account_id,
-                post_author,
-                post_id,
-                comment_id,
-            });
-        }
-        None => {
-            let _ = ctx.commands.try_send(Command::PublishComment {
-                account_id: ctx.account_id,
-                post_author,
-                post_id,
-                content: HEART.to_string(),
-            });
-        }
-    }
+    let _ = ctx.commands.try_send(match my_like {
+        Some(comment_id) => Command::RetractComment { account_id: ctx.account_id, service, node, comment_id },
+        None => Command::PublishComment { account_id: ctx.account_id, service, node, content: HEART.to_string() },
+    });
 }
 
 /// Fetch a post's comments (reply arrives as `Event::FeedComments`).
 pub fn fetch_comments(post_author: String, post_id: String) {
-    if post_author.is_empty() || post_id.is_empty() {
-        return;
-    }
+    let Some((service, node)) = comments_node_of(&post_author, &post_id) else { return };
     let guard = CLIENT.lock().unwrap();
     let Some(ctx) = guard.as_ref() else { return };
-    let _ = ctx.commands.try_send(Command::FetchComments {
-        account_id: ctx.account_id,
-        post_author,
-        post_id,
-    });
+    let _ = ctx.commands.try_send(Command::FetchComments { account_id: ctx.account_id, service, node });
 }
 
-/// Fetch our own feed + every followed feed (replies arrive as `Event::FeedPosts`).
-pub fn fetch_feeds() {
-    let guard = CLIENT.lock().unwrap();
-    let Some(ctx) = guard.as_ref() else { return };
-    let mut targets = vec![ctx.jid.clone()];
-    targets.extend(FOLLOWED.lock().unwrap().iter().cloned());
-    for jid in targets {
-        let _ = ctx.commands.try_send(Command::FetchFeed { account_id: ctx.account_id, jid });
+/// Ask for the comments of each of `posts` that has a comments node.
+fn request_comments(posts: &[FeedPost]) {
+    if let Some(ctx) = CLIENT.lock().unwrap().as_ref() {
+        for p in posts.iter().filter(|p| !p.comments_node.is_empty()) {
+            let _ = ctx.commands.try_send(Command::FetchComments {
+                account_id: ctx.account_id,
+                service: p.comments_jid.clone(),
+                node: p.comments_node.clone(),
+            });
+        }
     }
+}
+
+/// Download + cache the image attachments of `posts` (and their authors' avatars), then
+/// reload the feed.
+fn prefetch_feed_media(posts: &[FeedPost], qt: &CxxQtThread<Backend>) {
+    for p in posts {
+        if !p.author.is_empty() {
+            request_avatar(&p.author, false);
+        }
+        let url = p.attachment_url.clone();
+        let lower = url.to_ascii_lowercase();
+        if !is_image(&p.attachment_type) || !(lower.starts_with("https://") || lower.starts_with("http://")) {
+            continue;
+        }
+        let path = image_cache_path(&url);
+        if path.is_file() || !IMAGE_REQUESTED.lock().unwrap().insert(url.clone()) {
+            continue;
+        }
+        let qt = qt.clone();
+        runtime().spawn(async move {
+            let result = mxc_proto::xeps::http_upload::download_any(
+                &url,
+                mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT,
+            )
+            .await;
+            IMAGE_REQUESTED.lock().unwrap().remove(&url);
+            if let Ok(bytes) = result {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if std::fs::write(&path, &bytes).is_ok() {
+                    let _ = qt.queue(|mut backend: Pin<&mut Backend>| backend.as_mut().feeds_changed());
+                }
+            }
+        });
+    }
+}
+
+/// Fill the feed from the store's cache (authors already fetched this session are kept).
+async fn load_cached_feeds(store: &Store, account_id: i64, qt: &CxxQtThread<Backend>) {
+    let Ok(rows) = store.feed_posts(account_id).await else { return };
+    let mut by_author: HashMap<String, Vec<FeedPost>> = HashMap::new();
+    for row in rows {
+        by_author.entry(row.author.to_lowercase()).or_default().push(mxc_proto::xeps::microblog::from_row(row));
+    }
+    let cached: Vec<FeedPost> = by_author.values().flatten().cloned().collect();
+    {
+        let mut map = FEED_POSTS.lock().unwrap();
+        for (author, posts) in by_author {
+            map.entry(author).or_insert(posts);
+        }
+    }
+    prefetch_feed_media(&cached, qt);
+    let _ = qt.queue(|mut backend: Pin<&mut Backend>| backend.as_mut().feeds_changed());
+}
+
+/// Fetch our own feed + every followed feed (replies arrive as `Event::FeedPosts`), and
+/// refresh the follow suggestions.
+pub fn fetch_feeds() {
+    {
+        let guard = CLIENT.lock().unwrap();
+        let Some(ctx) = guard.as_ref() else { return };
+        let mut targets = vec![ctx.jid.clone()];
+        targets.extend(FOLLOWED.lock().unwrap().iter().cloned());
+        for jid in targets {
+            let _ = ctx.commands.try_send(Command::FetchFeed { account_id: ctx.account_id, jid });
+        }
+    }
+    refresh_feed_suggestions();
+}
+
+/// Follow suggestions, as on Android: contacts we share presence with both ways (they can see
+/// our feed and we theirs) whose feed we don't follow yet. Pushed to `Backend::feedSuggestions`
+/// (newline-joined bare JIDs).
+fn refresh_feed_suggestions() {
+    let Some(account_id) = CLIENT.lock().unwrap().as_ref().map(|c| c.account_id) else { return };
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let Ok(roster) = store.roster(account_id).await else { return };
+        let followed = FOLLOWED.lock().unwrap().clone();
+        let own = OWN_JID.lock().unwrap().clone();
+        let mut suggestions: Vec<String> = roster
+            .into_iter()
+            .filter(|r| r.subscription == "both")
+            .map(|r| r.jid)
+            .filter(|j| j.contains('@') && !j.eq_ignore_ascii_case(&own))
+            .filter(|j| !followed.iter().any(|f| f.eq_ignore_ascii_case(j)))
+            .collect();
+        suggestions.sort_by_key(|j| j.to_lowercase());
+        let joined = suggestions.join("\n");
+        if let Some(qt) = backend_qt() {
+            let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                backend.as_mut().set_feed_suggestions(QString::from(&joined));
+            });
+        }
+    });
 }
 
 /// Newline-joined followed JIDs (for the QML "following" list).
@@ -675,8 +839,8 @@ pub fn followed_feeds() -> String {
 
 /// Follow a feed (add + persist + fetch it).
 pub fn follow_feed(jid: String) {
-    let jid = jid.trim().to_string();
-    if jid.is_empty() {
+    let jid = jid.trim().trim_start_matches("xmpp:").split(['/', '?']).next().unwrap_or("").to_string();
+    if jid.is_empty() || !jid.contains('@') {
         return;
     }
     {
@@ -687,10 +851,10 @@ pub fn follow_feed(jid: String) {
         list.push(jid.clone());
         save_followed(&list);
     }
-    let guard = CLIENT.lock().unwrap();
-    if let Some(ctx) = guard.as_ref() {
+    if let Some(ctx) = CLIENT.lock().unwrap().as_ref() {
         let _ = ctx.commands.try_send(Command::FetchFeed { account_id: ctx.account_id, jid });
     }
+    refresh_feed_suggestions();
 }
 
 /// Unfollow a feed (remove + persist + drop its cached posts).
@@ -700,21 +864,66 @@ pub fn unfollow_feed(jid: String) {
         list.retain(|j| !j.eq_ignore_ascii_case(&jid));
         save_followed(&list);
     }
-    FEED_POSTS.lock().unwrap().remove(&jid);
+    FEED_POSTS.lock().unwrap().remove(&jid.to_lowercase());
+    // Drop the cached posts too (posts the contact pushes later still arrive).
+    if let Some(account_id) = CLIENT.lock().unwrap().as_ref().map(|c| c.account_id) {
+        runtime().spawn(async move {
+            if let Ok(store) = store().await {
+                let _ = store.replace_feed(account_id, &jid, &[]).await;
+            }
+        });
+    }
+    refresh_feed_suggestions();
+    if let Some(qt) = backend_qt() {
+        let _ = qt.queue(|mut backend: Pin<&mut Backend>| backend.as_mut().feeds_changed());
+    }
 }
 
-/// Publish a top-level post to our own feed.
-pub fn publish_post(title: String, content: String) {
-    if title.trim().is_empty() && content.trim().is_empty() {
-        return;
+/// Publish a top-level post to our own feed: Markdown `content`, an optional local file to
+/// attach (uploaded with its metadata stripped) and an optional related web link.
+pub fn publish_post(title: String, content: String, attachment_path: String, link: String) -> bool {
+    if title.trim().is_empty() && content.trim().is_empty() && attachment_path.is_empty() {
+        return false;
     }
     let guard = CLIENT.lock().unwrap();
-    let Some(ctx) = guard.as_ref() else { return };
-    let _ = ctx.commands.try_send(Command::PublishPost {
-        account_id: ctx.account_id,
-        title,
-        content,
-    });
+    let Some(ctx) = guard.as_ref() else { return false };
+    ctx.commands
+        .try_send(Command::PublishPost {
+            account_id: ctx.account_id,
+            title,
+            content,
+            attachment_path,
+            attachment: None,
+            link,
+            edit: None,
+        })
+        .is_ok()
+}
+
+/// Replace our post `post_id` (XEP-0277 edit: same id, original publish time). The attachment
+/// is kept unless `attachment_path` names a new file.
+pub fn edit_post(post_id: String, title: String, content: String, attachment_path: String, link: String) -> bool {
+    let own = OWN_JID.lock().unwrap().clone();
+    let Some(post) = find_post(&own, &post_id) else { return false };
+    let attachment = (!post.attachment_url.is_empty()).then(|| (post.attachment_url.clone(), post.attachment_type.clone()));
+    let guard = CLIENT.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else { return false };
+    ctx.commands
+        .try_send(Command::PublishPost {
+            account_id: ctx.account_id,
+            title,
+            content,
+            attachment_path,
+            attachment,
+            link,
+            edit: Some((post_id, post.published)),
+        })
+        .is_ok()
+}
+
+/// `xmpp:` URI of a post (to share it), as Android builds it.
+pub fn post_uri(author: &str, post_id: &str) -> String {
+    format!("xmpp:{author}?;node={};item={post_id}", mxc_proto::xeps::microblog::NS_MICROBLOG)
 }
 
 /// Retract one of our own posts.
@@ -729,32 +938,24 @@ pub fn retract_post(post_id: String) {
 
 /// Retract a comment (ours, or any comment on our own post).
 pub fn retract_comment(post_author: String, post_id: String, comment_id: String) {
-    if post_author.is_empty() || post_id.is_empty() || comment_id.is_empty() {
+    if comment_id.is_empty() {
         return;
     }
+    let Some((service, node)) = comments_node_of(&post_author, &post_id) else { return };
     let guard = CLIENT.lock().unwrap();
     let Some(ctx) = guard.as_ref() else { return };
-    let _ = ctx.commands.try_send(Command::RetractComment {
-        account_id: ctx.account_id,
-        post_author,
-        post_id,
-        comment_id,
-    });
+    let _ = ctx.commands.try_send(Command::RetractComment { account_id: ctx.account_id, service, node, comment_id });
 }
 
 /// Publish a comment on a post (XEP-0472 reply).
 pub fn publish_comment(post_author: String, post_id: String, content: String) {
-    if post_author.is_empty() || post_id.is_empty() || content.trim().is_empty() {
+    if content.trim().is_empty() {
         return;
     }
+    let Some((service, node)) = comments_node_of(&post_author, &post_id) else { return };
     let guard = CLIENT.lock().unwrap();
     let Some(ctx) = guard.as_ref() else { return };
-    let _ = ctx.commands.try_send(Command::PublishComment {
-        account_id: ctx.account_id,
-        post_author,
-        post_id,
-        content,
-    });
+    let _ = ctx.commands.try_send(Command::PublishComment { account_id: ctx.account_id, service, node, content });
 }
 
 /// OMEMO2 device-key cache for the trust UI, keyed by a contact's bare JID (or `OWN_KEY`
@@ -1028,7 +1229,7 @@ const SAFE_OPEN_EXTENSIONS: &[&str] = &[
     // images
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "heif",
     // audio / video
-    "mp3", "m4a", "aac", "ogg", "oga", "opus", "flac", "wav", "mp4", "m4v", "webm", "mkv", "mov",
+    "mp3", "m4a", "aac", "ogg", "oga", "opus", "flac", "wav", "mp4", "m4v", "webm", "mkv", "mov", "3gp",
     // documents
     "pdf", "txt", "md", "odt", "ods", "odp", "docx", "xlsx", "pptx", "doc", "xls", "ppt", "csv", "epub",
 ];
@@ -1235,6 +1436,9 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
             jid,
         });
         let _ = handle.commands.send(Command::Connect { account_id }).await;
+
+        // Show the cached feed right away; the fetches after connecting refresh it.
+        load_cached_feeds(&store, account_id, &qt).await;
 
         // Video-frame pump (separate task so high-rate frames don't share the event loop):
         // encode each frame for the current call to a JPEG data URL and push it to the call
@@ -1643,28 +1847,89 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
                         backend.as_mut().vcard_ready(QString::from(&jid), QString::from(&serialized));
                     });
                 }
-                // A feed's posts arrived (XEP-0472) → cache them, prefetch each post's comment
-                // count, and reload the Feeds UI.
-                Event::FeedPosts { jid, posts, .. } => {
-                    if let Some(ctx) = CLIENT.lock().unwrap().as_ref() {
-                        for p in &posts {
-                            let _ = ctx.commands.try_send(Command::FetchComments {
-                                account_id: ctx.account_id,
-                                post_author: p.author.clone(),
-                                post_id: p.id.clone(),
-                            });
-                        }
+                // A feed's posts arrived (XEP-0472) → cache them, prefetch each post's comments
+                // (counts) and image attachment, and reload the Feeds UI.
+                Event::FeedPosts { jid, posts, public, .. } => {
+                    if public {
+                        PUBLIC_FEEDS.lock().unwrap().insert(jid.to_lowercase());
+                    } else {
+                        PUBLIC_FEEDS.lock().unwrap().remove(&jid.to_lowercase());
                     }
-                    FEED_POSTS.lock().unwrap().insert(jid, posts);
+                    request_comments(&posts);
+                    prefetch_feed_media(&posts, &qt);
+                    FEED_POSTS.lock().unwrap().insert(jid.to_lowercase(), posts);
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                         backend.as_mut().feeds_changed();
                     });
                 }
-                // A post's comments arrived → cache by post id + reload the open post.
-                Event::FeedComments { post_id, comments, .. } => {
-                    FEED_COMMENTS.lock().unwrap().insert(post_id, comments);
+                // A post was published or edited (PEP push) → add or replace it.
+                Event::FeedPostReceived { post, .. } => {
+                    request_comments(std::slice::from_ref(&post));
+                    prefetch_feed_media(std::slice::from_ref(&post), &qt);
+                    {
+                        let mut map = FEED_POSTS.lock().unwrap();
+                        let posts = map.entry(post.author.to_lowercase()).or_default();
+                        posts.retain(|p| p.id != post.id);
+                        posts.push(post);
+                        posts.sort_by_key(|p| std::cmp::Reverse(p.published));
+                    }
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                         backend.as_mut().feeds_changed();
+                    });
+                }
+                // A post was retracted by its author.
+                Event::FeedPostRetracted { author, post_id, .. } => {
+                    let removed = FEED_POSTS
+                        .lock()
+                        .unwrap()
+                        .get_mut(&author.to_lowercase())
+                        .map(|posts| {
+                            let before = posts.len();
+                            posts.retain(|p| p.id != post_id);
+                            posts.len() != before
+                        })
+                        .unwrap_or(false);
+                    if removed {
+                        let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                            backend.as_mut().feeds_changed();
+                        });
+                    }
+                }
+                // A comments node's items arrived → cache by node + reload the open post.
+                Event::FeedComments { service, node, comments, .. } => {
+                    FEED_COMMENTS.lock().unwrap().insert(comments_key(&service, &node), comments);
+                    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                        backend.as_mut().feeds_changed();
+                    });
+                }
+                // A comments node changed: refetch it if one of our posts points at it (the
+                // node name is chosen by whoever creates it, so match service and node).
+                Event::FeedCommentsChanged { service, node, .. } => {
+                    let known = FEED_POSTS.lock().unwrap().values().flatten().any(|p| {
+                        p.comments_node == node && p.comments_jid.eq_ignore_ascii_case(&service)
+                    });
+                    if known {
+                        if let Some(ctx) = CLIENT.lock().unwrap().as_ref() {
+                            let _ = ctx.commands.try_send(Command::FetchComments {
+                                account_id: ctx.account_id,
+                                service,
+                                node,
+                            });
+                        }
+                    }
+                }
+                // A Story / post the user started finished uploading + publishing.
+                Event::PublishDone { what, error, .. } => {
+                    let text = match (what.as_str(), &error) {
+                        ("story", None) => "Story published".to_string(),
+                        ("story", Some(e)) => format!("Couldn't post story: {e}"),
+                        (_, None) => "Post published".to_string(),
+                        (_, Some(e)) => format!("Couldn't publish post: {e}"),
+                    };
+                    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                        let pending = (backend.publishing() - 1).max(0);
+                        backend.as_mut().set_publishing(pending);
+                        backend.as_mut().toast(QString::from(&text));
                     });
                 }
                 // OMEMO2 trust UI: a contact's device keys arrived → cache + tell QML to reload

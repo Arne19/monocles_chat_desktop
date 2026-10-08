@@ -78,6 +78,24 @@ impl Store {
         Ok(())
     }
 
+    /// Drop `contact`'s stories on this account whose ids aren't in `keep` (a complete listing
+    /// of its node). Returns how many were removed.
+    pub async fn retain_stories(&self, account_id: i64, contact: &str, keep: &[String]) -> Result<u64> {
+        let rows = sqlx::query_as::<_, (String,)>(
+            "SELECT uuid FROM stories WHERE account_id = ?1 AND contact = ?2 COLLATE NOCASE",
+        )
+        .bind(account_id)
+        .bind(contact)
+        .fetch_all(self.pool())
+        .await?;
+        let mut removed = 0;
+        for (uuid,) in rows.into_iter().filter(|(u,)| !keep.contains(u)) {
+            self.delete_story(account_id, contact, &uuid).await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// Remove one story (e.g. on retract) - only if `contact` (bare JID) published it on this
     /// account: a retraction is only valid from the story's own publisher.
     pub async fn delete_story(&self, account_id: i64, contact: &str, uuid: &str) -> Result<()> {
@@ -113,5 +131,19 @@ mod tests {
         assert_eq!(store.recent_stories(acc, now).await.unwrap()[0].url, "https://a/2");
         store.delete_story(acc, "alice@example.org", "s1").await.unwrap();
         assert!(store.recent_stories(acc, now).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retain_only_touches_that_publisher() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let now = 1_000_000;
+        for (id, who) in [("a1", "alice@example.org"), ("a2", "alice@example.org"), ("b1", "bob@example.org")] {
+            store.upsert_story(acc, id, who, "https://x/1", "image/jpeg", None, now).await.unwrap();
+        }
+        assert_eq!(store.retain_stories(acc, "Alice@example.org", &["a2".into()]).await.unwrap(), 1);
+        let mut left: Vec<String> = store.recent_stories(acc, now).await.unwrap().into_iter().map(|r| r.uuid).collect();
+        left.sort();
+        assert_eq!(left, vec!["a2", "b1"]);
     }
 }

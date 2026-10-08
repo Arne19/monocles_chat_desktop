@@ -85,4 +85,7 @@ pub async fn run(w: &Writer, store: &Store, cfg: &AccountConfig, events: &Sender
     if let Ok(items) = store.conversations(cfg.account_id).await {
         let _ = events.send(Event::ConversationsUpdated { account_id: cfg.account_id, items }).await;
     }
+
+    // Feeds: comments nodes used to be created open; give them the feed's audience (once).
+    super::microblog::align_comments_access_once(w, store, cfg).await;
 }

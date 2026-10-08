@@ -42,7 +42,7 @@ const ROLE_FILE_NAME: i32 = 277;
 const ROLE_ATTACHMENTS: i32 = 278;
 
 /// One message row, resolved for display.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct MessageItem {
     pub id: i64,
     pub body: String,
@@ -89,6 +89,65 @@ pub struct MessageItem {
     /// until it is downloaded. Empty string for the single-file case, which keeps rendering
     /// through `image_path` / `audio_path` / `file_url` exactly as before.
     pub attachments: String,
+}
+
+/// How a reloaded message list lines up with the shown one: `old[old_start..][..overlap]` are
+/// the same messages as `new[new_start..][..overlap]`, and everything else was dropped or added
+/// at either end. None if they don't line up like that (another chat, a jump) - then the model
+/// is reset.
+#[derive(Debug, PartialEq)]
+struct Alignment {
+    old_start: usize,
+    new_start: usize,
+    overlap: usize,
+}
+
+fn align(old: &[i64], new: &[i64]) -> Option<Alignment> {
+    let (&old_first, &new_first) = (old.first()?, new.first()?);
+    let (old_start, new_start) = if let Some(p) = new.iter().position(|&id| id == old_first) {
+        (0, p)
+    } else {
+        (old.iter().position(|&id| id == new_first)?, 0)
+    };
+    let overlap = (old.len() - old_start).min(new.len() - new_start);
+    let lines_up = old[old_start..old_start + overlap] == new[new_start..new_start + overlap];
+    // The overlap must reach the end of one list: a message vanishing from the middle (e.g.
+    // deleted) resets instead.
+    let reaches_end = old_start + overlap == old.len() || new_start + overlap == new.len();
+    (lines_up && reaches_end && overlap > 0).then_some(Alignment { old_start, new_start, overlap })
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::{align, Alignment};
+
+    fn a(old_start: usize, new_start: usize, overlap: usize) -> Option<Alignment> {
+        Some(Alignment { old_start, new_start, overlap })
+    }
+
+    #[test]
+    fn appended_dropped_and_prepended_rows_line_up() {
+        assert_eq!(align(&[1, 2, 3], &[1, 2, 3]), a(0, 0, 3));
+        // New message.
+        assert_eq!(align(&[1, 2, 3], &[1, 2, 3, 4]), a(0, 0, 3));
+        // Full window: the oldest drops out as a new one arrives.
+        assert_eq!(align(&[1, 2, 3], &[2, 3, 4]), a(1, 0, 2));
+        // Older page loaded.
+        assert_eq!(align(&[3, 4], &[1, 2, 3, 4]), a(0, 2, 2));
+        // Window shrank at the end.
+        assert_eq!(align(&[1, 2, 3, 4], &[1, 2]), a(0, 0, 2));
+    }
+
+    #[test]
+    fn anything_else_resets() {
+        assert_eq!(align(&[], &[1]), None);
+        assert_eq!(align(&[1, 2], &[]), None);
+        assert_eq!(align(&[1, 2, 3], &[7, 8, 9]), None);
+        // A message removed from the middle.
+        assert_eq!(align(&[1, 2, 3, 4], &[1, 3, 4]), None);
+        // Reordered.
+        assert_eq!(align(&[1, 2, 3], &[1, 3, 2]), None);
+    }
 }
 
 /// Local calendar day ("YYYY-MM-DD") of an RFC3339 / `datetime('now')` timestamp, for the chat's
@@ -588,6 +647,12 @@ pub mod qobject {
         #[qsignal]
         #[cxx_name = "jumpReady"]
         fn jump_ready(self: Pin<&mut MessageModel>, marker: QString);
+
+        /// One of our own messages (sent here or from another device) was added at the end of
+        /// the open chat - the view scrolls to it, wherever it was scrolled to.
+        #[qsignal]
+        #[cxx_name = "ownMessageAppended"]
+        fn own_message_appended(self: Pin<&mut MessageModel>);
     }
 
     unsafe extern "RustQt" {
@@ -608,6 +673,19 @@ pub mod qobject {
             bottom_right: &QModelIndex,
             roles: &QList_i32,
         );
+        // Row insertions/removals, so new and dropped messages don't reset the view.
+        #[inherit]
+        #[rust_name = "begin_insert_rows"]
+        fn beginInsertRows(self: Pin<&mut MessageModel>, parent: &QModelIndex, first: i32, last: i32);
+        #[inherit]
+        #[rust_name = "end_insert_rows"]
+        fn endInsertRows(self: Pin<&mut MessageModel>);
+        #[inherit]
+        #[rust_name = "begin_remove_rows"]
+        fn beginRemoveRows(self: Pin<&mut MessageModel>, parent: &QModelIndex, first: i32, last: i32);
+        #[inherit]
+        #[rust_name = "end_remove_rows"]
+        fn endRemoveRows(self: Pin<&mut MessageModel>);
     }
 
     impl cxx_qt::Threading for MessageModel {}
@@ -738,27 +816,63 @@ impl qobject::MessageModel {
         self.as_mut().end_reset_model();
     }
 
-    /// Replace all rows (called from the core runtime via the Qt thread queue). When the new
-    /// rows are the SAME messages (delivery ticks, avatar arrivals, corrections — the open
-    /// chat reloads often), update in place via `dataChanged`: a full model reset would throw
-    /// away the view's scroll position, visibly yanking the chat around.
+    /// Replace all rows (called from the core runtime via the Qt thread queue). The open chat
+    /// reloads often (new and sent messages, delivery ticks, avatars, corrections, paging), and a
+    /// full model reset throws the view to the top before it is scrolled back - the chat visibly
+    /// jumped. So whenever the new rows are the old ones with messages dropped/added at either
+    /// end (see [`align`]), they are applied as row removals/insertions plus `dataChanged` for
+    /// the rows that changed; only anything else resets.
     pub fn reset(mut self: Pin<&mut Self>, items: Vec<MessageItem>) {
-        let same = self.items.len() == items.len()
-            && self.items.iter().zip(&items).all(|(a, b)| a.id == b.id);
-        if same {
-            let count = items.len() as i32;
+        let old_ids: Vec<i64> = self.items.iter().map(|i| i.id).collect();
+        let new_ids: Vec<i64> = items.iter().map(|i| i.id).collect();
+        let Some(a) = align(&old_ids, &new_ids) else {
+            self.as_mut().begin_reset_model();
             self.as_mut().rust_mut().items = items;
-            if count > 0 {
-                let parent = QModelIndex::default();
-                let top = self.as_ref().index(0, 0, &parent);
-                let bottom = self.as_ref().index(count - 1, 0, &parent);
-                self.as_mut().data_changed(&top, &bottom, &cxx_qt_lib::QList::<i32>::default());
-            }
+            self.as_mut().end_reset_model();
             return;
+        };
+        let parent = QModelIndex::default();
+        // 1. Drop old rows before and after the overlap.
+        if a.old_start > 0 {
+            self.as_mut().begin_remove_rows(&parent, 0, a.old_start as i32 - 1);
+            self.as_mut().rust_mut().items.drain(..a.old_start);
+            self.as_mut().end_remove_rows();
         }
-        self.as_mut().begin_reset_model();
-        self.as_mut().rust_mut().items = items;
-        self.as_mut().end_reset_model();
+        let len = self.items.len();
+        if len > a.overlap {
+            self.as_mut().begin_remove_rows(&parent, a.overlap as i32, len as i32 - 1);
+            self.as_mut().rust_mut().items.truncate(a.overlap);
+            self.as_mut().end_remove_rows();
+        }
+        // 2. Update the overlapping rows that changed (now at 0..overlap).
+        let changed: Vec<usize> = (0..a.overlap)
+            .filter(|&i| self.items[i] != items[a.new_start + i])
+            .collect();
+        for &i in &changed {
+            self.as_mut().rust_mut().items[i] = items[a.new_start + i].clone();
+        }
+        for i in changed {
+            let idx = self.as_ref().index(i as i32, 0, &parent);
+            self.as_mut().data_changed(&idx, &idx, &cxx_qt_lib::QList::<i32>::default());
+        }
+        // 3. Insert new rows before (an older page) and after (new messages) the overlap.
+        if a.new_start > 0 {
+            self.as_mut().begin_insert_rows(&parent, 0, a.new_start as i32 - 1);
+            let mut front = items[..a.new_start].to_vec();
+            front.append(&mut self.as_mut().rust_mut().items);
+            self.as_mut().rust_mut().items = front;
+            self.as_mut().end_insert_rows();
+        }
+        let have = self.items.len();
+        if items.len() > have {
+            let own_appended = items[have..].iter().any(|m| m.outgoing);
+            self.as_mut().begin_insert_rows(&parent, have as i32, items.len() as i32 - 1);
+            self.as_mut().rust_mut().items.extend_from_slice(&items[have..]);
+            self.as_mut().end_insert_rows();
+            if own_appended {
+                self.as_mut().own_message_appended();
+            }
+        }
     }
 
     fn data(&self, index: &QModelIndex, role: i32) -> QVariant {

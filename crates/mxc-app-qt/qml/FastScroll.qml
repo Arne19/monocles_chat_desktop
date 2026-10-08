@@ -27,6 +27,11 @@ WheelHandler {
         return null
     }
 
+    // Emitted after each wheel/touchpad step this handler applied. The Flickable never sees
+    // these events, so it doesn't report them as `moving` — a view that must tell user scrolling
+    // from layout changes (the chat's stick-to-bottom) listens here.
+    signal scrolled()
+
     target: null
     orientation: Qt.Vertical
     acceptedDevices: PointerDevice.AllDevices
@@ -54,6 +59,7 @@ WheelHandler {
         const minY = f.originY - f.topMargin
         const maxY = Math.max(minY, f.originY + f.contentHeight + f.bottomMargin - f.height)
         f.contentY = Math.max(minY, Math.min(maxY, f.contentY - dy))
+        root.scrolled()
         const bar = f.ScrollBar.vertical
         if (bar) {
             bar.active = true

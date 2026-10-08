@@ -37,6 +37,7 @@ pub const FEATURES: &[&str] = &[
     "urn:xmpp:jingle:transports:ice-udp:1",        // XEP-0176 ICE-UDP
     "urn:xmpp:message-correct:0",                   // XEP-0308
     "urn:xmpp:message-retract:1",                   // XEP-0424
+    "urn:xmpp:microblog:0+notify",                  // XEP-0472 feed PEP push
     "urn:xmpp:ping",                                // XEP-0199
     "urn:xmpp:pubsub-social-feed:stories:0+notify", // Stories PEP push
     "urn:xmpp:reactions:0",                         // XEP-0444

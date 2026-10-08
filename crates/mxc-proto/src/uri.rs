@@ -213,7 +213,8 @@ fn percent_decode(value: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+            // From the bytes: slicing the str could split a multi-byte character and panic.
+            if let Some(byte) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
                 out.push(byte);
                 i += 3;
                 continue;
@@ -231,6 +232,13 @@ mod tests {
 
     const PQ: &str = "1122334455667788112233445566778811223344556677881122334455667788";
     const LEGACY: &str = "99aabbccddeeff0099aabbccddeeff0099aabbccddeeff0099aabbccddeeff00";
+
+    #[test]
+    fn percent_before_multibyte_character_does_not_panic() {
+        assert_eq!(percent_decode("a%€b"), "a%€b");
+        assert_eq!(percent_decode("%e2%82%ac"), "€");
+        assert!(parse("xmpp:a%€@b.org").is_some());
+    }
 
     #[test]
     fn round_trip_own_uri() {
