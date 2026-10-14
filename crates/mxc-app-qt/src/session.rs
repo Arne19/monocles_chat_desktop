@@ -1001,10 +1001,12 @@ pub fn verify_from_uri(jid: &str, text: &str) -> bool {
         return false;
     };
     let fingerprints = parsed.all_hex();
+    let hybrids = parsed.hybrids();
     let _ = commands.try_send(Command::VerifyOmemoFingerprints {
         account_id,
         jid: parsed.jid,
         fingerprints,
+        hybrids,
     });
     true
 }

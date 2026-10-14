@@ -211,6 +211,67 @@ fn pq_pin_reconcile_attempts() -> &'static Mutex<HashSet<FailKey>> {
     C.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+// --- user notices -----------------------------------------------------------
+
+/// Per-account UI event channel, registered at OMEMO bootstrap. The places that detect a
+/// post-quantum identity change (session building on send, heal, pin reconciliation) are deep in
+/// call chains that carry no event sender; this lets them still reach the user.
+fn event_sinks() -> &'static Mutex<HashMap<i64, Sender<Event>>> {
+    static C: OnceLock<Mutex<HashMap<i64, Sender<Event>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_event_sink(account_id: i64, events: &Sender<Event>) {
+    event_sinks().lock().unwrap().insert(account_id, events.clone());
+}
+
+/// (account, JID, pin key) whose post-quantum identity change the user was already told about.
+fn pq_identity_change_notified() -> &'static Mutex<HashSet<(i64, String, String)>> {
+    static C: OnceLock<Mutex<HashSet<(i64, String, String)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Tell the user — once per device per app run — that a contact's post-quantum identity changed
+/// and is refused until re-verified (proto-XEP §4.9.2). Refusing is the security rule; telling
+/// the user is what keeps a legitimate change (e.g. a restore from a backup without the PQ key)
+/// from silently cutting the contact off. Mirrors Android's `notifyOmemo2PqIdentityChanged`.
+fn notify_pq_identity_changed(account_id: i64, jid: &str, fp_key: &str) {
+    if !pq_identity_change_notified().lock().unwrap().insert((
+        account_id,
+        jid.to_string(),
+        fp_key.to_string(),
+    )) {
+        return;
+    }
+    warn!(%jid, "omemo: post-quantum identity CHANGED — refused until re-verified");
+    let sink = event_sinks().lock().unwrap().get(&account_id).cloned();
+    if let Some(events) = sink {
+        let _ = events.try_send(Event::Toast {
+            text: format!(
+                "The post-quantum identity of {jid} changed. New PQ OMEMO2 sessions with that \
+                 device are blocked until you verify it again by scanning their QR code."
+            ),
+            important: true,
+        });
+    }
+}
+
+/// Forget an earlier notice once the user re-verified the device, so a later change is reported.
+fn clear_pq_identity_notice(account_id: i64, jid: &str, fp_key: &str) {
+    pq_identity_change_notified().lock().unwrap().remove(&(
+        account_id,
+        jid.to_string(),
+        fp_key.to_string(),
+    ));
+}
+
+/// If `err` is a refused post-quantum identity change, tell the user.
+fn notice_if_pq_identity_changed(account_id: i64, jid: &str, err: &mxc_omemo::OmemoError) {
+    if let mxc_omemo::OmemoError::PqIdentityChanged(fp_key) = err {
+        notify_pq_identity_changed(account_id, jid, fp_key);
+    }
+}
+
 /// XEP-0384 heartbeat threshold: the first message received for a given ratchet key whose Double
 /// Ratchet counter reaches this value MUST be answered with a heartbeat (an empty OMEMO message),
 /// forcing a DH-ratchet step so the peer's next chain restarts at 0.
@@ -321,8 +382,9 @@ pub async fn ensure_initialized(
     w: &Writer,
     store: &Store,
     cfg: &AccountConfig,
-    _events: &Sender<Event>,
+    events: &Sender<Event>,
 ) -> anyhow::Result<()> {
+    register_event_sink(cfg.account_id, events);
     let device_id = maintain_and_republish(w, store, cfg).await?;
     publish_device_list(w, cfg, device_id).await?;
     Ok(())
@@ -541,6 +603,7 @@ async fn sessions_for(
                         }
                         Err(e) => {
                             warn!(%jid, dev, error = %e, "omemo: session establishment failed");
+                            notice_if_pq_identity_changed(cfg.account_id, jid, &e);
                             note_establish_failure(cfg.account_id, jid, dev);
                             continue;
                         }
@@ -650,6 +713,22 @@ fn build_header(enc: &EncryptedMessage, sender_device: u32) -> Element {
     }
 
     let mut header = Element::builder("header", NS_OMEMO2).attr(crate::ncname("sid"), sender_device.to_string());
+    // Handshake authentication (proto-XEP §4.9.7): session::encrypt signs it whenever a key is a
+    // pre-key message, so it is present exactly when a receiver will require it.
+    if let Some(auth) = &enc.pq_auth {
+        header = header.append(
+            Element::builder("pq-auth", NS_OMEMO2)
+                .append(
+                    Element::builder("pq-ik", NS_OMEMO2)
+                        .attr(crate::ncname("type"), "ML-DSA-87")
+                        .append(B64.encode(&auth.pq_ik))
+                        .build(),
+                )
+                .append(Element::builder("pq-sig", NS_OMEMO2).append(B64.encode(&auth.pq_sig)).build())
+                .append(Element::builder("ik-sig", NS_OMEMO2).append(B64.encode(&auth.ik_sig)).build())
+                .build(),
+        );
+    }
     for (jid, ks) in by_jid {
         let mut keys_el = Element::builder("keys", NS_OMEMO2).attr(crate::ncname("jid"), jid);
         for k in ks {
@@ -758,6 +837,7 @@ pub async fn heal_session(
         session::establish_session(&stores, cfg.bare(), our_device, &addr, &bundle).await
     {
         warn!(%sender_bare, sender_device, error = %e, "omemo: heal — re-establish failed");
+        notice_if_pq_identity_changed(cfg.account_id, sender_bare, &e);
         note_establish_failure(cfg.account_id, sender_bare, sender_device);
         return Ok(());
     }
@@ -787,6 +867,65 @@ pub async fn heal_session(
     w.send(msg)?;
     info!(%sender_bare, sender_device, "omemo: sent empty OMEMO2 message to heal broken session");
     Ok(())
+}
+
+/// Outcome of [`verify_hybrid_fingerprint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridCheck {
+    /// The post-quantum identity matches the scanned hybrid fingerprint (and is pinned).
+    Verified,
+    /// It does not: the published identity differs from the scanned one, or the bundle was
+    /// refused (wrong classical key, bad signature). Possibly an active attack.
+    Mismatch,
+    /// The device's bundle could not be fetched; nothing was decided.
+    Unavailable,
+}
+
+/// Out-of-band verification of a device's hybrid fingerprint (a scanned `omemo-pq-hfp-`,
+/// proto-XEP §10.1). `identity_key` is the device's serialized classical key. Returns true when
+/// its post-quantum identity matches `hybrid`: either the pinned one already does, or the
+/// device's bundle — both v4 signatures verified — carries one that does, which is then
+/// (re-)pinned. This is the only path allowed to replace a pin, because the user authenticated
+/// it out of band. Anything but [`HybridCheck::Verified`] means the caller MUST NOT mark the key
+/// verified, and SHOULD say why: a mismatch may be an active attack.
+pub async fn verify_hybrid_fingerprint(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    jid: &str,
+    device_id: u32,
+    identity_key: &[u8],
+    hybrid: &str,
+) -> anyhow::Result<HybridCheck> {
+    let pin_key = mxc_omemo::pq_pin_key(identity_key);
+    if let Some(pinned) = store.get_pinned_omemo2_pq_identity(cfg.account_id, jid, &pin_key).await? {
+        if mxc_omemo::hybrid_fingerprint(identity_key, &pinned) == hybrid {
+            return Ok(HybridCheck::Verified);
+        }
+    }
+    let bundle = match fetch_bundle(w, jid, device_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%jid, device_id, error = %e, "omemo: hybrid verification — bundle fetch failed");
+            return Ok(HybridCheck::Unavailable);
+        }
+    };
+    let pq_ik = match session::verified_bundle_pq_identity(&bundle, identity_key) {
+        Ok(pq) => pq,
+        Err(e) => {
+            warn!(%jid, device_id, error = %e, "omemo: hybrid verification — bundle refused");
+            return Ok(HybridCheck::Mismatch);
+        }
+    };
+    if mxc_omemo::hybrid_fingerprint(identity_key, &pq_ik) != hybrid {
+        warn!(%jid, device_id,
+            "omemo: hybrid verification FAILED — the published PQ identity does not match the scanned fingerprint");
+        return Ok(HybridCheck::Mismatch);
+    }
+    store.pin_omemo2_pq_identity(cfg.account_id, jid, &pin_key, &pq_ik).await?;
+    clear_pq_identity_notice(cfg.account_id, jid, &pin_key);
+    info!(%jid, device_id, "omemo: verified hybrid fingerprint and pinned its PQ identity");
+    Ok(HybridCheck::Verified)
 }
 
 /// Background pq_ik pin reconciliation (mirror of the Android client). A peer's post-quantum
@@ -851,6 +990,7 @@ pub async fn reconcile_pq_pin_if_missing(
         Err(e) => {
             warn!(%sender_bare, sender_device, error = %e,
                 "omemo: pq pin reconciliation — refused, not pinning");
+            notice_if_pq_identity_changed(cfg.account_id, sender_bare, &e);
         }
     }
     Ok(())
@@ -944,6 +1084,46 @@ fn select_key_candidates(
     (candidates, truncated)
 }
 
+/// Every `<key kex='true'>` in `header`, across all `<keys>` blocks, as the handshake transcript
+/// covers them (proto-XEP §4.9.7). Entries that do not parse are skipped, as the Android parser
+/// skips them, so both clients recompute the transcript over the same set.
+fn header_kex_entries(header: &Element) -> Vec<session::KexEntry> {
+    let mut entries = Vec::new();
+    for keys in header.children().filter(|c| c.name() == "keys") {
+        let Some(jid) = keys.attr("jid") else { continue };
+        let bare = jid.split('/').next().unwrap_or(jid);
+        for key in keys.children().filter(|c| c.name() == "key" && c.attr("kex") == Some("true")) {
+            let (Some(rid), Ok(data)) = (
+                key.attr("rid").and_then(|r| r.parse::<u32>().ok()),
+                B64.decode(key.text().trim()),
+            ) else {
+                continue;
+            };
+            entries.push(session::KexEntry { jid: bare.to_string(), device_id: rid, data });
+        }
+    }
+    entries
+}
+
+/// Parse `<pq-auth>`, or `None` when it is absent or malformed (never an error: a message
+/// without it is refused by [`session::verify_pq_auth`] if, and only if, it needs it).
+fn parse_pq_auth(header: &Element) -> Option<session::PqAuth> {
+    let auth = header.get_child("pq-auth", NS_OMEMO2)?;
+    let pq_ik_el = auth.get_child("pq-ik", NS_OMEMO2)?;
+    if pq_ik_el.attr("type").is_some_and(|t| t != "ML-DSA-87") {
+        warn!("omemo: refusing <pq-auth> with an unsupported type");
+        return None;
+    }
+    let field = |name: &str| -> Option<Vec<u8>> {
+        B64.decode(auth.get_child(name, NS_OMEMO2)?.text().trim()).ok()
+    };
+    Some(session::PqAuth {
+        pq_ik: B64.decode(pq_ik_el.text().trim()).ok()?,
+        pq_sig: field("pq-sig")?,
+        ik_sig: field("ik-sig")?,
+    })
+}
+
 fn keys_block_is_ours(jid_attr: Option<&str>, our_bare: &str) -> bool {
     let Some(jid) = jid_attr else { return false };
     let bare = jid.split('/').next().unwrap_or(jid);
@@ -1000,6 +1180,21 @@ pub async fn decrypt_message(
     }
 
     let from = DeviceAddr { jid: sender_bare.to_string(), device_id: sender_device };
+    // Post-quantum handshake authentication, BEFORE any candidate reaches libsignal: once it has
+    // processed a pre-key message the session is stored, and later messages on it would decrypt
+    // with no further check (proto-XEP §4.9.7).
+    let handshake = session::verify_pq_auth(
+        &stores,
+        &from,
+        &candidates,
+        &header_kex_entries(header),
+        parse_pq_auth(header).as_ref(),
+    )
+    .await
+    .map_err(|e| {
+        notice_if_pq_identity_changed(cfg.account_id, sender_bare, &e);
+        anyhow::anyhow!("omemo decrypt: {e}")
+    })?;
     // A header may legitimately carry more than one wrap for us — e.g. a sender that rebuilt the
     // session mid-send and attached both the old and the new one. Try each and keep the first
     // that opens (mirrors Android's processReceiving, which walks its candidate list the same
@@ -1045,6 +1240,10 @@ pub async fn decrypt_message(
             return Err(anyhow::anyhow!("omemo decrypt: {e}"));
         }
     };
+    // The pin was written inside verify_pq_auth, before libsignal saw the message.
+    if handshake.as_ref().is_some_and(|h| h.newly_pinned) {
+        debug!(%sender_bare, sender_device, "omemo: pinned PQ identity from an authenticated handshake");
+    }
 
     // XEP-0384 heartbeat: if this whisper's ratchet counter reached the threshold (a long
     // one-directional chain), flag a heartbeat so the caller forces a DH-ratchet step — restoring

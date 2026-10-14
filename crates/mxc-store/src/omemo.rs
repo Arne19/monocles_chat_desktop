@@ -137,9 +137,10 @@ impl Store {
         Ok(row.map(|r| r.pq_identity_key))
     }
 
-    /// Pin (or re-pin) `jid`'s post-quantum identity to its classical `fingerprint`. The
-    /// caller (mxc-omemo) has already authenticated `pq_identity_key` via the bundle's
-    /// ML-DSA-87 signature and applied the change-of-pin policy. See
+    /// Pin `jid`'s post-quantum identity to its classical `fingerprint`, REPLACING any existing
+    /// pin. Only for an out-of-band verification of the hybrid fingerprint — the one input
+    /// allowed to replace a pin (proto-XEP §10.1); every other path uses
+    /// [`Self::pin_omemo2_pq_identity_if_absent`]. See
     /// [`Self::get_pinned_omemo2_pq_identity`] for why the pin is scoped to `jid`.
     pub async fn pin_omemo2_pq_identity(
         &self,
@@ -158,6 +159,34 @@ impl Store {
         .execute(self.pool())
         .await?;
         Ok(())
+    }
+
+    /// Pin `jid`'s post-quantum identity only if nothing is pinned yet for (`jid`,
+    /// `fingerprint`). One `INSERT … ON CONFLICT DO NOTHING` against the primary key, so two
+    /// tasks racing to pin can never overwrite each other (mirrors Android's
+    /// `pinOmemo2PqIdentityIfAbsent`).
+    ///
+    /// Returns the key pinned afterwards: `pq_identity_key` when it was inserted (or already
+    /// was the pin), otherwise the different key that was already there.
+    pub async fn pin_omemo2_pq_identity_if_absent(
+        &self,
+        account_id: i64,
+        jid: &str,
+        fingerprint: &str,
+        pq_identity_key: &[u8],
+    ) -> Result<Vec<u8>> {
+        sqlx::query!(
+            r#"INSERT INTO omemo_pq_identities (account_id, address_jid, fingerprint, pq_identity_key)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(account_id, address_jid, fingerprint) DO NOTHING"#,
+            account_id, jid, fingerprint, pq_identity_key,
+        )
+        .execute(self.pool())
+        .await?;
+        Ok(self
+            .get_pinned_omemo2_pq_identity(account_id, jid, fingerprint)
+            .await?
+            .unwrap_or_else(|| pq_identity_key.to_vec()))
     }
 
     /// Wipe all locally cached OMEMO2 **peer** state for an account — ongoing sessions, peer

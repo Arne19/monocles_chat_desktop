@@ -73,10 +73,11 @@ the PQ OMEMO2 changes and is the same tree the Android app builds against) into 
 ```sh
 git clone https://codeberg.org/monocles/pq-omemo-2.git deps/libsignal
 # Pin the revision this client expects. Not optional in practice: earlier revisions
-# predate the FIPS 203 ML-KEM-1024 switch and the v3 bundle transcript, and a
-# mismatched pair fails to establish a session rather than degrading — so the
-# symptom looks like a broken build, not a version skew.
-git -C deps/libsignal checkout c49a3d879541f8b501bb5e39d1aa52469d23c4fa
+# predate the v4 bundle transcript (signed by both identity keys) and the <pq-auth>
+# handshake transcript, and a mismatched pair fails to establish a session rather
+# than degrading — so the symptom looks like a broken build, not a version skew.
+# TODO: replace with the pq-omemo-2 commit that contains "pq-bundle:v4" and pqauth.rs.
+git -C deps/libsignal checkout <pq-omemo-2 commit with transcript v4>
 ```
 
 **Dev database (sqlx):** `mxc-store`'s compile-time `query!` macros need a SQLite DB with

@@ -20,7 +20,9 @@ pub const FEATURES: &[&str] = &[
     "jabber:iq:version",                            // XEP-0092
     "jabber:x:oob",                                 // XEP-0066
     "urn:monocles:omemo-pq:1",                      // PQ OMEMO2 (proto-XEP OMEMO-PQXDH)
+    "urn:monocles:omemo-pq:1:bundle-v4",            // dual-signed v4 bundle (diagnostics, §11.3)
     "urn:monocles:omemo-pq:1:devices+notify",       // PEP +notify for device list
+    "urn:monocles:omemo-pq:1:kex-auth",             // <pq-auth> handshake auth (diagnostics, §11.3)
     "urn:monocles:omemo-pq:1:pqxdh",                // PQXDH capability (diagnostics, §11.3)
     "urn:monocles:omemo-pq:1:spqr",                 // SPQR capability (diagnostics, §11.3)
     "urn:xmpp:chat-markers:0",                      // XEP-0333

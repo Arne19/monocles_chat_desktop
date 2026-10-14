@@ -34,8 +34,10 @@ pub enum OmemoError {
     NoPqxdh,
     #[error("peer does not advertise a post-quantum hybrid identity (no <pq-ik> in bundle)")]
     NoPqIdentity,
-    #[error("post-quantum identity for {0} changed and the classical fingerprint is not verified")]
+    #[error("post-quantum identity for {0} changed — refused; re-verify the contact's hybrid fingerprint")]
     PqIdentityChanged(String),
+    #[error("handshake authentication (<pq-auth>) failed: {0}")]
+    HandshakeAuth(String),
     #[error("store: {0}")]
     Store(#[from] mxc_store::StoreError),
     #[error("libsignal: {0}")]

@@ -170,7 +170,17 @@ pub enum Command {
     /// Fingerprints that match nothing are ignored — they belong to a stack we do not run, or
     /// to a device we have not fetched yet. Replies with a refreshed `Event::ContactKeys` (or
     /// `Event::OwnKeys` for our own JID) and a toast.
-    VerifyOmemoFingerprints { account_id: i64, jid: String, fingerprints: Vec<String> },
+    ///
+    /// `hybrids` maps a classical hex from `fingerprints` to the hybrid fingerprint the code
+    /// carried for it (`omemo-pq-hfp-`). Such a key is verified only once its post-quantum
+    /// identity — pinned, or from the device's freshly verified bundle — matches the hybrid;
+    /// that match is also the only way to replace a pinned post-quantum identity.
+    VerifyOmemoFingerprints {
+        account_id: i64,
+        jid: String,
+        fingerprints: Vec<String>,
+        hybrids: Vec<(String, String)>,
+    },
 
     /// Wipe all locally cached OMEMO2 *peer* state (sessions, identities + trust, PQ pins,
     /// cached device lists) and re-advertise our (unchanged) bundle, so keys rebuild cleanly on

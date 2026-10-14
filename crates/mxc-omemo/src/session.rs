@@ -17,8 +17,8 @@ use sha3::digest::{ExtendableOutput, Update};
 use sha3::{CShake256, CShake256Core};
 use zeroize::Zeroize;
 use libsignal_protocol::{
-    kem, message_decrypt_prekey, message_decrypt_signal, message_encrypt, pq_bundle_transcript,
-    pq_kem_binding, process_prekey_bundle, GenericSignedPreKey, IdentityKey, IdentityKeyPair, KeyPair,
+    kem, message_decrypt_prekey, message_decrypt_signal, message_encrypt, pq_bundle_transcript, pq_bundle_verify,
+    pq_kem_binding, pq_kex_auth_transcript, pq_kex_auth_verify, process_prekey_bundle, KexAuthEntry, GenericSignedPreKey, IdentityKey, IdentityKeyPair, KeyPair,
     KyberPreKeyId, KyberPreKeyRecord, PqIdentityKey, PqIdentityKeyPair, PqSignature, PreKeyBundle,
     PreKeyId, PreKeyRecord, PreKeySignalMessage, PublicKey, SignalMessage, SignedPreKeyId,
     SignedPreKeyRecord, Timestamp,
@@ -87,6 +87,188 @@ pub struct EncryptedMessage {
     /// Key commitment over the message key (see `COMMIT_INFO`), published as a single shared
     /// `<commit>` element so a ciphertext binds to exactly one message key.
     pub commit: [u8; COMMIT_LEN],
+    /// `<pq-auth>`: present whenever `keys` contains a pre-key message (proto-XEP §4.9.7).
+    pub pq_auth: Option<PqAuth>,
+}
+
+/// The content of a `<pq-auth>` element: the sender's ML-DSA-87 identity key and its signature
+/// over the handshake transcript, plus the classical identity key's signature over the same
+/// transcript (proto-XEP §4.9.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PqAuth {
+    pub pq_ik: Vec<u8>,
+    pub pq_sig: Vec<u8>,
+    pub ik_sig: Vec<u8>,
+}
+
+/// One `<key kex='true'>` of a stanza, as the handshake transcript covers it: the `<keys jid>`
+/// it sits under, its `rid`, and the serialized `PreKeySignalMessage`.
+#[derive(Debug, Clone)]
+pub struct KexEntry {
+    pub jid: String,
+    pub device_id: u32,
+    pub data: Vec<u8>,
+}
+
+/// A pre-key message whose `<pq-auth>` verified; see [`verify_pq_auth`].
+#[derive(Debug, Clone)]
+pub struct VerifiedHandshake {
+    pub fp_key: String,
+    pub pq_ik: Vec<u8>,
+    /// True when this handshake wrote the pin (first contact).
+    pub newly_pinned: bool,
+}
+
+fn kex_auth_transcript(
+    sender_jid: &str,
+    sender_device: u32,
+    ik: &IdentityKey,
+    pq_ik: &PqIdentityKey,
+    entries: &[KexEntry],
+) -> Vec<u8> {
+    let entries: Vec<KexAuthEntry<'_>> = entries
+        .iter()
+        .map(|e| KexAuthEntry {
+            recipient_jid: &e.jid,
+            recipient_device_id: e.device_id,
+            prekey_message: &e.data,
+        })
+        .collect();
+    pq_kex_auth_transcript(sender_jid, sender_device, ik, pq_ik, &entries)
+}
+
+/// Sign `<pq-auth>` for an outgoing message, or `None` when it carries no pre-key message.
+///
+/// The ML-DSA-87 signature post-quantum authenticates the handshake: a quantum adversary who
+/// recovers our classical identity key can still not open a session in our name with anyone who
+/// pinned our post-quantum identity. The classical signature binds that post-quantum key to our
+/// classical identity, so nobody without our classical private key can replace it with their own.
+fn sign_pq_auth(
+    stores: &OmemoStores,
+    our_jid: &str,
+    our_device: u32,
+    keys: &[WrappedKey],
+) -> Result<Option<PqAuth>> {
+    let entries: Vec<KexEntry> = keys
+        .iter()
+        .filter(|k| k.kex)
+        .map(|k| KexEntry { jid: k.jid.clone(), device_id: k.device_id, data: k.data.clone() })
+        .collect();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut rng = rand::rng();
+    let pq = stores.pq_identity();
+    let pq_pub = pq.public_key();
+    let transcript = kex_auth_transcript(
+        our_jid,
+        our_device,
+        stores.identity().identity_key(),
+        &pq_pub,
+        &entries,
+    );
+    let pq_sig = pq.sign(&transcript, &mut rng).map_err(|e| OmemoError::Signal(e.to_string()))?;
+    let ik_sig = stores
+        .identity()
+        .private_key()
+        .calculate_signature(&transcript, &mut rng)
+        .map_err(|e| OmemoError::Signal(e.to_string()))?;
+    Ok(Some(PqAuth {
+        pq_ik: pq_pub.serialize().to_vec(),
+        pq_sig: pq_sig.serialize().to_vec(),
+        ik_sig: ik_sig.to_vec(),
+    }))
+}
+
+/// Post-quantum authentication of an incoming pre-key message (proto-XEP §4.9.7). MUST run
+/// before the message is handed to libsignal: once it has processed a pre-key message the new
+/// session is stored, and the sender's later (non-pre-key) messages would decrypt with no
+/// further post-quantum check.
+///
+/// `candidates` are the wraps for our device that will be tried; `header_kex` every
+/// `<key kex='true'>` in the header (all recipients — the signature covers them all). Returns
+/// `None` when no candidate is a pre-key message: an established session was authenticated when
+/// it was built. Otherwise `<pq-auth>` must be present, both signatures must verify, and its
+/// post-quantum key must match the one pinned for the sender's (JID, classical identity).
+pub async fn verify_pq_auth(
+    stores: &OmemoStores,
+    from: &DeviceAddr,
+    candidates: &[(Vec<u8>, bool)],
+    header_kex: &[KexEntry],
+    auth: Option<&PqAuth>,
+) -> Result<Option<VerifiedHandshake>> {
+    let mut sender_ik: Option<IdentityKey> = None;
+    for (data, kex) in candidates {
+        if !*kex {
+            continue;
+        }
+        // A malformed candidate is skipped, not fatal: libsignal cannot process it either (it
+        // fails to parse there too, before any state changes), and a well-formed sibling — e.g.
+        // the second wrap of a sender that rebuilt the session mid-send — must stay usable.
+        let Ok(msg) = PreKeySignalMessage::try_from(data.as_slice()) else {
+            tracing::warn!("omemo: skipping malformed pre-key message candidate");
+            continue;
+        };
+        let ik = *msg.identity_key();
+        if sender_ik.is_some_and(|known| known != ik) {
+            return Err(OmemoError::HandshakeAuth(
+                "pre-key messages for this device name different identity keys".into(),
+            ));
+        }
+        sender_ik = Some(ik);
+    }
+    let Some(ik) = sender_ik else { return Ok(None) };
+    let auth = auth.ok_or_else(|| {
+        OmemoError::HandshakeAuth(
+            "pre-key message without a valid <pq-auth> — the sender's client predates handshake \
+             authentication and must be updated"
+                .into(),
+        )
+    })?;
+    // The one shared verification routine (libsignal `pq_kex_auth_verify`, also behind
+    // Android's `PqAuth.verify`): lengths, both signatures, no short-circuit.
+    let entries: Vec<KexAuthEntry<'_>> = header_kex
+        .iter()
+        .map(|e| KexAuthEntry {
+            recipient_jid: &e.jid,
+            recipient_device_id: e.device_id,
+            prekey_message: &e.data,
+        })
+        .collect();
+    if !pq_kex_auth_verify(
+        &from.jid,
+        from.device_id,
+        &ik,
+        &auth.pq_ik,
+        &auth.pq_sig,
+        &auth.ik_sig,
+        &entries,
+    ) {
+        return Err(OmemoError::HandshakeAuth("invalid <pq-auth> signature".into()));
+    }
+    // Pin NOW, before libsignal stores the session: if the payload later fails to open, the
+    // session still exists, and it must not exist without its pin. Safe on first contact
+    // because the classical key signed this PQ key (`<ik-sig>`). The write is atomic, so a
+    // concurrent pin is never overwritten; a different existing pin refuses the handshake.
+    let fp_key = crate::pq_pin_key(&ik.serialize());
+    let existing = stores
+        .store
+        .get_pinned_omemo2_pq_identity(stores.account_id, &from.jid, &fp_key)
+        .await?;
+    let newly_pinned = existing.is_none();
+    let pinned = match existing {
+        Some(p) => p,
+        None => {
+            stores
+                .store
+                .pin_omemo2_pq_identity_if_absent(stores.account_id, &from.jid, &fp_key, &auth.pq_ik)
+                .await?
+        }
+    };
+    if pinned != auth.pq_ik {
+        return Err(OmemoError::PqIdentityChanged(fp_key));
+    }
+    Ok(Some(VerifiedHandshake { fp_key, pq_ik: auth.pq_ik.clone(), newly_pinned }))
 }
 
 /// Context-binding string used as BOTH the HKDF salt and the AES-GCM AAD (proto-XEP §5.4.2):
@@ -335,12 +517,15 @@ pub fn stores_from_identity(
     Ok(OmemoStores::new(store, account_id, identity, device_id, pq_identity))
 }
 
-/// Sign the monocles hybrid-identity transcript (v2) binding the device's post-quantum
+/// Sign the monocles hybrid-identity transcript (v4) binding the device's post-quantum
 /// identity key to its classical identity key, EC signed pre-key, and — via the KEM binding
 /// digest — every ML-KEM pre-key in the bundle (kem-spk + all one-time kem-pk), proto-XEP
-/// §4.9.1. Returns `(pq_ik_bytes, pq_sig_bytes)`. The transcript and binding are computed by
-/// libsignal's [`pq_bundle_transcript`] / [`pq_kem_binding`] so they are byte-identical to
-/// what a verifier (incl. the Android client) recomputes and checks.
+/// §4.9.1. It is signed by BOTH identity keys: the ML-DSA-87 signature stops a quantum
+/// adversary substituting any of it, the classical one stops anyone without our classical
+/// private key attaching a pq_ik of their own. Returns `(pq_ik, pq_sig, ik_sig)`. The
+/// transcript and binding are computed by libsignal's [`pq_bundle_transcript`] /
+/// [`pq_kem_binding`] so they are byte-identical to what a verifier (incl. the Android
+/// client) recomputes and checks.
 fn sign_bundle_pq(
     stores: &OmemoStores,
     signed_prekey_id: u32,
@@ -348,7 +533,7 @@ fn sign_bundle_pq(
     kem_spk_id: u32,
     kem_spk_public: &[u8],
     kem_one_time: &[(u32, &[u8])],
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let mut rng = rand::rng();
     let pq = stores.pq_identity();
     let pq_pub = pq.public_key();
@@ -365,7 +550,13 @@ fn sign_bundle_pq(
         &kem_binding,
     );
     let sig = pq.sign(&transcript, &mut rng).map_err(|e| OmemoError::Signal(e.to_string()))?;
-    Ok((pq_pub.serialize().to_vec(), sig.serialize().to_vec()))
+    let ik_sig = stores
+        .identity()
+        .private_key()
+        .calculate_signature(&transcript, &mut rng)
+        .map_err(|e| OmemoError::Signal(e.to_string()))?
+        .to_vec();
+    Ok((pq_pub.serialize().to_vec(), sig.serialize().to_vec(), ik_sig))
 }
 
 /// Generate one signed pre-key (EC), one last-resort signed KEM pre-key, plus `count`
@@ -436,7 +627,7 @@ pub async fn generate_and_store_prekeys(
 
     let kem_ot: Vec<(u32, &[u8])> =
         kem_prekeys.iter().map(|k| (k.id, k.key.as_slice())).collect();
-    let (pq_ik, pq_sig) = sign_bundle_pq(
+    let (pq_ik, pq_sig, ik_sig) = sign_bundle_pq(
         stores,
         signed_prekey_id,
         &spk_kp.public_key,
@@ -457,6 +648,7 @@ pub async fn generate_and_store_prekeys(
         kem_prekeys,
         pq_ik,
         pq_sig,
+        ik_sig,
     })
 }
 
@@ -701,7 +893,7 @@ async fn rebuild_bundle(stores: &OmemoStores, signed_prekey_id: u32) -> Result<B
     let kem_spk_public = kem_rec.public_key()?.serialize().to_vec();
     let kem_ot: Vec<(u32, &[u8])> =
         kem_prekeys.iter().map(|k| (k.id, k.key.as_slice())).collect();
-    let (pq_ik, pq_sig) = sign_bundle_pq(
+    let (pq_ik, pq_sig, ik_sig) = sign_bundle_pq(
         stores,
         spk_id,
         &spk_rec.public_key()?,
@@ -722,6 +914,7 @@ async fn rebuild_bundle(stores: &OmemoStores, signed_prekey_id: u32) -> Result<B
         kem_prekeys,
         pq_ik,
         pq_sig,
+        ik_sig,
     })
 }
 
@@ -749,14 +942,15 @@ pub async fn establish_session(
     let pq_identity_key = PqIdentityKey::deserialize(&bundle.pq_ik)?;
     let pq_signature = PqSignature::deserialize(&bundle.pq_sig)?;
 
-    // TOFU-pin the post-quantum identity, keyed to (owning JID, classical identity key). If
-    // the peer presents a *different* `<pq-ik>` for an identity we have already pinned, refuse
-    // — unless the classical fingerprint has been manually verified (trust == 3), in which
-    // case a legitimate post-quantum re-key is accepted and re-pinned (proto-XEP §6.15,
-    // §4.9.2). A first-contact pin can only mount a DoS, never an undetected MITM, because
-    // process_prekey_bundle below still verifies the ML-DSA-87 signature — and scoping the pin
-    // to `remote.jid` keeps even that DoS from reaching across JIDs, since a classical `<ik>`
-    // is public and any peer can republish someone else's.
+    // TOFU-pin the post-quantum identity, keyed to (owning JID, classical identity key). A
+    // *different* `<pq-ik>` for an identity we have already pinned is ALWAYS refused — also
+    // when the classical fingerprint is user-verified (proto-XEP §4.9.2). Earlier builds
+    // accepted and re-pinned it in that case, to blunt a pin-poisoning DoS; but a quantum
+    // adversary who recovers the classical key could then present a pq_ik of its own and have
+    // it accepted precisely because the contact was verified. That DoS is gone: pins are scoped
+    // to `remote.jid`, and the v4 transcript is signed by the classical key too, so nobody
+    // without that private key can attach a pq_ik to it. The only way to replace a pin is an
+    // out-of-band verification of the new hybrid fingerprint (`omemo-pq-hfp-`).
     let fp_key = crate::pq_pin_key(&ik.serialize());
     let pinned = stores
         .store
@@ -764,16 +958,20 @@ pub async fn establish_session(
         .await?;
     if let Some(pinned) = &pinned {
         if pinned.as_slice() != bundle.pq_ik.as_slice() {
-            let verified = stores
-                .store
-                .omemo_identity(stores.account_id, &remote.jid, remote.device_id as i64)
-                .await?
-                .map(|r| r.trust == 3)
-                .unwrap_or(false);
-            if !verified {
-                return Err(OmemoError::PqIdentityChanged(fp_key));
-            }
+            return Err(OmemoError::PqIdentityChanged(fp_key));
         }
+    }
+    // Verify both transcript signatures and pin BEFORE process_prekey_bundle: it stores the
+    // session, which must never exist against a PQ identity other than the pinned one. Pinning
+    // first (atomically) means a concurrent pin of a different key refuses the build before any
+    // session is stored; process_prekey_bundle then checks the same signatures again.
+    verified_bundle_pq_identity(bundle, &ik.serialize())?;
+    let now_pinned = stores
+        .store
+        .pin_omemo2_pq_identity_if_absent(stores.account_id, &remote.jid, &fp_key, &bundle.pq_ik)
+        .await?;
+    if now_pinned != bundle.pq_ik {
+        return Err(OmemoError::PqIdentityChanged(fp_key));
     }
 
     // Choose a one-time EC prekey.
@@ -791,9 +989,9 @@ pub async fn establish_session(
 
     // Recompute the KEM binding over ALL of the fetched bundle's ML-KEM pre-keys
     // (kem-spk + every one-time kem-pk). `with_pq_identity` makes
-    // process_prekey_bundle (below) verify the ML-DSA-87 signature over the v2
-    // transcript — which covers this binding — against `pq_identity_key`, so a
-    // substituted KEM pre-key (the harvest-and-forge vector) aborts here.
+    // process_prekey_bundle (below) verify both signatures over the v4 transcript —
+    // which covers this binding — so a substituted KEM pre-key (the harvest-and-forge
+    // vector) or a foreign pq_ik aborts here.
     let kem_ot: Vec<(KyberPreKeyId, &[u8])> = bundle
         .kem_prekeys
         .iter()
@@ -816,7 +1014,12 @@ pub async fn establish_session(
         _kem_sig.clone(),
         ik,
     )?
-    .with_pq_identity(pq_identity_key, pq_signature, kem_binding.to_vec());
+    .with_pq_identity(
+        pq_identity_key,
+        pq_signature,
+        bundle.ik_sig.clone(),
+        kem_binding.to_vec(),
+    );
 
     let remote_addr = protocol_address(&remote.jid, remote.device_id)?;
     let local_addr = protocol_address(our_jid, our_device)?;
@@ -834,55 +1037,24 @@ pub async fn establish_session(
         &mut rng,
     )
     .await?;
-
-    // The signature verified inside process_prekey_bundle, so it is now safe to pin (or
-    // re-pin, when verified) this post-quantum identity to the classical identity key.
-    stores
-        .store
-        .pin_omemo2_pq_identity(stores.account_id, &remote.jid, &fp_key, &bundle.pq_ik)
-        .await?;
+    // The PQ identity was verified and pinned above, before the session was stored.
     Ok(())
 }
 
-/// Verify a fetched [`Bundle`]'s post-quantum identity and **pin-fill** it for a peer whose
-/// classical identity we already know but whose pq_ik was never pinned — the state left behind
-/// when the PEER initiated the session: an inbound PQXDH key exchange carries the initiator's
-/// classical identity key but not its `<pq-ik>`, which only travels in the published bundle.
-/// Without the pin the device keeps displaying its classical instead of hybrid fingerprint.
-/// Mirrors the Android client's `reconcileOmemo2PqPinIfMissing`.
-///
-/// Security: strictly a TOFU pin-fill, never a re-pin — an existing pin is NEVER overwritten
-/// here (a changed pq_ik remains [`establish_session`]'s refuse-unless-verified policy). Before
-/// pinning, the bundle must (a) carry exactly the classical identity key we already hold for
-/// this device (`known_ik`, the serialized key from our identity store), so a malicious or
-/// compromised PEP node cannot poison the pin of a known identity, and (b) carry a valid
-/// ML-DSA-87 signature over the v2 transcript (ik, pq_ik, EC signed pre-key, KEM binding),
-/// proving possession of the pq signing key for exactly this classical identity — the same
-/// verification `process_prekey_bundle` performs during [`establish_session`].
-///
-/// Returns `Ok(true)` when a pin was written, `Ok(false)` when one already existed.
-pub async fn reconcile_pq_pin(
-    stores: &OmemoStores,
-    remote: &DeviceAddr,
-    bundle: &Bundle,
-    known_ik: &[u8],
-) -> Result<bool> {
-    // The hybrid post-quantum identity is mandatory — never downgrade, never pin nothing.
+/// The post-quantum identity a fetched [`Bundle`] authenticates for the classical identity
+/// `known_ik` (serialized, 33 bytes): the bundle must carry exactly that classical key, and both
+/// signatures over its v4 transcript must verify ([`pq_bundle_verify`], the check
+/// `process_prekey_bundle` makes). Returns the 2592-byte ML-DSA-87 key.
+pub fn verified_bundle_pq_identity(bundle: &Bundle, known_ik: &[u8]) -> Result<Vec<u8>> {
     if !bundle.has_pq_identity() {
         return Err(OmemoError::NoPqIdentity);
     }
-
-    // (a) the bundle must belong to the classical identity we already know.
     let ik = IdentityKey::decode(&ec_djb(&bundle.ik))?;
     if ik.serialize().as_ref() != known_ik {
         return Err(OmemoError::BundleParse(
-            "bundle carries a different classical identity key than the established session"
-                .into(),
+            "bundle carries a different classical identity key".into(),
         ));
     }
-
-    // (b) recompute the KEM binding over ALL of the bundle's ML-KEM pre-keys and the v2
-    // transcript exactly as the publisher signed them, then verify the ML-DSA-87 signature.
     let pq_identity_key = PqIdentityKey::deserialize(&bundle.pq_ik)?;
     let pq_signature = PqSignature::deserialize(&bundle.pq_sig)?;
     let kem_ot: Vec<(KyberPreKeyId, &[u8])> = bundle
@@ -895,36 +1067,75 @@ pub async fn reconcile_pq_pin(
         &bundle.kem_spk,
         &kem_ot,
     );
-    let transcript = pq_bundle_transcript(
+    if !pq_bundle_verify(
         &ik,
         &pq_identity_key,
+        &pq_signature,
+        &bundle.ik_sig,
         SignedPreKeyId::from(bundle.spk_id),
         &dec_pub(&bundle.spk)?,
         &kem_binding,
-    );
-    if !pq_identity_key.verify(&transcript, &pq_signature) {
-        return Err(OmemoError::BadSignature("pq bundle transcript (pin reconciliation)"));
+    ) {
+        return Err(OmemoError::BadSignature("pq bundle transcript"));
     }
+    Ok(bundle.pq_ik.clone())
+}
 
-    // Pin-fill only: the store's pin operation is an UPSERT, so re-check here and NEVER
-    // overwrite an existing pin (a concurrent establish_session may have pinned already).
+/// Verify a fetched [`Bundle`]'s post-quantum identity and **pin-fill** it for a peer whose
+/// classical identity we already know but whose pq_ik was never pinned — the state left behind
+/// when the PEER initiated the session: an inbound PQXDH key exchange carries the initiator's
+/// classical identity key but not its `<pq-ik>`, which only travels in the published bundle.
+/// Without the pin the device keeps displaying its classical instead of hybrid fingerprint.
+/// Mirrors the Android client's `reconcileOmemo2PqPinIfMissing`.
+///
+/// Security: strictly a TOFU pin-fill, never a re-pin — an existing pin is NEVER overwritten
+/// here (a changed pq_ik remains a refused identity change). Before pinning, the bundle must
+/// (a) carry exactly the classical identity key we already hold for this device (`known_ik`,
+/// the serialized key from our identity store), so a malicious or compromised PEP node cannot
+/// poison the pin of a known identity, and (b) carry valid ML-DSA-87 AND classical signatures
+/// over the v4 transcript (ik, pq_ik, EC signed pre-key, KEM binding) — the same
+/// [`pq_bundle_verify`] check `process_prekey_bundle` performs during [`establish_session`].
+///
+/// Returns `Ok(true)` when a pin was written, `Ok(false)` when the same key was already pinned,
+/// and [`OmemoError::PqIdentityChanged`] when a *different* one is (the pin is kept).
+pub async fn reconcile_pq_pin(
+    stores: &OmemoStores,
+    remote: &DeviceAddr,
+    bundle: &Bundle,
+    known_ik: &[u8],
+) -> Result<bool> {
+    // (a) the bundle must belong to the classical identity we already know, and (b) both
+    // signatures over its v4 transcript must verify.
+    verified_bundle_pq_identity(bundle, known_ik).map_err(|e| match e {
+        OmemoError::BadSignature(_) => {
+            OmemoError::BadSignature("pq bundle transcript (pin reconciliation)")
+        }
+        other => other,
+    })?;
+
+    // Pin-fill only, and NEVER overwrite an existing pin (a concurrent establish_session or
+    // inbound handshake may have pinned already). The read tells "already pinned" apart from
+    // "pinned now"; the write itself is atomic, so a race between the two cannot overwrite.
     let fp_key = crate::pq_pin_key(known_ik);
-    if let Some(pinned) = stores
+    let existing = stores
         .store
         .get_pinned_omemo2_pq_identity(stores.account_id, &remote.jid, &fp_key)
-        .await?
-    {
-        if pinned.as_slice() != bundle.pq_ik.as_slice() {
-            tracing::warn!(jid = %remote.jid, device = remote.device_id,
-                "omemo: pq pin reconciliation found a DIFFERENT pq_ik already pinned — keeping the existing pin");
-        }
-        return Ok(false);
-    }
-    stores
-        .store
-        .pin_omemo2_pq_identity(stores.account_id, &remote.jid, &fp_key, &bundle.pq_ik)
         .await?;
-    Ok(true)
+    let newly_pinned = existing.is_none();
+    let pinned = match existing {
+        Some(pinned) => pinned,
+        None => {
+            stores
+                .store
+                .pin_omemo2_pq_identity_if_absent(stores.account_id, &remote.jid, &fp_key, &bundle.pq_ik)
+                .await?
+        }
+    };
+    if pinned != bundle.pq_ik {
+        // The existing pin stands; the mismatch is an identity change the caller reports.
+        return Err(OmemoError::PqIdentityChanged(fp_key));
+    }
+    Ok(newly_pinned)
 }
 
 /// Encrypt `plaintext` (an SCE envelope) for all `recipients` that already have a session.
@@ -983,7 +1194,8 @@ pub async fn encrypt(
     // (mirrors Android's XmppOmemo2Message.wipeMessageKey).
     message_key.zeroize();
 
-    Ok(EncryptedMessage { payload, keys, commit })
+    let pq_auth = sign_pq_auth(stores, our_jid, our_device, &keys)?;
+    Ok(EncryptedMessage { payload, keys, commit, pq_auth })
 }
 
 /// Decrypt one wrapped key + payload addressed to us. Returns the SCE plaintext.
@@ -1260,6 +1472,131 @@ mod tests {
         assert_eq!(pt, b"hello pq world");
     }
 
+    /// Pin-fill never overwrites: the first pin for (JID, IK) stands, a later different key is
+    /// reported back instead of written, and only the explicit replace (hybrid-fingerprint scan)
+    /// changes it.
+    #[tokio::test]
+    async fn pin_if_absent_never_overwrites() {
+        let (bob, _) = party("bob@example.com").await;
+        let (acc, jid, fp) = (bob.account_id, "alice@example.com", "05aa");
+        let first = bob.store.pin_omemo2_pq_identity_if_absent(acc, jid, fp, &[1u8; 4]).await.unwrap();
+        assert_eq!(first, vec![1u8; 4]);
+        let second = bob.store.pin_omemo2_pq_identity_if_absent(acc, jid, fp, &[2u8; 4]).await.unwrap();
+        assert_eq!(second, vec![1u8; 4], "an existing pin must win");
+        // The same pin for another JID is independent (pins are JID-scoped).
+        let other = bob
+            .store
+            .pin_omemo2_pq_identity_if_absent(acc, "mallory@example.com", fp, &[3u8; 4])
+            .await
+            .unwrap();
+        assert_eq!(other, vec![3u8; 4]);
+        bob.store.pin_omemo2_pq_identity(acc, jid, fp, &[2u8; 4]).await.unwrap();
+        assert_eq!(
+            bob.store.get_pinned_omemo2_pq_identity(acc, jid, fp).await.unwrap(),
+            Some(vec![2u8; 4]),
+            "the explicit replace (hfp scan) does change it"
+        );
+    }
+
+    /// `<pq-auth>` (proto-XEP §4.9.7): a pre-key message is accepted only with a valid handshake
+    /// signature by BOTH of the sender's identity keys, and only under the PQ identity pinned for
+    /// it. Runs the real verification against a real PQXDH pre-key message.
+    #[tokio::test]
+    async fn pq_auth_authenticates_the_handshake() {
+        let (bob, bob_dev) = party("bob@example.com").await;
+        let bob_bundle = generate_and_store_prekeys(&bob, 1, 1000, 100, 5).await.unwrap();
+        let (alice, alice_dev) = party("alice@example.com").await;
+        let bob_addr = DeviceAddr { jid: "bob@example.com".into(), device_id: bob_dev };
+        establish_session(&alice, "alice@example.com", alice_dev, &bob_addr, &bob_bundle)
+            .await
+            .unwrap();
+        let enc = encrypt(&alice, "alice@example.com", alice_dev, &[bob_addr], Some("bob@example.com"), b"hi")
+            .await
+            .unwrap();
+        assert!(enc.keys[0].kex);
+        let auth = enc.pq_auth.clone().expect("a pre-key message carries <pq-auth>");
+        let wk = &enc.keys[0];
+        let candidates = vec![(wk.data.clone(), true)];
+        let entries =
+            vec![KexEntry { jid: "BOB@example.com".into(), device_id: bob_dev, data: wk.data.clone() }];
+        let alice_addr = DeviceAddr { jid: "alice@example.com".into(), device_id: alice_dev };
+
+        // Valid: verifies (JID case does not matter), and — first contact — pins right away,
+        // before any decryption.
+        let ok = verify_pq_auth(&bob, &alice_addr, &candidates, &entries, Some(&auth))
+            .await
+            .expect("valid <pq-auth>")
+            .expect("a pre-key message is authenticated");
+        assert!(ok.newly_pinned);
+        assert_eq!(ok.pq_ik, alice.pq_identity().public_key().serialize().to_vec());
+        assert_eq!(
+            bob.store
+                .get_pinned_omemo2_pq_identity(bob.account_id, "alice@example.com", &ok.fp_key)
+                .await
+                .unwrap(),
+            Some(ok.pq_ik.clone()),
+            "the pin is written at verification, not after the payload opens"
+        );
+        // Verifying again finds the same pin: not newly pinned, still accepted.
+        let again = verify_pq_auth(&bob, &alice_addr, &candidates, &entries, Some(&auth))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!again.newly_pinned);
+
+        // Missing: refused.
+        assert!(matches!(
+            verify_pq_auth(&bob, &alice_addr, &candidates, &entries, None).await,
+            Err(OmemoError::HandshakeAuth(_))
+        ));
+
+        // A planted PQ key with its own valid ML-DSA signature, but Alice's classical signature
+        // replayed from the genuine <pq-auth>: refused, because IK never signed that transcript.
+        let mallory_pq = PqIdentityKeyPair::generate(&mut rand::rng());
+        let transcript = kex_auth_transcript(
+            "alice@example.com",
+            alice_dev,
+            alice.identity().identity_key(),
+            &mallory_pq.public_key(),
+            &entries,
+        );
+        let planted = PqAuth {
+            pq_ik: mallory_pq.public_key().serialize().to_vec(),
+            pq_sig: mallory_pq.sign(&transcript, &mut rand::rng()).unwrap().serialize().to_vec(),
+            ik_sig: auth.ik_sig.clone(),
+        };
+        assert!(matches!(
+            verify_pq_auth(&bob, &alice_addr, &candidates, &entries, Some(&planted)).await,
+            Err(OmemoError::HandshakeAuth(_))
+        ));
+
+        // The signature covers every pre-key message of the stanza: dropping or adding one fails.
+        let mut extra = entries.clone();
+        extra.push(KexEntry { jid: "carol@example.com".into(), device_id: 5, data: vec![1, 2, 3] });
+        assert!(verify_pq_auth(&bob, &alice_addr, &candidates, &extra, Some(&auth)).await.is_err());
+
+        // Attributed to another sender: fails.
+        let mallory_addr = DeviceAddr { jid: "mallory@example.com".into(), device_id: alice_dev };
+        assert!(verify_pq_auth(&bob, &mallory_addr, &candidates, &entries, Some(&auth)).await.is_err());
+
+        // A different PQ identity already pinned for Alice: an identity change, refused.
+        let other = PqIdentityKeyPair::generate(&mut rand::rng());
+        bob.store
+            .pin_omemo2_pq_identity(bob.account_id, "alice@example.com", &ok.fp_key, &other.public_key().serialize())
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_pq_auth(&bob, &alice_addr, &candidates, &entries, Some(&auth)).await,
+            Err(OmemoError::PqIdentityChanged(_))
+        ));
+
+        // A whisper (non-pre-key) candidate needs no <pq-auth>.
+        assert!(verify_pq_auth(&bob, &alice_addr, &[(wk.data.clone(), false)], &[], None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     /// The key commitment makes the AEAD key-committing: a payload opens only under the one
     /// message key whose commitment matches the single published `<commit>`. A missing, tampered,
     /// or different-key commitment MUST be rejected — this is the invisible-salamander /
@@ -1363,7 +1700,7 @@ mod tests {
         assert!(bob_bundle.kem_prekeys.len() >= 2);
 
         // An attacker substitutes a one-time KEM key that Alice will NOT select
-        // (she picks kem_prekeys[0]); only the transcript v2 manifest — which binds
+        // (she picks kem_prekeys[0]); only the transcript's KEM manifest — which binds
         // the entire published KEM set, not just the selected key — catches this.
         let mut tampered = bob_bundle.clone();
         tampered.kem_prekeys[1].key[0] ^= 0xFF;
@@ -1448,7 +1785,10 @@ mod tests {
             .pin_omemo2_pq_identity(alice.account_id, &bob_addr.jid, &pin_key, &sentinel)
             .await
             .unwrap();
-        assert!(!reconcile_pq_pin(&alice, &bob_addr, &bob_bundle, &known_ik).await.unwrap());
+        assert!(matches!(
+            reconcile_pq_pin(&alice, &bob_addr, &bob_bundle, &known_ik).await,
+            Err(OmemoError::PqIdentityChanged(_))
+        ));
         assert_eq!(
             alice
                 .store

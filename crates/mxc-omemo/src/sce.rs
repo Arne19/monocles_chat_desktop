@@ -48,11 +48,10 @@ impl Envelope {
         }
     }
 
-    /// Serialize to envelope XML with bucket padding (proto-XEP §4.6.3): `<rpad>` is sized
-    /// so the serialized envelope lands exactly on the next [`PAD_BUCKET`]-byte boundary.
-    /// The AES-GCM ciphertext length then reveals only a coarse size class of the content
-    /// instead of its length — a fixed-range random pad (the previous 1–200 bytes) still
-    /// exposed the content length to within the range.
+    /// Serialize to envelope XML with size-class padding (proto-XEP §4.6.3): `<rpad>` is sized
+    /// so the serialized envelope lands exactly on [`padded_envelope_length`]. The AES-GCM
+    /// ciphertext length then reveals only a coarse size class of the content instead of its
+    /// length.
     pub fn to_xml(&self) -> String {
         let mut s = String::new();
         s.push_str(&format!("<envelope xmlns='{NS_SCE}'>"));
@@ -64,11 +63,10 @@ impl Envelope {
         }
         s.push_str(&format!("<from jid='{}'/>", xml_escape(&self.from)));
         s.push_str(&format!("<to jid='{}'/>", xml_escape(&self.to)));
-        // Everything except <rpad> is in place: pad to the next bucket boundary.
-        // The pad alphabet is ASCII (1 char == 1 UTF-8 byte, no XML escaping), so
-        // the final length is byte-exact.
+        // Everything except <rpad> is in place: pad to the size class. The pad alphabet is
+        // ASCII (1 char == 1 UTF-8 byte, no XML escaping), so the final length is byte-exact.
         let unpadded = s.len() + RPAD_ELEMENT_OVERHEAD + "</envelope>".len();
-        let target = (unpadded / PAD_BUCKET + 1) * PAD_BUCKET;
+        let target = padded_envelope_length(unpadded);
         s.push_str(&format!("<rpad>{}</rpad>", random_pad_chars(target - unpadded)));
         s.push_str("</envelope>");
         s
@@ -175,10 +173,28 @@ impl Envelope {
     }
 }
 
-/// Envelope size bucket for length hiding (proto-XEP §4.6.3); must match Android's
-/// `XmppOmemo2Message.PAD_BUCKET` in spirit (receivers ignore rpad, so exact parity
-/// is not required for interop — only for a uniform size-class distribution).
+/// Smallest envelope size class, and the granularity below 4 KiB (proto-XEP §4.6.3). Receivers
+/// ignore `<rpad>`, so parity with Android is not needed for interop — but it is needed for
+/// privacy: differing padding would itself fingerprint the sending client.
 const PAD_BUCKET: usize = 256;
+
+/// The padded size of an envelope that is `unpadded` bytes long including an empty `<rpad>`:
+/// Padmé (Nikitin et al., PETS 2019) of `unpadded + 1`, rounded up to a multiple of
+/// [`PAD_BUCKET`]. Always at least one byte larger, so `<rpad>` is never empty. Byte-identical
+/// to Android's `XmppOmemo2Message.paddedEnvelopeLength`.
+///
+/// Below 4 KiB this is the plain 256-byte bucket, which already hides the length of almost every
+/// chat message. Above it, fixed buckets leak ever more as messages grow, while Padmé keeps the
+/// overhead at most 12% and the leak to O(log log L) bits. Deterministic on purpose: random
+/// padding is averaged away by an observer who sees many messages of a similar length.
+pub(crate) fn padded_envelope_length(unpadded: usize) -> usize {
+    let x = unpadded as u64 + 1;
+    let e = 63 - x.leading_zeros(); // floor(log2 x)
+    let s = 32 - e.leading_zeros(); // floor(log2 e) + 1, 0 for e = 0
+    let mask = (1u64 << (e - s)) - 1;
+    let padme = (x + mask) & !mask;
+    padme.div_ceil(PAD_BUCKET as u64) as usize * PAD_BUCKET
+}
 /// Serialized size of an empty `<rpad></rpad>` element.
 const RPAD_ELEMENT_OVERHEAD: usize = "<rpad></rpad>".len();
 
@@ -392,6 +408,24 @@ mod tests {
                 "envelope with body_len={body_len} not on a {PAD_BUCKET}-byte boundary (len {})",
                 xml.len()
             );
+        }
+        // Large envelopes land exactly on their Padmé size class.
+        for body_len in [5000usize, 70_000] {
+            let env = Envelope::new(&"x".repeat(body_len), "a@b.c", "d@e.f", None, "");
+            let xml = env.to_xml();
+            assert_eq!(xml.len(), padded_envelope_length(xml.len() - 1), "body_len={body_len}");
+        }
+    }
+
+    /// Known answers shared with Android's `paddedEnvelopeLengthKnownAnswers` and the proto-XEP.
+    #[test]
+    fn padded_envelope_length_known_answers() {
+        for (unpadded, padded) in [
+            (0, 256), (1, 256), (255, 256), (256, 512), (1000, 1024), (4095, 4096),
+            (4096, 4352), (4097, 4352), (5000, 5120), (10000, 10240), (65536, 67584),
+            (100000, 100352), (1000000, 1015808),
+        ] {
+            assert_eq!(padded_envelope_length(unpadded), padded, "unpadded {unpadded}");
         }
     }
 }

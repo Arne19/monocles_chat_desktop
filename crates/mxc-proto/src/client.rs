@@ -437,15 +437,19 @@ impl CoreActor {
         // plain `omemo-sid-` parameter: we have no legacy stack, so this is the only key we
         // have and every client — including monocles Android builds from before the
         // `omemo-pq-sid-` parameter existed — can read it. See `crate::uri`.
+        // It also carries our hybrid fingerprint (`omemo-pq-hfp-`), so a scan authenticates the
+        // post-quantum half too.
+        let own_pq = self.store.omemo_own_pq_identity_pub(account_id).await?;
         let verification_uri = match self.store.omemo_own_identity_pub(account_id).await? {
-            Some(ik) if own_device_id != 0 => crate::uri::verification_uri(
-                cfg.bare(),
-                &[crate::uri::UriFingerprint::from_identity_key(
+            Some(ik) if own_device_id != 0 => {
+                let mut fp = crate::uri::UriFingerprint::from_identity_key(
                     crate::uri::FingerprintKind::Omemo,
                     own_device_id,
                     &ik,
-                )],
-            ),
+                );
+                fp.hybrid = own_pq.as_ref().map(|pq| mxc_omemo::hybrid_fingerprint(&ik, pq));
+                crate::uri::verification_uri(cfg.bare(), &[fp])
+            }
             _ => String::new(),
         };
         let mut devices = Vec::new();
@@ -717,13 +721,15 @@ impl CoreActor {
             Command::FetchContactKeys { account_id, jid } => {
                 self.emit_contact_keys(account_id, jid).await
             }
-            Command::VerifyOmemoFingerprints { account_id, jid, fingerprints } => {
+            Command::VerifyOmemoFingerprints { account_id, jid, fingerprints, hybrids } => {
                 // Out-of-band verification (scanned QR / pasted link). Trust is keyed by the
                 // identity-key VALUE, so we simply match every fingerprint from the code
                 // against the keys we hold for this JID; anything else in the code (e.g. the
                 // legacy OMEMO key of a monocles Android device) matches nothing and is
                 // silently ignored rather than treated as an error.
                 let mut verified = 0usize;
+                let mut hybrid_mismatches = 0usize;
+                let mut hybrid_unavailable = 0usize;
                 for id in self.store.list_omemo_identities(account_id, &jid).await? {
                     let hex = crate::uri::UriFingerprint::from_identity_key(
                         crate::uri::FingerprintKind::OmemoPq,
@@ -733,6 +739,28 @@ impl CoreActor {
                     .hex;
                     if !fingerprints.iter().any(|f| f.eq_ignore_ascii_case(&hex)) {
                         continue;
+                    }
+                    // A code carrying the hybrid fingerprint covers the post-quantum identity
+                    // too: verify only once that matches (proto-XEP §10.1).
+                    if let Some((_, hybrid)) =
+                        hybrids.iter().find(|(h, _)| h.eq_ignore_ascii_case(&hex))
+                    {
+                        let device = u32::try_from(id.device_id).unwrap_or(0);
+                        match xeps::omemo::verify_hybrid_fingerprint(
+                            w, &self.store, cfg, &jid, device, &id.identity_key, hybrid,
+                        )
+                        .await?
+                        {
+                            xeps::omemo::HybridCheck::Verified => {}
+                            xeps::omemo::HybridCheck::Mismatch => {
+                                hybrid_mismatches += 1;
+                                continue;
+                            }
+                            xeps::omemo::HybridCheck::Unavailable => {
+                                hybrid_unavailable += 1;
+                                continue;
+                            }
+                        }
                     }
                     verified += 1;
                     // trust = 3 is "manually verified" (shield), the state the call-verify
@@ -748,6 +776,34 @@ impl CoreActor {
                     self.emit_own_keys(cfg, account_id).await?;
                 } else {
                     self.emit_contact_keys(account_id, jid.clone()).await?;
+                }
+                // A failed post-quantum check is reported on its own, ahead of the summary: a
+                // mismatch may be an active attack, and must not read as "keys not fetched yet".
+                if hybrid_mismatches > 0 {
+                    let _ = self
+                        .events
+                        .send(Event::Toast {
+                            text: format!(
+                                "Verification FAILED: the post-quantum identity {jid} publishes \
+                                 does not match the scanned code. Nothing was verified for that \
+                                 device."
+                            ),
+                            important: true,
+                        })
+                        .await;
+                }
+                if hybrid_unavailable > 0 {
+                    let _ = self
+                        .events
+                        .send(Event::Toast {
+                            text: format!(
+                                "Could not verify the post-quantum identity of {jid}: its keys \
+                                 could not be fetched. Nothing was verified — scan the code \
+                                 again later."
+                            ),
+                            important: true,
+                        })
+                        .await;
                 }
                 let text = if verified == 0 {
                     // Either the code is for somebody else, or their devices have not been

@@ -31,6 +31,11 @@ pub enum FingerprintKind {
 
 pub const OMEMO_PARAM: &str = "omemo-sid-";
 pub const OMEMO_PQ_PARAM: &str = "omemo-pq-sid-";
+/// The PQ OMEMO2 hybrid fingerprint of a device (proto-XEP §10.1): SHA3-512 over its classical
+/// AND post-quantum identity keys, 128 lowercase hex. The identity-key parameters carry only the
+/// classical key, so a scan of them alone cannot authenticate the post-quantum half; this one
+/// can, and it is the only out-of-band input allowed to replace a pinned post-quantum identity.
+pub const OMEMO_PQ_HYBRID_PARAM: &str = "omemo-pq-hfp-";
 
 /// One identity key from (or for) a verification URI. `hex` is the bare 64-character lowercase
 /// hex of the 32-byte Curve25519 key — libsignal's `0x05` type prefix stripped, no grouping
@@ -40,6 +45,8 @@ pub struct UriFingerprint {
     pub kind: FingerprintKind,
     pub device_id: i64,
     pub hex: String,
+    /// The device's hybrid fingerprint (`omemo-pq-hfp-`), on the entry carrying its PQ key.
+    pub hybrid: Option<String>,
 }
 
 impl UriFingerprint {
@@ -51,7 +58,7 @@ impl UriFingerprint {
         } else {
             identity_key
         };
-        Self { kind, device_id, hex: hex::encode(key) }
+        Self { kind, device_id, hex: hex::encode(key), hybrid: None }
     }
 }
 
@@ -69,6 +76,14 @@ impl ParsedUri {
     pub fn all_hex(&self) -> Vec<String> {
         self.fingerprints.iter().map(|f| f.hex.clone()).collect()
     }
+
+    /// `(classical hex, hybrid fingerprint)` for every key that came with an `omemo-pq-hfp-`.
+    pub fn hybrids(&self) -> Vec<(String, String)> {
+        self.fingerprints
+            .iter()
+            .filter_map(|f| f.hybrid.as_ref().map(|h| (f.hex.clone(), h.clone())))
+            .collect()
+    }
 }
 
 /// Render `xmpp:<jid>?<params>` for a QR code / shareable link.
@@ -83,6 +98,13 @@ pub fn verification_uri(bare_jid: &str, fingerprints: &[UriFingerprint]) -> Stri
         out.push_str(&fp.device_id.to_string());
         out.push('=');
         out.push_str(&fp.hex);
+        if let Some(hybrid) = &fp.hybrid {
+            out.push(';');
+            out.push_str(OMEMO_PQ_HYBRID_PARAM);
+            out.push_str(&fp.device_id.to_string());
+            out.push('=');
+            out.push_str(hybrid);
+        }
     }
     out
 }
@@ -136,6 +158,7 @@ fn finish(jid_part: &str, query: Option<&str>, separator: char) -> Option<Parsed
     }
     let mut seen: Vec<String> = Vec::new();
     let mut fingerprints = Vec::new();
+    let mut hybrids: Vec<(i64, String)> = Vec::new();
     for pair in query.unwrap_or("").split(separator) {
         let Some((key, value)) = pair.split_once('=') else { continue };
         let key = percent_decode(key).to_ascii_lowercase();
@@ -143,6 +166,19 @@ fn finish(jid_part: &str, query: Option<&str>, separator: char) -> Option<Parsed
             continue; // first occurrence wins
         }
         seen.push(key.clone());
+        if let Some(id) = key.strip_prefix(OMEMO_PQ_HYBRID_PARAM) {
+            let value: String = percent_decode(value).to_ascii_lowercase();
+            if let Ok(id) = id.parse::<i64>() {
+                if id > 0
+                    && value.len() == 128
+                    && value.chars().all(|c| c.is_ascii_hexdigit())
+                    && hybrids.len() < MAX_URI_FINGERPRINTS
+                {
+                    hybrids.push((id, value));
+                }
+            }
+            continue;
+        }
         let (kind, suffix) = if let Some(id) = key.strip_prefix(OMEMO_PQ_PARAM) {
             (FingerprintKind::OmemoPq, id)
         } else if let Some(id) = key.strip_prefix(OMEMO_PARAM) {
@@ -156,9 +192,22 @@ fn finish(jid_part: &str, query: Option<&str>, separator: char) -> Option<Parsed
             continue;
         }
         let Some(hex) = normalize_fingerprint(&percent_decode(value)) else { continue };
-        fingerprints.push(UriFingerprint { kind, device_id, hex });
+        fingerprints.push(UriFingerprint { kind, device_id, hex, hybrid: None });
         if fingerprints.len() >= MAX_URI_FINGERPRINTS {
             break;
+        }
+    }
+    // A hybrid belongs to the device's PQ key: under omemo-pq-sid- when the issuer also runs
+    // legacy OMEMO, else under omemo-sid- (a client like us, with only the PQ stack).
+    for (id, hybrid) in hybrids {
+        let has_pq = fingerprints
+            .iter()
+            .any(|f| f.device_id == id && f.kind == FingerprintKind::OmemoPq);
+        if let Some(f) = fingerprints.iter_mut().find(|f| {
+            f.device_id == id
+                && (f.kind == FingerprintKind::OmemoPq || (!has_pq && f.kind == FingerprintKind::Omemo))
+        }) {
+            f.hybrid = Some(hybrid);
         }
     }
     Some(ParsedUri { jid, fingerprints })
@@ -246,6 +295,7 @@ mod tests {
             kind: FingerprintKind::Omemo,
             device_id: 42,
             hex: PQ.to_string(),
+            hybrid: None,
         };
         let uri = verification_uri("me@example.com", &[fp.clone()]);
         assert_eq!(uri, format!("xmpp:me@example.com?omemo-sid-42={PQ}"));
@@ -263,11 +313,57 @@ mod tests {
         assert_eq!(
             parsed.fingerprints,
             vec![
-                UriFingerprint { kind: FingerprintKind::Omemo, device_id: 7, hex: LEGACY.into() },
-                UriFingerprint { kind: FingerprintKind::OmemoPq, device_id: 7, hex: PQ.into() },
+                UriFingerprint { kind: FingerprintKind::Omemo, device_id: 7, hex: LEGACY.into(), hybrid: None },
+                UriFingerprint { kind: FingerprintKind::OmemoPq, device_id: 7, hex: PQ.into(), hybrid: None },
             ]
         );
         assert_eq!(parsed.all_hex(), vec![LEGACY.to_string(), PQ.to_string()]);
+    }
+
+    fn hfp() -> String {
+        format!("{LEGACY}{PQ}")
+    }
+
+    /// The hybrid belongs to the PQ key of the same device (proto-XEP §10.1), mirroring Android.
+    #[test]
+    fn hybrid_attaches_to_the_pq_key() {
+        let h = hfp();
+        let parsed =
+            parse(&format!("xmpp:a@b.com?omemo-sid-7={LEGACY};omemo-pq-sid-7={PQ};omemo-pq-hfp-7={h}"))
+                .expect("parses");
+        assert_eq!(parsed.fingerprints[0].hybrid, None);
+        assert_eq!(parsed.fingerprints[1].hybrid.as_deref(), Some(h.as_str()));
+        assert_eq!(parsed.hybrids(), vec![(PQ.to_string(), h.clone())]);
+        // Without an omemo-pq-sid- it attaches to omemo-sid- (a PQ-only issuer).
+        let parsed = parse(&format!("xmpp:a@b.com?omemo-sid-7={PQ};omemo-pq-hfp-7={h}")).unwrap();
+        assert_eq!(parsed.fingerprints[0].hybrid.as_deref(), Some(h.as_str()));
+    }
+
+    #[test]
+    fn mismatched_or_malformed_hybrid_is_ignored() {
+        let h = hfp();
+        for uri in [
+            format!("xmpp:a@b.com?omemo-pq-sid-7={PQ};omemo-pq-hfp-8={h}"),
+            format!("xmpp:a@b.com?omemo-pq-sid-7={PQ};omemo-pq-hfp-7={PQ}"),
+            format!("xmpp:a@b.com?omemo-pq-sid-7={PQ};omemo-pq-hfp-7={}", h.replace('a', "z")),
+        ] {
+            assert_eq!(parse(&uri).unwrap().fingerprints[0].hybrid, None, "{uri}");
+        }
+        // Never itself taken for an identity key.
+        assert!(parse(&format!("xmpp:a@b.com?omemo-pq-hfp-7={h}")).unwrap().fingerprints.is_empty());
+    }
+
+    #[test]
+    fn hybrid_round_trips() {
+        let fp = UriFingerprint {
+            kind: FingerprintKind::Omemo,
+            device_id: 9,
+            hex: PQ.to_string(),
+            hybrid: Some(hfp()),
+        };
+        let uri = verification_uri("me@example.com", &[fp.clone()]);
+        assert_eq!(uri, format!("xmpp:me@example.com?omemo-sid-9={PQ};omemo-pq-hfp-9={}", hfp()));
+        assert_eq!(parse(&uri).unwrap().fingerprints, vec![fp]);
     }
 
     #[test]
