@@ -76,8 +76,7 @@ git clone https://codeberg.org/monocles/pq-omemo-2.git deps/libsignal
 # predate the v4 bundle transcript (signed by both identity keys) and the <pq-auth>
 # handshake transcript, and a mismatched pair fails to establish a session rather
 # than degrading — so the symptom looks like a broken build, not a version skew.
-# TODO: replace with the pq-omemo-2 commit that contains "pq-bundle:v4" and pqauth.rs.
-git -C deps/libsignal checkout <pq-omemo-2 commit with transcript v4>
+git -C deps/libsignal checkout 10861bff671740174f4e99f7e30dc492fcf6ec8b  # "PQ auth check and hardening"
 ```
 
 **Dev database (sqlx):** `mxc-store`'s compile-time `query!` macros need a SQLite DB with
