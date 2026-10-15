@@ -103,13 +103,39 @@ pub async fn handle_incoming(
         };
         if let Some((room, nick)) = from.split_once('/').filter(|_| is_our_room) {
             if let Ok(conv) = store.conversation_id(cfg.account_id, room, "muc").await {
+                let item = x.get_child("item", "http://jabber.org/protocol/muc#user");
                 if ptype == "unavailable" {
                     let _ = store.remove_muc_occupant(conv, nick).await;
-                } else if let Some(item) = x.get_child("item", "http://jabber.org/protocol/muc#user") {
+                } else if let Some(item) = item {
                     let real = item.attr("jid").map(|j| j.split('/').next().unwrap_or(j));
                     let aff = item.attr("affiliation");
                     let _ = store.upsert_muc_occupant(conv, nick, real, aff).await;
                 }
+                // Live role/affiliation of every occupant (ourselves included) for the UI: they
+                // gate moderation, kick and ban. A nick change also sends an unavailable
+                // presence (status 303) for the old nick, followed by one for the new nick.
+                let available = ptype != "unavailable";
+                let attr = |name: &str| {
+                    item.and_then(|i| i.attr(name)).filter(|_| available).unwrap_or("none").to_string()
+                };
+                let _ = events
+                    .send(Event::MucOccupant {
+                        account_id: cfg.account_id,
+                        room: room.to_string(),
+                        nick: nick.to_string(),
+                        role: attr("role"),
+                        affiliation: attr("affiliation"),
+                        real_jid: item
+                            .and_then(|i| i.attr("jid"))
+                            .map(|j| j.split('/').next().unwrap_or(j).to_string()),
+                        occupant_id: super::origin::only_child_id(pres, "occupant-id", "urn:xmpp:occupant-id:0"),
+                        is_self,
+                        available,
+                        nick_change: x
+                            .children()
+                            .any(|c| c.name() == "status" && c.attr("code") == Some("303")),
+                    })
+                    .await;
                 if is_self {
                     if let Some(occ) =
                         super::origin::only_child_id(pres, "occupant-id", "urn:xmpp:occupant-id:0")

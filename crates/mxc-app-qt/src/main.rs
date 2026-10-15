@@ -12,6 +12,7 @@ mod feeds;
 mod media;
 mod messages;
 mod model;
+mod muc_admin;
 mod occupants;
 mod qr;
 mod roster;

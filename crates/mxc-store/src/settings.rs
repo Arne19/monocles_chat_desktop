@@ -33,6 +33,29 @@ impl Store {
         Ok(())
     }
 
+    // ---- generic key/value ----
+
+    /// The value stored under `key`, if any.
+    pub async fn setting(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query_as::<_, (String,)>("SELECT value FROM settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// Store `value` under `key` (replacing any previous value).
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     // ---- one-shot flags (e.g. migrations done once per account) ----
 
     /// Whether the flag `key` has been set.

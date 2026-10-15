@@ -14,6 +14,7 @@
 //! - [`carbons`]   XEP-0280 message carbons
 //! - [`mam`]       XEP-0313 message archive management
 //! - [`muc`]       XEP-0045 multi-user chat
+//! - [`moderation`] XEP-0425 message moderation
 //! - [`bookmarks`] XEP-0402 bookmarks2
 //! - [`avatar`]    XEP-0084/0153 user avatars, XEP-0172 nick
 //!
@@ -36,6 +37,7 @@ pub mod jingle_sdp;
 pub mod mam;
 pub mod messaging;
 pub mod microblog;
+pub mod moderation;
 pub mod muc;
 pub mod muji;
 pub mod omemo;

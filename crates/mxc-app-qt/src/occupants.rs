@@ -10,6 +10,8 @@ const ROLE_NICK: i32 = 256;
 const ROLE_JID: i32 = 257;
 const ROLE_PRESENCE: i32 = 258;
 const ROLE_AVATAR: i32 = 259;
+const ROLE_ROLE: i32 = 260;
+const ROLE_AFFILIATION: i32 = 261;
 
 /// One room occupant.
 #[derive(Clone, Default)]
@@ -19,6 +21,9 @@ pub struct OccupantEntry {
     pub jid: String,
     pub presence: String,
     pub avatar_path: String,
+    /// XEP-0045 role (`moderator`/`participant`/`visitor`) and affiliation, "" if unknown.
+    pub role: String,
+    pub affiliation: String,
 }
 
 #[cxx_qt::bridge]
@@ -130,6 +135,8 @@ impl qobject::OccupantModel {
             ROLE_JID => QVariant::from(&QString::from(item.jid.as_str())),
             ROLE_PRESENCE => QVariant::from(&QString::from(item.presence.as_str())),
             ROLE_AVATAR => QVariant::from(&QString::from(item.avatar_path.as_str())),
+            ROLE_ROLE => QVariant::from(&QString::from(item.role.as_str())),
+            ROLE_AFFILIATION => QVariant::from(&QString::from(item.affiliation.as_str())),
             _ => QVariant::default(),
         }
     }
@@ -144,6 +151,8 @@ impl qobject::OccupantModel {
         roles.insert(ROLE_JID, QByteArray::from("jid"));
         roles.insert(ROLE_PRESENCE, QByteArray::from("presence"));
         roles.insert(ROLE_AVATAR, QByteArray::from("avatarPath"));
+        roles.insert(ROLE_ROLE, QByteArray::from("role"));
+        roles.insert(ROLE_AFFILIATION, QByteArray::from("affiliation"));
         roles
     }
 }

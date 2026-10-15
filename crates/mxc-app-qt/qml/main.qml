@@ -45,6 +45,14 @@ ApplicationWindow {
     property string currentPeerPresence: ""
     property bool currentPeerIsMuc: false
     property bool currentRoomOmemoCapable: false
+    // XEP-0425: the open room supports moderation and we're a moderator there. Bumping
+    // mucModerationRev (on mucPrivacyChanged) re-evaluates it after a role/disco change.
+    property int mucModerationRev: 0
+    property bool currentRoomCanModerate: currentPeerIsMuc && mucModerationRev >= 0
+                                          && backend.mucCanModerate(currentPeerJid)
+    // XEP-0045: we're an admin/owner of the open room (member and ban lists).
+    property bool currentRoomCanManageMembers: currentPeerIsMuc && mucModerationRev >= 0
+                                               && backend.mucCanManageMembers(currentPeerJid)
     // Pending reply (XEP-0461): the target message's marker + a preview of its text.
     property string replyToMarker: ""
     property string replyToText: ""
@@ -451,6 +459,7 @@ ApplicationWindow {
             window.detailsFields = rows
         }
         function onMucPrivacyChanged() {
+            window.mucModerationRev++
             if (window.currentPeerIsMuc)
                 window.currentRoomOmemoCapable = backend.mucOmemoCapable(window.currentPeerJid)
         }
@@ -606,6 +615,15 @@ ApplicationWindow {
         window.currentPeerIsMuc = true
         window.currentRoomOmemoCapable = backend.mucOmemoCapable(room)
         msgModel.openPeerKind(room, "muc")
+    }
+
+    // Short XEP-0045 standing label for the occupants list ("" for a plain participant).
+    function occupantStanding(role, affiliation) {
+        if (affiliation === "owner") return qsTr("Owner")
+        if (affiliation === "admin") return qsTr("Admin")
+        if (role === "moderator") return qsTr("Moderator")
+        if (role === "visitor") return qsTr("Visitor")
+        return ""
     }
 
     function openMucPm(occupantJid, nick) {
@@ -2055,6 +2073,12 @@ ApplicationWindow {
                                                     window.openMucPm(model.jid, model.nick)
                                                     occupantsPopup.close()
                                                 }
+                                                // Right-click → private message / kick / ban.
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    acceptedButtons: Qt.RightButton
+                                                    onClicked: occupantMenu.show(model.nick)
+                                                }
                                                 contentItem: RowLayout {
                                                     spacing: 8
                                                     Avatar {
@@ -2070,6 +2094,26 @@ ApplicationWindow {
                                                         elide: Text.ElideRight
                                                         Layout.fillWidth: true
                                                     }
+                                                    // XEP-0045 standing: owner/admin, else a moderator role.
+                                                    Label {
+                                                        textFormat: Text.PlainText
+                                                        text: window.occupantStanding(model.role, model.affiliation)
+                                                        visible: text.length > 0
+                                                        opacity: 0.6
+                                                        font.pixelSize: 11
+                                                    }
+                                                }
+                                            }
+                                            // Admins/owners: offline members and bans.
+                                            footer: ItemDelegate {
+                                                width: ListView.view.width
+                                                visible: window.currentPeerIsMuc
+                                                         && window.currentRoomCanManageMembers
+                                                height: visible ? implicitHeight : 0
+                                                text: qsTr("Members and bans…")
+                                                onClicked: {
+                                                    occupantsPopup.close()
+                                                    memberListsDialog.show(window.currentPeerJid)
                                                 }
                                             }
                                             Label {
@@ -2399,18 +2443,7 @@ ApplicationWindow {
                                     MouseArea {
                                         anchors.fill: parent
                                         acceptedButtons: Qt.RightButton
-                                        onClicked: senderMenu.popup()
-                                    }
-                                    Menu {
-                                        id: senderMenu
-                                        MenuItem {
-                                            text: qsTr("Send private message")
-                                            onTriggered: {
-                                                var occupantJid = window.currentPeerJid + "/" + model.sender
-                                                backend.startPrivate(occupantJid)
-                                                window.openMucPm(occupantJid, model.sender)
-                                            }
-                                        }
+                                        onClicked: occupantMenu.show(model.sender)
                                     }
                                 }
 
@@ -2457,6 +2490,14 @@ ApplicationWindow {
                                                      && model.marker.length > 0
                                             height: visible ? implicitHeight : 0
                                             onTriggered: retractDialog.ask(model.marker)
+                                        }
+                                        // Room moderators can remove anyone's message (XEP-0425).
+                                        MenuItem {
+                                            text: qsTr("Moderate…")
+                                            visible: window.currentRoomCanModerate && !model.retracted
+                                                     && model.stanzaId.length > 0
+                                            height: visible ? implicitHeight : 0
+                                            onTriggered: moderateDialog.ask(model.stanzaId)
                                         }
                                     }
 
@@ -4710,6 +4751,429 @@ ApplicationWindow {
         contentItem: Label {
             text: qsTr("This asks everyone in the chat to delete it too, and can't be undone.")
             wrapMode: Text.Wrap
+        }
+    }
+
+    // Room occupant actions (sender avatar / occupants list right-click). Kick and ban are
+    // offered only when XEP-0045 allows them for us (backend.mucCanKick / mucCanBan); the room
+    // enforces the same rules.
+    Menu {
+        id: occupantMenu
+        property string nick: ""
+        property bool canKick: false
+        property bool canBan: false
+        property var permissionChoices: []
+        function show(n) {
+            nick = n
+            canKick = backend.mucCanKick(window.currentPeerJid, n)
+            canBan = backend.mucCanBan(window.currentPeerJid, n)
+            permissionChoices = JSON.parse(backend.mucAffiliationChoices(window.currentPeerJid, n))
+            popup()
+        }
+        MenuItem {
+            text: qsTr("Send private message")
+            onTriggered: {
+                var occupantJid = window.currentPeerJid + "/" + occupantMenu.nick
+                backend.startPrivate(occupantJid)
+                window.openMucPm(occupantJid, occupantMenu.nick)
+                occupantsPopup.close()
+            }
+        }
+        MenuItem {
+            text: qsTr("Kick…")
+            visible: occupantMenu.canKick
+            height: visible ? implicitHeight : 0
+            onTriggered: occupantAdminDialog.ask("kick", occupantMenu.nick)
+        }
+        MenuItem {
+            text: qsTr("Ban…")
+            visible: occupantMenu.canBan
+            height: visible ? implicitHeight : 0
+            onTriggered: occupantAdminDialog.ask("ban", occupantMenu.nick)
+        }
+        MenuItem {
+            text: qsTr("Manage permissions…")
+            visible: occupantMenu.permissionChoices.length > 0
+            height: visible ? implicitHeight : 0
+            onTriggered: permissionsDialog.ask(occupantMenu.nick, occupantMenu.permissionChoices)
+        }
+    }
+
+    // XEP-0045 member and ban lists (admins/owners): members not currently in the room, with
+    // their permissions and ban; banned users, with unban. Refetched on open; our changes
+    // update it via mucAffiliationsChanged.
+    Dialog {
+        id: memberListsDialog
+        property string room: ""
+        property var offline: []
+        property var banned: []
+        property bool loading: false
+        property string error: ""
+        function show(r) {
+            room = r
+            reload()
+            error = ""
+            loading = backend.fetchMucAffiliations(r)
+            if (!loading)
+                error = qsTr("Not connected")
+            open()
+        }
+        // Shown in an empty section: still loading, the fetch failed, or really none.
+        function emptyText() {
+            if (loading) return qsTr("Loading…")
+            if (error.length > 0) return qsTr("Couldn't load the lists: %1").arg(error)
+            return qsTr("None")
+        }
+        function reload() {
+            var lists = JSON.parse(backend.mucMemberListsJson(room))
+            offline = lists.offline
+            banned = lists.banned
+        }
+        Connections {
+            target: backend
+            function onMucAffiliationsChanged(r) {
+                if (r.toLowerCase() === memberListsDialog.room.toLowerCase()) {
+                    memberListsDialog.loading = false
+                    memberListsDialog.error = ""
+                    memberListsDialog.reload()
+                }
+            }
+            function onMucAffiliationsFailed(r, error) {
+                if (r.toLowerCase() === memberListsDialog.room.toLowerCase()) {
+                    memberListsDialog.loading = false
+                    memberListsDialog.error = error
+                }
+            }
+        }
+        title: qsTr("Members and bans")
+        anchors.centerIn: parent
+        modal: true
+        width: 400
+        height: Math.min(window.height - 80, 520)
+        standardButtons: Dialog.Close
+        contentItem: ScrollView {
+            clip: true
+            ColumnLayout {
+                width: memberListsDialog.availableWidth
+                spacing: 2
+                Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("Offline members")
+                    font.bold: true
+                    Layout.topMargin: 4
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    visible: memberListsDialog.offline.length === 0
+                    text: memberListsDialog.emptyText()
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    opacity: 0.6
+                }
+                Repeater {
+                    model: memberListsDialog.offline
+                    ItemDelegate {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        onClicked: memberJidMenu.show(modelData.jid)
+                        contentItem: RowLayout {
+                            spacing: 8
+                            Label {
+                                textFormat: Text.PlainText
+                                text: modelData.jid
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
+                            }
+                            Label {
+                                textFormat: Text.PlainText
+                                text: window.occupantStanding("", modelData.affiliation)
+                                visible: text.length > 0
+                                opacity: 0.6
+                                font.pixelSize: 11
+                            }
+                        }
+                    }
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("Banned")
+                    font.bold: true
+                    Layout.topMargin: 12
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    visible: memberListsDialog.banned.length === 0
+                    text: memberListsDialog.emptyText()
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                    opacity: 0.6
+                }
+                Repeater {
+                    model: memberListsDialog.banned
+                    RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Label {
+                            textFormat: Text.PlainText
+                            text: modelData.jid
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                        }
+                        Button {
+                            text: qsTr("Unban")
+                            flat: true
+                            visible: JSON.parse(backend.mucJidChoices(memberListsDialog.room, modelData.jid))
+                                         .some(function(c) { return c.action === "unban" })
+                            onClicked: backend.setJidAffiliation(memberListsDialog.room, modelData.jid, "none", "")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Actions for a listed (offline) member: permissions and ban, as allowed.
+    Menu {
+        id: memberJidMenu
+        property string jid: ""
+        property var rights: []
+        property bool canBan: false
+        function show(j) {
+            jid = j
+            var choices = JSON.parse(backend.mucJidChoices(memberListsDialog.room, j))
+            rights = choices.filter(function(c) { return c.action !== "ban" })
+            canBan = choices.some(function(c) { return c.action === "ban" })
+            if (rights.length > 0 || canBan)
+                popup()
+        }
+        MenuItem {
+            text: qsTr("Manage permissions…")
+            visible: memberJidMenu.rights.length > 0
+            height: visible ? implicitHeight : 0
+            onTriggered: permissionsDialog.askJid(memberJidMenu.jid, memberJidMenu.rights)
+        }
+        MenuItem {
+            text: qsTr("Ban…")
+            visible: memberJidMenu.canBan
+            height: visible ? implicitHeight : 0
+            onTriggered: occupantAdminDialog.askBanJid(memberJidMenu.jid)
+        }
+    }
+
+    // XEP-0045 membership / admin / owner rights (Android's "Manage permissions"): pick one
+    // change from those we're allowed to make (backend.mucAffiliationChoices).
+    Dialog {
+        id: permissionsDialog
+        // A present occupant (`nick`) or, from the member list, a JID (`jid`).
+        property string nick: ""
+        property string jid: ""
+        property var choices: []
+        property int selected: -1
+        function ask(n, c) {
+            nick = n
+            jid = ""
+            choices = c
+            selected = -1
+            open()
+        }
+        function askJid(j, c) {
+            nick = j
+            jid = j
+            choices = c
+            selected = -1
+            open()
+        }
+        function label(action) {
+            switch (action) {
+            case "grant_membership": return qsTr("Grant membership")
+            case "remove_membership": return qsTr("Remove membership")
+            case "grant_admin": return qsTr("Grant admin privileges")
+            case "remove_admin": return qsTr("Remove admin privileges")
+            case "grant_owner": return qsTr("Grant owner privileges")
+            case "remove_owner": return qsTr("Remove owner privileges")
+            }
+            return action
+        }
+        title: qsTr("Permissions of %1").arg(nick)
+        anchors.centerIn: parent
+        modal: true
+        width: 360
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        onAccepted: {
+            if (selected < 0 || selected >= choices.length)
+                return
+            if (jid.length > 0)
+                backend.setJidAffiliation(window.currentPeerJid, jid, choices[selected].affiliation, "")
+            else
+                backend.setOccupantAffiliation(window.currentPeerJid, nick, choices[selected].affiliation)
+        }
+        contentItem: ColumnLayout {
+            spacing: 2
+            Repeater {
+                model: permissionsDialog.choices
+                RadioButton {
+                    required property var modelData
+                    required property int index
+                    text: permissionsDialog.label(modelData.action)
+                    checked: permissionsDialog.selected === index
+                    onClicked: permissionsDialog.selected = index
+                }
+            }
+        }
+        Component.onCompleted: standardButton(Dialog.Ok).enabled = Qt.binding(function() { return permissionsDialog.selected >= 0 })
+    }
+
+    // Confirm a kick or ban, with an optional reason. After a ban, moderators are offered to
+    // remove the banned occupant's recent messages too (as on Android).
+    Dialog {
+        id: occupantAdminDialog
+        property string action: ""
+        property string nick: ""
+        // Set when banning a listed (possibly offline) JID rather than a present occupant.
+        property string jid: ""
+        function ask(a, n) {
+            action = a
+            nick = n
+            jid = ""
+            occupantReasonField.text = ""
+            open()
+            occupantReasonField.forceActiveFocus()
+        }
+        function askBanJid(j) {
+            action = "ban"
+            nick = j
+            jid = j
+            occupantReasonField.text = ""
+            open()
+            occupantReasonField.forceActiveFocus()
+        }
+        title: action === "ban" ? qsTr("Ban %1?").arg(nick) : qsTr("Kick %1?").arg(nick)
+        anchors.centerIn: parent
+        modal: true
+        width: 360
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        onAccepted: {
+            var room = window.currentPeerJid
+            var reason = occupantReasonField.text.trim()
+            if (action === "kick") {
+                backend.kickOccupant(room, nick, reason)
+            } else if (action === "ban" && jid.length > 0) {
+                backend.setJidAffiliation(room, jid, "outcast", reason)
+            } else if (action === "ban") {
+                // Read the occupant-id before the ban removes them from the room. Offer the
+                // message clean-up only once the room confirms the ban (mucAffiliationChanged).
+                var occId = backend.mucOccupantId(room, nick)
+                var bannedJid = backend.banOccupant(room, nick, reason)
+                moderateRecentDialog.pending = (bannedJid.length > 0 && backend.mucCanModerate(room))
+                        ? { room: room, jid: bannedJid.toLowerCase(), nick: nick, occupantId: occId }
+                        : null
+            }
+        }
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: occupantAdminDialog.action === "ban"
+                      ? qsTr("They are removed from the room and can't join again until unbanned.")
+                      : qsTr("They are removed from the room but can join again.")
+            }
+            TextField {
+                id: occupantReasonField
+                placeholderText: qsTr("Reason (optional)")
+                Layout.fillWidth: true
+                onAccepted: occupantAdminDialog.accept()
+            }
+        }
+    }
+
+    Dialog {
+        id: moderateRecentDialog
+        property string room: ""
+        property string nick: ""
+        property string occupantId: ""
+        // A ban we sent and await the room's confirmation of: {room, jid, nick, occupantId}.
+        property var pending: null
+        Connections {
+            target: backend
+            function onMucAffiliationChanged(room, jid, affiliation) {
+                var p = moderateRecentDialog.pending
+                if (p && affiliation === "outcast" && room.toLowerCase() === p.room.toLowerCase()
+                        && jid.toLowerCase() === p.jid) {
+                    moderateRecentDialog.pending = null
+                    moderateRecentDialog.ask(p.room, p.nick, p.occupantId)
+                }
+            }
+        }
+        function ask(r, n, occ) {
+            room = r
+            nick = n
+            occupantId = occ
+            moderateRecentReasonField.text = qsTr("Spam")
+            open()
+            moderateRecentReasonField.selectAll()
+            moderateRecentReasonField.forceActiveFocus()
+        }
+        title: qsTr("Moderate messages?")
+        anchors.centerIn: parent
+        modal: true
+        width: 360
+        standardButtons: Dialog.No | Dialog.Yes
+        onAccepted: backend.moderateRecent(room, nick, occupantId, moderateRecentReasonField.text.trim())
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                text: qsTr("Also remove the recent messages %1 sent in this room, for everyone?").arg(moderateRecentDialog.nick)
+            }
+            TextField {
+                id: moderateRecentReasonField
+                placeholderText: qsTr("Reason (optional)")
+                Layout.fillWidth: true
+                onAccepted: moderateRecentDialog.accept()
+            }
+        }
+    }
+
+    // XEP-0425: ask the room to remove a message for everyone, with an optional reason.
+    Dialog {
+        id: moderateDialog
+        property string targetStanzaId: ""
+        function ask(stanzaId) {
+            targetStanzaId = stanzaId
+            moderateReasonField.text = qsTr("Spam")
+            open()
+            moderateReasonField.selectAll()
+            moderateReasonField.forceActiveFocus()
+        }
+        title: qsTr("Moderate message?")
+        anchors.centerIn: parent
+        modal: true
+        width: 360
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        onAccepted: {
+            if (targetStanzaId.length > 0)
+                msgModel.moderate(window.currentPeerJid, targetStanzaId, moderateReasonField.text.trim())
+            targetStanzaId = ""
+        }
+        contentItem: ColumnLayout {
+            spacing: 8
+            Label {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: qsTr("The room removes this message for everyone. This can't be undone.")
+                wrapMode: Text.Wrap
+            }
+            TextField {
+                id: moderateReasonField
+                placeholderText: qsTr("Reason (optional)")
+                Layout.fillWidth: true
+                onAccepted: moderateDialog.accept()
+            }
         }
     }
 

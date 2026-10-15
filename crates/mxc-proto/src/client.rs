@@ -332,6 +332,9 @@ impl CoreActor {
                                 Msg { to: String, body: String },
                                 File { name: String },
                                 Publish { what: &'static str },
+                                /// A room admin action the user asked for: the error already
+                                /// says what failed, so it's shown as is.
+                                RoomAdmin,
                                 Other,
                             }
                             let fail_ctx = match &cmd {
@@ -359,6 +362,11 @@ impl CoreActor {
                                 },
                                 Command::PublishStory { .. } => FailCtx::Publish { what: "story" },
                                 Command::PublishPost { .. } => FailCtx::Publish { what: "post" },
+                                Command::Moderate { .. }
+                                | Command::ModerateRecent { .. }
+                                | Command::MucKick { .. }
+                                | Command::MucSetAffiliation { .. }
+                                | Command::MucFetchAffiliations { .. } => FailCtx::RoomAdmin,
                                 _ => FailCtx::Other,
                             };
                             let is_online = online.get();
@@ -384,6 +392,12 @@ impl CoreActor {
                                                 account_id: cfg.account_id,
                                                 what: what.to_string(),
                                                 error: Some(format!("{e:#}")),
+                                            }).await;
+                                        }
+                                        FailCtx::RoomAdmin => {
+                                            let _ = actor.events.send(Event::Toast {
+                                                text: e.to_string(),
+                                                important: true,
                                             }).await;
                                         }
                                         FailCtx::Other => {
@@ -529,6 +543,27 @@ impl CoreActor {
                     w, &self.store, cfg, &self.events, &to, &target_id, conversation_id,
                 )
                 .await
+            }
+            Command::Moderate { room, stanza_id, reason, .. } => {
+                xeps::moderation::moderate(w, cfg.account_id, &room, &stanza_id, reason.as_deref()).await
+            }
+            Command::ModerateRecent { room, nick, occupant_id, reason, .. } => {
+                xeps::moderation::moderate_recent(
+                    w, &self.store, cfg.account_id, &room, &nick, occupant_id.as_deref(), reason.as_deref(),
+                )
+                .await
+            }
+            Command::MucKick { room, nick, reason, .. } => {
+                xeps::muc::kick(w, &room, &nick, reason.as_deref()).await
+            }
+            Command::MucSetAffiliation { room, jid, affiliation, reason, .. } => {
+                xeps::muc::set_affiliation(
+                    w, &self.store, cfg, &self.events, &room, &jid, &affiliation, reason.as_deref(),
+                )
+                .await
+            }
+            Command::MucFetchAffiliations { room, .. } => {
+                xeps::muc::fetch_affiliations(w, cfg, &self.events, &room).await
             }
             Command::LoadHistory { conversation_id, before, .. } => {
                 xeps::mam::load_page(w, &self.store, cfg, &self.events, conversation_id, before).await

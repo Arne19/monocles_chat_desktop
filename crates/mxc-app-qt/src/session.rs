@@ -543,57 +543,116 @@ fn comments_key(service: &str, node: &str) -> (String, String) {
     (service.to_lowercase(), node.to_string())
 }
 
-/// Bare JIDs whose feeds we follow (persisted to a text file in the data dir).
-static FOLLOWED: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(load_followed()));
+/// Bare JIDs whose feeds we follow. Persisted per account in the encrypted store (the
+/// `settings` table); loaded by [`load_local_state`] at login.
+static FOLLOWED: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Per-section "seen up to here" cursors for the nav-rail badges (calls/stories/feeds),
-/// persisted as a small key=value file in the data dir so the counts survive restarts.
-fn seen_marks_file() -> PathBuf {
-    let dir = directories::ProjectDirs::from("de", "monocles", "monocles-chat")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("seen_marks.txt")
+/// Per-section "seen up to here" cursors for the nav-rail badges (calls/stories/feeds), so
+/// the counts survive restarts. Persisted per account in the encrypted store like [`FOLLOWED`].
+static SEEN_MARKS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The sections that have a seen cursor.
+const SEEN_MARK_KEYS: [&str; 3] = ["calls", "stories", "feeds"];
+
+/// Serializes the store writes of [`FOLLOWED`] / [`SEEN_MARKS`]: each write snapshots the
+/// in-memory value under this lock, so an older snapshot can't land after a newer one.
+static LOCAL_STATE_WRITE: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+fn followed_key(account_id: i64) -> String {
+    format!("followed_feeds:{account_id}")
+}
+
+fn seen_mark_key(account_id: i64, key: &str) -> String {
+    format!("seen_mark:{account_id}:{key}")
 }
 
 pub(crate) fn seen_mark(key: &str) -> String {
-    let prefix = format!("{key}=");
-    std::fs::read_to_string(seen_marks_file())
-        .unwrap_or_default()
-        .lines()
-        .find_map(|l| l.strip_prefix(&prefix).map(String::from))
-        .unwrap_or_default()
+    SEEN_MARKS.lock().unwrap().get(key).cloned().unwrap_or_default()
 }
 
 pub(crate) fn set_seen_mark(key: &str, value: &str) {
-    let prefix = format!("{key}=");
-    let path = seen_marks_file();
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.starts_with(&prefix))
-        .map(String::from)
-        .collect();
-    lines.push(format!("{prefix}{value}"));
-    let _ = std::fs::write(&path, lines.join("\n"));
+    SEEN_MARKS.lock().unwrap().insert(key.to_string(), value.to_string());
+    let Some(account_id) = CLIENT.lock().unwrap().as_ref().map(|c| c.account_id) else { return };
+    let key = key.to_string();
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let _guard = LOCAL_STATE_WRITE.lock().await;
+        let value = seen_mark(&key);
+        let _ = store.set_setting(&seen_mark_key(account_id, &key), &value).await;
+    });
 }
 
-fn followed_file() -> PathBuf {
-    let dir = directories::ProjectDirs::from("de", "monocles", "monocles-chat")
+fn save_followed() {
+    let Some(account_id) = CLIENT.lock().unwrap().as_ref().map(|c| c.account_id) else { return };
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let _guard = LOCAL_STATE_WRITE.lock().await;
+        let joined = FOLLOWED.lock().unwrap().join("\n");
+        let _ = store.set_setting(&followed_key(account_id), &joined).await;
+    });
+}
+
+/// Where older builds kept these lists, unencrypted, in the data dir.
+fn legacy_state_file(name: &str) -> PathBuf {
+    directories::ProjectDirs::from("de", "monocles", "monocles-chat")
         .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join("followed_feeds.txt")
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(name)
 }
 
-fn load_followed() -> Vec<String> {
-    std::fs::read_to_string(followed_file())
+/// Move the plaintext `followed_feeds.txt` / `seen_marks.txt` of older builds into the store
+/// (for `account_id`, unless it already has values there), then delete the files.
+async fn migrate_legacy_state(store: &Store, account_id: i64) {
+    let followed_path = legacy_state_file("followed_feeds.txt");
+    if let Ok(text) = std::fs::read_to_string(&followed_path) {
+        let key = followed_key(account_id);
+        let list: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        if matches!(store.setting(&key).await, Ok(None))
+            && store.set_setting(&key, &list.join("\n")).await.is_err()
+        {
+            return; // keep the file for the next attempt
+        }
+        let _ = std::fs::remove_file(&followed_path);
+    }
+    let seen_path = legacy_state_file("seen_marks.txt");
+    if let Ok(text) = std::fs::read_to_string(&seen_path) {
+        for line in text.lines() {
+            let Some((name, value)) = line.split_once('=') else { continue };
+            if !SEEN_MARK_KEYS.contains(&name) {
+                continue;
+            }
+            let key = seen_mark_key(account_id, name);
+            if matches!(store.setting(&key).await, Ok(None))
+                && store.set_setting(&key, value).await.is_err()
+            {
+                return;
+            }
+        }
+        let _ = std::fs::remove_file(&seen_path);
+    }
+}
+
+/// Load `account_id`'s followed feeds + seen cursors from the store (at login, before
+/// anything reads them).
+async fn load_local_state(store: &Store, account_id: i64) {
+    migrate_legacy_state(store, account_id).await;
+    let followed: Vec<String> = store
+        .setting(&followed_key(account_id))
+        .await
+        .ok()
+        .flatten()
         .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect())
-        .unwrap_or_default()
-}
-
-fn save_followed(list: &[String]) {
-    let _ = std::fs::write(followed_file(), list.join("\n"));
+        .unwrap_or_default();
+    let mut marks = HashMap::new();
+    for name in SEEN_MARK_KEYS {
+        if let Ok(Some(value)) = store.setting(&seen_mark_key(account_id, name)).await {
+            marks.insert(name.to_string(), value);
+        }
+    }
+    *FOLLOWED.lock().unwrap() = followed;
+    *SEEN_MARKS.lock().unwrap() = marks;
 }
 
 /// A "like" is a comment whose body is exactly this heart (matches monocles Android).
@@ -849,8 +908,8 @@ pub fn follow_feed(jid: String) {
             return;
         }
         list.push(jid.clone());
-        save_followed(&list);
     }
+    save_followed();
     if let Some(ctx) = CLIENT.lock().unwrap().as_ref() {
         let _ = ctx.commands.try_send(Command::FetchFeed { account_id: ctx.account_id, jid });
     }
@@ -862,8 +921,8 @@ pub fn unfollow_feed(jid: String) {
     {
         let mut list = FOLLOWED.lock().unwrap();
         list.retain(|j| !j.eq_ignore_ascii_case(&jid));
-        save_followed(&list);
     }
+    save_followed();
     FEED_POSTS.lock().unwrap().remove(&jid.to_lowercase());
     // Drop the cached posts too (posts the contact pushes later still arrive).
     if let Some(account_id) = CLIENT.lock().unwrap().as_ref().map(|c| c.account_id) {
@@ -1416,6 +1475,7 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
         Err(e) => return backend_update(&qt, &format!("Account error: {e}"), false),
     };
     let _ = store.set_account_enabled(account_id, true).await;
+    load_local_state(store, account_id).await;
 
     // Seal the password for next-launch auto-login (idempotent; references used before move).
     if mxc_store::secrets::store(mxc_store::secrets::kinds::PASSWORD, &jid, password.as_bytes())
@@ -1683,11 +1743,55 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
                     });
                 }
                 // Room OMEMO capability discovered (join/disco) → re-gate the lock toggle.
-                Event::MucPrivacy { room, omemo_capable, .. } => {
+                Event::MucPrivacy { room, omemo_capable, moderation, .. } => {
+                    crate::muc_admin::set_moderation(&room, moderation);
                     MUC_OMEMO.lock().unwrap().insert(room, omemo_capable);
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                         backend.as_mut().muc_privacy_changed();
                     });
+                }
+                // A room's member/ban lists arrived (or couldn't be read), or the room accepted
+                // one of our changes.
+                Event::MucAffiliations { room, items, .. } => {
+                    crate::muc_admin::set_affiliations(&room, items);
+                    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                        backend.as_mut().muc_affiliations_changed(QString::from(&room));
+                    });
+                }
+                Event::MucAffiliationsFailed { room, error, .. } => {
+                    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                        backend.as_mut().muc_affiliations_failed(QString::from(&room), QString::from(&error));
+                    });
+                }
+                Event::MucAffiliationChanged { room, jid, affiliation, .. } => {
+                    crate::muc_admin::affiliation_changed(&room, &jid, &affiliation);
+                    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                        backend.as_mut().muc_affiliations_changed(QString::from(&room));
+                        backend.as_mut().muc_affiliation_changed(
+                            QString::from(&room),
+                            QString::from(&jid),
+                            QString::from(&affiliation),
+                        );
+                    });
+                }
+                // (Re)joining a room: its occupants are re-announced from scratch.
+                Event::MucJoining { room, .. } => {
+                    crate::muc_admin::reset_room(&room);
+                    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                        backend.as_mut().muc_privacy_changed();
+                    });
+                }
+                // An occupant's role/affiliation. Only a change of our own re-gates the open
+                // chat's moderation actions; kick/ban are looked up when a menu opens.
+                Event::MucOccupant {
+                    room, nick, role, affiliation, real_jid, occupant_id, is_self, available, nick_change, ..
+                } => {
+                    let occupant = crate::muc_admin::Occupant { role, affiliation, real_jid, occupant_id };
+                    if crate::muc_admin::update(&room, &nick, occupant, is_self, available, nick_change) {
+                        let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                            backend.as_mut().muc_privacy_changed();
+                        });
+                    }
                 }
                 // MUC occupant avatar — cache keyed by the occupant JID (room/nick).
                 Event::MucAvatar { room, nick, data, .. } => {
@@ -2231,6 +2335,67 @@ pub fn retract_message(conversation_id: i64, to: String, target_id: String) {
     });
 }
 
+/// XEP-0425: ask `room` to retract the message with room stanza-id `stanza_id` (we must be a
+/// moderator). The room's broadcast tombstones it; failures surface as a toast.
+pub fn moderate_message(room: String, stanza_id: String, reason: Option<String>) {
+    let guard = CLIENT.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else { return };
+    let _ = ctx.commands.try_send(Command::Moderate { account_id: ctx.account_id, room, stanza_id, reason });
+}
+
+/// XEP-0045 kick: remove occupant `nick` from `room` (role `none`).
+pub fn kick_occupant(room: String, nick: String, reason: Option<String>) {
+    let guard = CLIENT.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else { return };
+    let _ = ctx.commands.try_send(Command::MucKick { account_id: ctx.account_id, room, nick, reason });
+}
+
+/// XEP-0045: fetch `room`'s member and ban lists (→ `mucAffiliationsChanged`, or
+/// `mucAffiliationsFailed`). False when there's no session to ask.
+pub fn fetch_muc_affiliations(room: String) -> bool {
+    let guard = CLIENT.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else { return false };
+    ctx.commands.try_send(Command::MucFetchAffiliations { account_id: ctx.account_id, room }).is_ok()
+}
+
+/// XEP-0045: set the bare `jid`'s affiliation in `room` (a listed, possibly offline, user).
+pub fn set_jid_affiliation(room: String, jid: String, affiliation: String, reason: Option<String>) {
+    let guard = CLIENT.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else { return };
+    let _ = ctx
+        .commands
+        .try_send(Command::MucSetAffiliation { account_id: ctx.account_id, room, jid, affiliation, reason });
+}
+
+/// XEP-0045: set present occupant `nick`'s affiliation in `room` (`outcast` bans). Returns
+/// the real bare JID the request was sent for — the room confirms it with
+/// `mucAffiliationChanged` — or `None` when their JID isn't known (affiliations are by JID)
+/// or there's no session.
+pub fn set_occupant_affiliation(
+    room: String,
+    nick: String,
+    affiliation: String,
+    reason: Option<String>,
+) -> Option<String> {
+    let jid = crate::muc_admin::occupant(&room, &nick).and_then(|o| o.real_jid)?;
+    let guard = CLIENT.lock().unwrap();
+    let ctx = guard.as_ref()?;
+    ctx.commands
+        .try_send(Command::MucSetAffiliation { account_id: ctx.account_id, room, jid: jid.clone(), affiliation, reason })
+        .ok()?;
+    Some(jid)
+}
+
+/// XEP-0425 after a ban: moderate occupant `nick`'s recent messages in `room`. Their
+/// occupant-id must be captured *before* the ban removes them from the presence map, so the
+/// caller passes the one it read (or "" when unknown).
+pub fn moderate_recent(room: String, nick: String, occupant_id: String, reason: Option<String>) {
+    let guard = CLIENT.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else { return };
+    let occupant_id = Some(occupant_id).filter(|o| !o.is_empty());
+    let _ = ctx.commands.try_send(Command::ModerateRecent { account_id: ctx.account_id, room, nick, occupant_id, reason });
+}
+
 /// XEP-0308: replace one of our own messages' body.
 pub fn correct_message(conversation_id: i64, to: String, target_id: String, new_body: String) {
     let guard = CLIENT.lock().unwrap();
@@ -2707,11 +2872,14 @@ pub fn occupants(room: &str) -> Vec<OccupantEntry> {
             .filter_map(|(full, status)| {
                 let (bare, nick) = full.rsplit_once('/')?;
                 if bare == room && !nick.is_empty() {
+                    let (role, affiliation) = crate::muc_admin::describe(room, nick);
                     Some(OccupantEntry {
                         nick: nick.to_string(),
                         jid: full.clone(),
                         presence: status.clone(),
                         avatar_path: avatar_path_for(full),
+                        role,
+                        affiliation,
                     })
                 } else {
                     None

@@ -37,6 +37,10 @@ pub struct MessageRow {
     pub timestamp: String,
     /// XEP-7397 thread id — set for WebXDC `.xdc` app messages (the instance key).
     pub thread: Option<String>,
+    /// XEP-0425: the tombstone was made by a room moderator, not the sender.
+    pub moderated: bool,
+    /// XEP-0425: the moderator's reason, if one was given.
+    pub moderation_reason: Option<String>,
 }
 
 /// One full-text search hit: a message joined with its conversation, for the chats-list
@@ -209,7 +213,7 @@ impl Store {
         let mut rows = sqlx::query_as::<_, MessageRow>(
             r#"SELECT id, conversation_id, stanza_id, origin_id, counterpart, direction,
                       body, encryption, state, edited_of, retracted, attachment, reply_to,
-                      omemo_fingerprint, timestamp, thread
+                      omemo_fingerprint, timestamp, thread, moderated, moderation_reason
                FROM messages WHERE conversation_id = ?1
                ORDER BY timestamp DESC, id DESC LIMIT ?2"#,
         )
@@ -397,7 +401,7 @@ impl Store {
         let row = sqlx::query_as::<_, MessageRow>(
             r#"SELECT id, conversation_id, stanza_id, origin_id, counterpart, direction,
                       body, encryption, state, edited_of, retracted, attachment, reply_to,
-                      omemo_fingerprint, timestamp, thread
+                      omemo_fingerprint, timestamp, thread, moderated, moderation_reason
                FROM messages
                WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2)
                ORDER BY id DESC LIMIT 1"#,
@@ -518,6 +522,55 @@ impl Store {
         Ok(id)
     }
 
+    /// Remember a XEP-0425 moderation of room stanza-id `stanza_id` whose message we don't have
+    /// (yet), so it is dropped if it arrives later.
+    pub async fn add_pending_moderation(&self, conversation_id: i64, stanza_id: &str) -> Result<()> {
+        sqlx::query("INSERT OR IGNORE INTO pending_moderations (conversation_id, stanza_id) VALUES (?1, ?2)")
+            .bind(conversation_id)
+            .bind(stanza_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Whether room stanza-id `stanza_id` was moderated before its message arrived; consumes
+    /// the record.
+    pub async fn take_pending_moderation(&self, conversation_id: i64, stanza_id: &str) -> Result<bool> {
+        let done = sqlx::query("DELETE FROM pending_moderations WHERE conversation_id = ?1 AND stanza_id = ?2")
+            .bind(conversation_id)
+            .bind(stanza_id)
+            .execute(self.pool())
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Room stanza-ids of the newest (at most `limit`) not yet retracted messages one occupant
+    /// sent in `conversation_id` — the targets of "moderate recent messages" after a ban. The
+    /// sender is matched by XEP-0421 occupant-id when known (stable across nick changes), else
+    /// by their occupant JID (`room@host/nick`).
+    pub async fn recent_room_stanza_ids_from(
+        &self,
+        conversation_id: i64,
+        occupant_id: Option<&str>,
+        occupant_jid: &str,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"SELECT stanza_id FROM messages
+               WHERE conversation_id = ?1 AND direction = 'in' AND retracted = 0
+                 AND stanza_id IS NOT NULL
+                 AND (occupant_id = ?2 OR (?2 IS NULL AND counterpart = ?3))
+               ORDER BY timestamp DESC, id DESC LIMIT ?4"#,
+        )
+        .bind(conversation_id)
+        .bind(occupant_id)
+        .bind(occupant_jid)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids)
+    }
+
     /// XEP-0308: replace the body of message `message_id` (already authorized by the caller
     /// via [`Self::find_from_sender`]). The row takes the *correction's* encryption and
     /// fingerprint, so a plaintext correction of an encrypted message can't keep the lock.
@@ -546,15 +599,34 @@ impl Store {
     /// XEP-0424 tombstone of message `message_id` (already authorized by the caller); same
     /// effect as [`Self::retract_message`]. Returns the body it had.
     pub async fn retract_message_id(&self, message_id: i64) -> Result<Option<String>> {
+        self.tombstone_message_id(message_id, false, None).await
+    }
+
+    /// XEP-0425 tombstone of message `message_id` by a room moderator (already authorized by
+    /// the caller: the moderation came from the room itself). Like
+    /// [`Self::retract_message_id`], but records the moderation and its `reason`.
+    pub async fn moderate_message_id(&self, message_id: i64, reason: Option<&str>) -> Result<Option<String>> {
+        self.tombstone_message_id(message_id, true, reason).await
+    }
+
+    async fn tombstone_message_id(
+        &self,
+        message_id: i64,
+        moderated: bool,
+        reason: Option<&str>,
+    ) -> Result<Option<String>> {
         let body: Option<Option<String>> = sqlx::query_scalar("SELECT body FROM messages WHERE id = ?1")
             .bind(message_id)
             .fetch_optional(self.pool())
             .await?;
         sqlx::query(
             r#"UPDATE messages SET retracted = 1, body = NULL, attachment = NULL,
-               edited_of = NULL, reply_to = NULL, omemo_fingerprint = NULL WHERE id = ?1"#,
+               edited_of = NULL, reply_to = NULL, omemo_fingerprint = NULL,
+               moderated = ?2, moderation_reason = ?3 WHERE id = ?1"#,
         )
         .bind(message_id)
+        .bind(moderated)
+        .bind(reason)
         .execute(self.pool())
         .await?;
         sqlx::query("DELETE FROM reactions WHERE message_id = ?1")
@@ -1021,6 +1093,36 @@ impl Store {
         Ok(())
     }
 
+    /// We changed bare `jid`'s affiliation in a room. Present occupants with that real JID
+    /// (keyed by nick) take the new affiliation; the nick-less offline-member row is dropped
+    /// and only recreated for a member/admin/owner who isn't present, and only in a private,
+    /// non-anonymous room — where `configure_room` keeps that roster as OMEMO crypto targets.
+    pub async fn set_muc_affiliation_by_jid(&self, conversation_id: i64, jid: &str, affiliation: &str) -> Result<()> {
+        sqlx::query(
+            r#"DELETE FROM muc_occupants
+               WHERE conversation_id = ?1 AND nick = real_jid AND real_jid = ?2 COLLATE NOCASE"#,
+        )
+        .bind(conversation_id)
+        .bind(jid)
+        .execute(self.pool())
+        .await?;
+        let present = sqlx::query(
+            r#"UPDATE muc_occupants SET affiliation = ?3
+               WHERE conversation_id = ?1 AND real_jid = ?2 COLLATE NOCASE"#,
+        )
+        .bind(conversation_id)
+        .bind(jid)
+        .bind(affiliation)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        let is_member = matches!(affiliation, "member" | "admin" | "owner");
+        if present == 0 && is_member && !self.is_public_group(conversation_id).await? {
+            self.upsert_muc_occupant(conversation_id, jid, Some(jid), Some(affiliation)).await?;
+        }
+        Ok(())
+    }
+
     /// Resolve an occupant nick to their real bare JID (for decrypting a groupchat OMEMO message).
     pub async fn muc_occupant_real_jid(
         &self,
@@ -1204,6 +1306,108 @@ mod sender_auth_tests {
         // Retracted messages can't be targeted again.
         assert_eq!(store.retract_message_id(alice).await.unwrap().as_deref(), Some("edited"));
         assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-alice"), None).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn moderation_targets_the_room_stanza_id_and_keeps_the_reason() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        let other = store.conversation_id(acc, "other@muc.example.org", "muc").await.unwrap();
+        let spam = store
+            .insert_message(&NewMessage { stanza_id: Some("sid-1".into()), ..msg(room, "s1", Direction::In, None) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Only the room-assigned stanza-id matches, and only in that room.
+        assert_eq!(store.find_by_stanza_id(room, "s1").await.unwrap(), None);
+        assert_eq!(store.find_by_stanza_id(other, "sid-1").await.unwrap(), None);
+        assert_eq!(store.find_by_stanza_id(room, "sid-1").await.unwrap(), Some(spam));
+
+        assert_eq!(store.moderate_message_id(spam, Some("Spam")).await.unwrap().as_deref(), Some("hello"));
+        let row = store.message_by_marker(room, "sid-1").await.unwrap().unwrap();
+        assert!(row.retracted && row.moderated);
+        assert_eq!(row.moderation_reason.as_deref(), Some("Spam"));
+        assert_eq!(row.body, None);
+        // A moderated message can't be moderated again.
+        assert_eq!(store.find_by_stanza_id(room, "sid-1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn pending_moderations_are_consumed_once() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        let other = store.conversation_id(acc, "other@muc.example.org", "muc").await.unwrap();
+        store.add_pending_moderation(room, "sid").await.unwrap();
+        store.add_pending_moderation(room, "sid").await.unwrap();
+        assert!(!store.take_pending_moderation(other, "sid").await.unwrap());
+        assert!(store.take_pending_moderation(room, "sid").await.unwrap());
+        assert!(!store.take_pending_moderation(room, "sid").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn affiliation_changes_keep_one_roster_row_per_jid() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        store.set_muc_features(room, true, true).await.unwrap();
+        let rows = |conv| {
+            let store = store.clone();
+            async move {
+                let mut v: Vec<(String, Option<String>)> =
+                    sqlx::query_as("SELECT nick, affiliation FROM muc_occupants WHERE conversation_id = ?1")
+                        .bind(conv)
+                        .fetch_all(store.pool())
+                        .await
+                        .unwrap();
+                v.sort();
+                v
+            }
+        };
+        // Present as nick "bob": the nick row changes, no extra JID row.
+        store.upsert_muc_occupant(room, "bob", Some("bob@x"), Some("member")).await.unwrap();
+        store.set_muc_affiliation_by_jid(room, "Bob@x", "admin").await.unwrap();
+        assert_eq!(rows(room).await, vec![("bob".into(), Some("admin".into()))]);
+        // Offline: a JID row is added, then dropped on ban.
+        store.set_muc_affiliation_by_jid(room, "carl@x", "member").await.unwrap();
+        assert!(rows(room).await.contains(&("carl@x".into(), Some("member".into()))));
+        store.set_muc_affiliation_by_jid(room, "carl@x", "outcast").await.unwrap();
+        assert!(!rows(room).await.iter().any(|(n, _)| n == "carl@x"));
+        // Public (anonymous) room: no offline roster rows at all.
+        let public = store.conversation_id(acc, "pub@muc.example.org", "muc").await.unwrap();
+        store.set_muc_affiliation_by_jid(public, "dan@x", "member").await.unwrap();
+        assert!(rows(public).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recent_messages_of_one_occupant() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        let from = |origin: &str, sid: &str, nick: &str, occ: Option<&str>| NewMessage {
+            stanza_id: Some(sid.into()),
+            counterpart: format!("room@muc.example.org/{nick}"),
+            ..msg(room, origin, Direction::In, occ)
+        };
+        store.insert_message(&from("1", "s1", "spammer", Some("occ-s"))).await.unwrap();
+        store.insert_message(&from("2", "s2", "renamed", Some("occ-s"))).await.unwrap();
+        store.insert_message(&from("3", "s3", "alice", Some("occ-a"))).await.unwrap();
+        store.insert_message(&from("4", "s4", "anon", None)).await.unwrap();
+        // Our own message never counts.
+        store
+            .insert_message(&NewMessage { stanza_id: Some("s5".into()), ..msg(room, "5", Direction::Out, Some("occ-s")) })
+            .await
+            .unwrap();
+
+        let mut by_occ = store.recent_room_stanza_ids_from(room, Some("occ-s"), "room@muc.example.org/renamed", 10).await.unwrap();
+        by_occ.sort();
+        assert_eq!(by_occ, vec!["s1", "s2"]);
+        // Without an occupant-id: by occupant JID only.
+        let by_nick = store.recent_room_stanza_ids_from(room, None, "room@muc.example.org/anon", 10).await.unwrap();
+        assert_eq!(by_nick, vec!["s4"]);
+        assert_eq!(store.recent_room_stanza_ids_from(room, Some("occ-s"), "x", 1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

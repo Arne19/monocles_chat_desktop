@@ -112,6 +112,9 @@ pub async fn join(
     if let Some(pw) = password {
         x = x.append(Element::builder("password", NS_MUC).append(pw).build());
     }
+    // The room answers with every current occupant's presence, then ours: drop what we knew
+    // about it (we may have missed departures while disconnected) before any of that arrives.
+    let _ = events.send(Event::MucJoining { account_id: cfg.account_id, room: room.to_string() }).await;
     let presence = Element::builder("presence", "jabber:client")
         .attr(crate::ncname("to"), format!("{room}/{nick}"))
         .append(x.build())
@@ -145,6 +148,7 @@ pub async fn configure_room(
     // --- room features (disco#info) ---
     let mut members_only = false;
     let mut non_anonymous = false;
+    let mut moderation = None;
     let req = Element::builder("iq", "jabber:client")
         .attr(crate::ncname("type"), "get")
         .attr(crate::ncname("to"), room)
@@ -154,6 +158,7 @@ pub async fn configure_room(
     if let Ok(reply) = iq::request(w, req).await {
         if let Some(query) = reply.get_child("query", NS_DISCO_INFO) {
             super::stanza_id::set_supported(cfg.account_id, room, super::stanza_id::advertises(query));
+            moderation = super::moderation::advertised(query);
             for f in query.children().filter(|c| c.name() == "feature") {
                 match f.attr("var") {
                     Some("muc_membersonly") => members_only = true,
@@ -163,6 +168,7 @@ pub async fn configure_room(
             }
         }
     }
+    super::moderation::set_supported(cfg.account_id, room, moderation);
     store.set_muc_features(conv, members_only, non_anonymous).await?;
     let omemo_capable = members_only && non_anonymous;
     let _ = events
@@ -170,23 +176,14 @@ pub async fn configure_room(
             account_id: cfg.account_id,
             room: room.to_string(),
             omemo_capable,
+            moderation: moderation.is_some(),
         })
         .await;
 
     // --- member roster (only meaningful when real JIDs are exposed) ---
     if omemo_capable {
         for affiliation in ["owner", "admin", "member"] {
-            let req = Element::builder("iq", "jabber:client")
-                .attr(crate::ncname("type"), "get")
-                .attr(crate::ncname("to"), room)
-                .attr(crate::ncname("id"), new_id("muc-aff"))
-                .append(
-                    Element::builder("query", NS_MUC_ADMIN)
-                        .append(Element::builder("item", NS_MUC_ADMIN).attr(crate::ncname("affiliation"), affiliation).build())
-                        .build(),
-                )
-                .build();
-            let Ok(reply) = iq::request(w, req).await else { continue };
+            let Ok(reply) = iq::request(w, affiliation_query(room, affiliation)).await else { continue };
             let Some(query) = reply.get_child("query", NS_MUC_ADMIN) else { continue };
             for item in query.children().filter(|c| c.name() == "item") {
                 let Some(jid) = item.attr("jid") else { continue };
@@ -205,6 +202,145 @@ pub async fn configure_room(
     Ok(())
 }
 
+/// A XEP-0045 request for `room`'s list of JIDs with `affiliation`.
+fn affiliation_query(room: &str, affiliation: &str) -> Element {
+    Element::builder("iq", "jabber:client")
+        .attr(crate::ncname("type"), "get")
+        .attr(crate::ncname("to"), room)
+        .attr(crate::ncname("id"), new_id("muc-aff"))
+        .append(
+            Element::builder("query", NS_MUC_ADMIN)
+                .append(Element::builder("item", NS_MUC_ADMIN).attr(crate::ncname("affiliation"), affiliation).build())
+                .build(),
+        )
+        .build()
+}
+
+/// The bare JIDs in a muc#admin list reply (other than `own_bare`), with their affiliation
+/// (the item's own, else the one asked for).
+fn affiliation_items(reply: &Element, asked: &str, own_bare: &str) -> Vec<(String, String)> {
+    let Some(query) = reply.get_child("query", NS_MUC_ADMIN) else { return Vec::new() };
+    query
+        .children()
+        .filter(|c| c.name() == "item")
+        .filter_map(|item| {
+            let jid = item.attr("jid")?;
+            let bare = jid.split('/').next().unwrap_or(jid);
+            if bare.is_empty() || bare.eq_ignore_ascii_case(own_bare) {
+                return None;
+            }
+            Some((bare.to_string(), item.attr("affiliation").unwrap_or(asked).to_string()))
+        })
+        .collect()
+}
+
+/// XEP-0045 §9.5/§9.8/§10.5/§10.8: fetch `room`'s owner, admin, member and outcast lists
+/// (offline members and bans included), concurrently, and report them as
+/// [`Event::MucAffiliations`]. Lists we may not read (e.g. outcasts as a plain member) are
+/// skipped; if none could be read, [`Event::MucAffiliationsFailed`] says why.
+pub async fn fetch_affiliations(
+    w: &Writer,
+    cfg: &AccountConfig,
+    events: &Sender<Event>,
+    room: &str,
+) -> anyhow::Result<()> {
+    const LISTS: [&str; 4] = ["owner", "admin", "member", "outcast"];
+    let replies =
+        futures::future::join_all(LISTS.map(|affiliation| iq::request(w, affiliation_query(room, affiliation)))).await;
+    let mut items = Vec::new();
+    let mut first_error = None;
+    let mut any = false;
+    for (affiliation, reply) in LISTS.iter().zip(replies) {
+        match reply {
+            Ok(reply) => {
+                any = true;
+                items.extend(affiliation_items(&reply, affiliation, cfg.bare()));
+            }
+            Err(e) => {
+                tracing::debug!(%room, %affiliation, error = %e, "affiliation list refused");
+                first_error.get_or_insert(e.to_string());
+            }
+        }
+    }
+    let event = if any {
+        Event::MucAffiliations { account_id: cfg.account_id, room: room.to_string(), items }
+    } else {
+        Event::MucAffiliationsFailed {
+            account_id: cfg.account_id,
+            room: room.to_string(),
+            error: first_error.unwrap_or_default(),
+        }
+    };
+    let _ = events.send(event).await;
+    Ok(())
+}
+
+/// A XEP-0045 admin `<item/>` change for `room`, with an optional reason.
+fn admin_item(room: &str, attrs: &[(&str, &str)], reason: Option<&str>) -> Element {
+    let mut item = Element::builder("item", NS_MUC_ADMIN);
+    for (k, v) in attrs {
+        item = item.attr(crate::ncname(k), *v);
+    }
+    if let Some(r) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        item = item.append(Element::builder("reason", NS_MUC_ADMIN).append(r).build());
+    }
+    Element::builder("iq", "jabber:client")
+        .attr(crate::ncname("type"), "set")
+        .attr(crate::ncname("to"), room)
+        .attr(crate::ncname("id"), new_id("muc-admin"))
+        .append(Element::builder("query", NS_MUC_ADMIN).append(item.build()).build())
+        .build()
+}
+
+/// XEP-0045 §8.2 kick: set occupant `nick`'s role to `none` (we must be a moderator, and they
+/// may not be an admin or owner — the room enforces both).
+pub async fn kick(w: &Writer, room: &str, nick: &str, reason: Option<&str>) -> anyhow::Result<()> {
+    iq::request(w, admin_item(room, &[("nick", nick), ("role", "none")], reason))
+        .await
+        .map_err(|e| anyhow::anyhow!("Couldn't remove {nick}: {e}"))?;
+    Ok(())
+}
+
+/// XEP-0045 affiliation change of the bare `jid` (§9 admin / §10 owner use cases): `outcast`
+/// bans (and removes them from the room), `none`/`member`/`admin`/`owner` revoke or grant
+/// membership and rights. We must outrank them as admin, or be an owner for admin/owner
+/// changes — the room enforces it.
+pub async fn set_affiliation(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    events: &Sender<Event>,
+    room: &str,
+    jid: &str,
+    affiliation: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(affiliation, "outcast" | "none" | "member" | "admin" | "owner"),
+        "unknown affiliation {affiliation}"
+    );
+    let bare = jid.split('/').next().unwrap_or(jid);
+    iq::request(w, admin_item(room, &[("jid", bare), ("affiliation", affiliation)], reason))
+        .await
+        .map_err(|e| match affiliation {
+            "outcast" => anyhow::anyhow!("Couldn't ban {bare}: {e}"),
+            _ => anyhow::anyhow!("Couldn't change the permissions of {bare}: {e}"),
+        })?;
+    // Keep the stored roster (the OMEMO crypto targets) in step with the change.
+    if let Ok(conv) = store.conversation_id(cfg.account_id, room, "muc").await {
+        let _ = store.set_muc_affiliation_by_jid(conv, bare, affiliation).await;
+    }
+    let _ = events
+        .send(Event::MucAffiliationChanged {
+            account_id: cfg.account_id,
+            room: room.to_string(),
+            jid: bare.to_string(),
+            affiliation: affiliation.to_string(),
+        })
+        .await;
+    Ok(())
+}
+
 /// Leave a room (unavailable presence to room/nick).
 pub fn leave(w: &Writer, room: &str, nick: &str) -> anyhow::Result<()> {
     let presence = Element::builder("presence", "jabber:client")
@@ -212,4 +348,35 @@ pub fn leave(w: &Writer, room: &str, nick: &str) -> anyhow::Result<()> {
         .attr(crate::ncname("type"), "unavailable")
         .build();
     w.send(presence)
+}
+
+#[cfg(test)]
+mod admin_tests {
+    use super::*;
+
+    #[test]
+    fn kick_and_ban_items() {
+        let kick = admin_item("room@muc", &[("nick", "spammer"), ("role", "none")], Some(" flood "));
+        assert_eq!(kick.attr("type"), Some("set"));
+        assert_eq!(kick.attr("to"), Some("room@muc"));
+        let item = kick.get_child("query", NS_MUC_ADMIN).unwrap().get_child("item", NS_MUC_ADMIN).unwrap();
+        assert_eq!((item.attr("nick"), item.attr("role")), (Some("spammer"), Some("none")));
+        assert_eq!(item.get_child("reason", NS_MUC_ADMIN).unwrap().text(), "flood");
+
+        let ban = admin_item("room@muc", &[("jid", "s@x"), ("affiliation", "outcast")], Some(""));
+        let item = ban.get_child("query", NS_MUC_ADMIN).unwrap().get_child("item", NS_MUC_ADMIN).unwrap();
+        assert_eq!((item.attr("jid"), item.attr("affiliation")), (Some("s@x"), Some("outcast")));
+        assert!(item.get_child("reason", NS_MUC_ADMIN).is_none());
+    }
+
+    #[test]
+    fn affiliation_list_items() {
+        let reply: Element = "<iq xmlns='jabber:client' type='result'>            <query xmlns='http://jabber.org/protocol/muc#admin'>              <item affiliation='outcast' jid='spam@x'><reason>flood</reason></item>              <item jid='me@example.org/res'/>              <item jid='bob@x/phone'/>              <item nick='nojid'/>            </query></iq>"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            affiliation_items(&reply, "outcast", "ME@example.org"),
+            vec![("spam@x".to_string(), "outcast".to_string()), ("bob@x".to_string(), "outcast".to_string())]
+        );
+    }
 }

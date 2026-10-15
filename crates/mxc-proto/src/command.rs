@@ -80,6 +80,30 @@ pub enum Command {
     /// XEP-0424 retract a previously-sent message.
     Retract { account_id: i64, conversation_id: i64, to: String, target_id: String },
 
+    /// XEP-0425 ask `room` to retract the message with room stanza-id `stanza_id` (we must be a
+    /// moderator there).
+    Moderate { account_id: i64, room: String, stanza_id: String, reason: Option<String> },
+
+    /// After a ban: moderate the occupant's recent messages in `room` (by occupant-id when
+    /// known, else by nick).
+    ModerateRecent {
+        account_id: i64,
+        room: String,
+        nick: String,
+        occupant_id: Option<String>,
+        reason: Option<String>,
+    },
+
+    /// XEP-0045 kick: set occupant `nick`'s role to `none`.
+    MucKick { account_id: i64, room: String, nick: String, reason: Option<String> },
+
+    /// XEP-0045: fetch `room`'s owner/admin/member/outcast lists (→ `Event::MucAffiliations`).
+    MucFetchAffiliations { account_id: i64, room: String },
+
+    /// XEP-0045: set the real bare `jid`'s affiliation in `room` — `outcast` (ban), `none`,
+    /// `member`, `admin` or `owner`.
+    MucSetAffiliation { account_id: i64, room: String, jid: String, affiliation: String, reason: Option<String> },
+
     /// XEP-0085 chat state (composing/active/paused).
     SendChatState { account_id: i64, to: String, state: String },
 

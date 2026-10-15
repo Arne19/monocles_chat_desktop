@@ -40,6 +40,7 @@ const ROLE_WEBXDC_URL: i32 = 275;
 const ROLE_FILE_URL: i32 = 276;
 const ROLE_FILE_NAME: i32 = 277;
 const ROLE_ATTACHMENTS: i32 = 278;
+const ROLE_STANZA_ID: i32 = 279;
 
 /// One message row, resolved for display.
 #[derive(Clone, Default, PartialEq)]
@@ -89,6 +90,9 @@ pub struct MessageItem {
     /// until it is downloaded. Empty string for the single-file case, which keeps rendering
     /// through `image_path` / `audio_path` / `file_url` exactly as before.
     pub attachments: String,
+    /// The archive-assigned XEP-0359 stanza-id (the room's, in a MUC), or empty — the target
+    /// of a XEP-0425 moderation.
+    pub stanza_id: String,
 }
 
 /// How a reloaded message list lines up with the shown one: `old[old_start..][..overlap]` are
@@ -403,7 +407,13 @@ impl MessageItem {
                 .collect();
             attachments = serde_json::to_string(&tiles).unwrap_or_default();
         }
-        let (body, image_path, audio_path) = if m.retracted {
+        let (body, image_path, audio_path) = if m.moderated {
+            let body = match m.moderation_reason.as_deref() {
+                Some(reason) => format!("(removed by a moderator: {reason})"),
+                None => "(removed by a moderator)".to_string(),
+            };
+            (body, String::new(), String::new())
+        } else if m.retracted {
             ("(message retracted)".to_string(), String::new(), String::new())
         } else if !attachments.is_empty() {
             // The caption (empty when the files were sent without one) renders under the tiles.
@@ -496,6 +506,7 @@ impl MessageItem {
             file_url,
             file_name,
             attachments,
+            stanza_id: m.stanza_id.clone().unwrap_or_default(),
         }
     }
 
@@ -620,6 +631,11 @@ pub mod qobject {
         /// XEP-0424: retract message `target_id` (our own) in the open conversation.
         #[qinvokable]
         fn retract(self: &MessageModel, to: &QString, target_id: &QString);
+
+        /// XEP-0425: ask `room` to retract the message with room stanza-id `stanza_id` (we
+        /// must be a moderator). An empty `reason` sends none.
+        #[qinvokable]
+        fn moderate(self: &MessageModel, room: &QString, stanza_id: &QString, reason: &QString);
 
         /// XEP-0308: replace message `target_id`'s body in the open conversation.
         #[qinvokable]
@@ -793,6 +809,17 @@ impl qobject::MessageModel {
         }
     }
 
+    /// Ask the room to moderate (XEP-0425) a message; the room's broadcast tombstones it for
+    /// everyone and comes back as `MessageRetracted`, which reloads this conversation.
+    pub fn moderate(&self, room: &QString, stanza_id: &QString, reason: &QString) {
+        let stanza_id = stanza_id.to_string();
+        if stanza_id.is_empty() {
+            return;
+        }
+        let reason = reason.to_string().trim().to_string();
+        crate::session::moderate_message(room.to_string(), stanza_id, Some(reason).filter(|r| !r.is_empty()));
+    }
+
     /// Send a XEP-0308 correction for one of our messages; the core updates the stored row
     /// and replies with `MessageEdited`, which reloads this conversation.
     pub fn correct(&self, to: &QString, target_id: &QString, new_body: &QString) {
@@ -903,6 +930,7 @@ impl qobject::MessageModel {
             ROLE_FILE_URL => QVariant::from(&QString::from(item.file_url.as_str())),
             ROLE_FILE_NAME => QVariant::from(&QString::from(item.file_name.as_str())),
             ROLE_ATTACHMENTS => QVariant::from(&QString::from(item.attachments.as_str())),
+            ROLE_STANZA_ID => QVariant::from(&QString::from(item.stanza_id.as_str())),
             _ => QVariant::default(),
         }
     }
@@ -948,6 +976,7 @@ impl qobject::MessageModel {
         roles.insert(ROLE_FILE_URL, QByteArray::from("fileUrl"));
         roles.insert(ROLE_FILE_NAME, QByteArray::from("fileName"));
         roles.insert(ROLE_ATTACHMENTS, QByteArray::from("attachments"));
+        roles.insert(ROLE_STANZA_ID, QByteArray::from("stanzaId"));
         roles
     }
 }

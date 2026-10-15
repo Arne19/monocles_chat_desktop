@@ -1744,27 +1744,65 @@ async fn process_payload(
         return Ok(());
     }
 
-    // XEP-0424 retraction.
-    // Only the original sender may retract (find_from_sender); in a MUC the room itself may
-    // additionally moderate (XEP-0425: from the bare room JID, targeting the room stanza-id).
+    // XEP-0425 moderation. Only the room itself (its bare JID — never an occupant) may
+    // moderate, only by the room-assigned stanza-id, and only in the clear: it's the MUC
+    // service acting, which can't encrypt. Any message from the room carrying the payload is
+    // consumed here, so its fallback body is never stored.
+    if kind == "muc" && !from.contains('/') {
+        if let Some((target, reason)) = super::moderation::moderation_target(msg) {
+            match store.find_by_stanza_id(conv, &target).await? {
+                Some(mid) => {
+                    let old_body = store.moderate_message_id(mid, reason.as_deref()).await?;
+                    let _ = events.send(Event::MessageRetracted {
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                    }).await;
+                }
+                // Not here (yet): paging back through an archive that keeps originals can bring
+                // the moderated message after its moderation — drop it when it shows up.
+                None => store.add_pending_moderation(conv, &target).await?,
+            }
+            return Ok(());
+        }
+    }
+    // XEP-0425 §6 tombstone: the room archive replaced a moderated message with a body-less
+    // `<retracted><moderated/></retracted>` stub. Only trusted from a (screened) archive result,
+    // and it can only tombstone the row with its *own* stanza-id — so a forged one can at most
+    // hide itself. Never inserted as a new message.
+    if kind == "muc" && from_archive {
+        if let Some(reason) = super::moderation::tombstone(msg) {
+            if let Some(sid) = stanza_id.as_deref() {
+                if let Some(mid) = store.find_by_stanza_id(conv, sid).await? {
+                    let old_body = store.moderate_message_id(mid, reason.as_deref()).await?;
+                    let _ = events.send(Event::MessageRetracted {
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                    }).await;
+                }
+            }
+            return Ok(());
+        }
+    }
+    // A room message moderated before it reached us (see above): never stored.
+    if kind == "muc" {
+        if let Some(sid) = stanza_id.as_deref() {
+            if store.take_pending_moderation(conv, sid).await? {
+                tracing::debug!(%sid, "dropping a message that was moderated before it arrived");
+                return Ok(());
+            }
+        }
+    }
+
+    // XEP-0424 retraction. Only the original sender may retract (find_from_sender).
     if let Some(retract) = content.get_child("retract", NS_RETRACT) {
         if let Some(target) = retract.attr("id") {
-            let is_moderation = kind == "muc"
-                && !from.contains('/')
-                && retract.children().any(|c| c.name() == "moderated");
-            let mid = if is_moderation {
-                store.find_by_stanza_id(conv, target).await?
-            } else {
-                match sender_filter(kind, own_side, occupant_id.as_deref()) {
-                    // Like corrections: an encrypted message can only be retracted under the
-                    // same OMEMO fingerprint, else the peer's server could forge a plaintext
-                    // retraction and delete it. (OMEMO2 retractions travel inside the SCE
-                    // envelope on both clients, so this costs no legitimate retraction.)
-                    Some((dir, occ)) => {
-                        store.find_from_sender(conv, target, dir, occ, Some(fingerprint.as_deref())).await?
-                    }
-                    None => None,
+            let mid = match sender_filter(kind, own_side, occupant_id.as_deref()) {
+                // Like corrections: an encrypted message can only be retracted under the
+                // same OMEMO fingerprint, else the peer's server could forge a plaintext
+                // retraction and delete it. (OMEMO2 retractions travel inside the SCE
+                // envelope on both clients, so this costs no legitimate retraction.)
+                Some((dir, occ)) => {
+                    store.find_from_sender(conv, target, dir, occ, Some(fingerprint.as_deref())).await?
                 }
+                None => None,
             };
             match mid {
                 Some(mid) => {

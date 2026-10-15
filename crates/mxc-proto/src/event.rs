@@ -161,9 +161,40 @@ pub enum Event {
     /// MUC occupant avatar photo (vCard-temp). `data` is empty if the occupant has none.
     MucAvatar { account_id: i64, room: String, nick: String, data: Vec<u8> },
 
-    /// A room's OMEMO capability (private + non-anonymous), discovered on join. The UI uses it
-    /// to enable/disable the encryption lock for the open room.
-    MucPrivacy { account_id: i64, room: String, omemo_capable: bool },
+    /// A room's OMEMO capability (private + non-anonymous) and XEP-0425 moderation support,
+    /// discovered on join. The UI uses them to enable/disable the encryption lock and the
+    /// "Moderate…" message action for the open room.
+    MucPrivacy { account_id: i64, room: String, omemo_capable: bool, moderation: bool },
+
+    /// A room's affiliation lists (owner/admin/member/outcast — offline members and bans
+    /// included, ourselves excluded) as (bare JID, affiliation), fetched on request.
+    MucAffiliations { account_id: i64, room: String, items: Vec<(String, String)> },
+
+    /// We changed `jid`'s affiliation in `room` and the room accepted it.
+    MucAffiliationChanged { account_id: i64, room: String, jid: String, affiliation: String },
+
+    /// We're (re)joining `room`: its occupants' presences follow, ending with our own.
+    MucJoining { account_id: i64, room: String },
+
+    /// Fetching `room`'s affiliation lists failed (none could be read).
+    MucAffiliationsFailed { account_id: i64, room: String, error: String },
+
+    /// A room occupant's (or our own, `is_self`) XEP-0045 role/affiliation from their presence.
+    /// `available == false` once they left (or were kicked/banned); role and affiliation are
+    /// then `none`. `real_jid` (bare) is only known in non-anonymous rooms or as a moderator.
+    MucOccupant {
+        account_id: i64,
+        room: String,
+        nick: String,
+        role: String,
+        affiliation: String,
+        real_jid: Option<String>,
+        occupant_id: Option<String>,
+        is_self: bool,
+        available: bool,
+        /// An unavailable presence that only announces a nick change (status 303).
+        nick_change: bool,
+    },
 
     /// Our own account profile + PQ OMEMO2 keys (this device + our other devices).
     OwnKeys {

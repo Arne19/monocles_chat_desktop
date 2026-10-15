@@ -440,6 +440,77 @@ pub mod qobject {
         #[cxx_name = "mucOmemoCapable"]
         fn muc_omemo_capable(self: &Backend, room: &QString) -> bool;
 
+        /// Whether we may moderate messages in `room` (XEP-0425 support + moderator role).
+        #[qinvokable]
+        #[cxx_name = "mucCanModerate"]
+        fn muc_can_moderate(self: &Backend, room: &QString) -> bool;
+
+        /// Whether we may kick occupant `nick` (moderator; they're not an admin/owner).
+        #[qinvokable]
+        #[cxx_name = "mucCanKick"]
+        fn muc_can_kick(self: &Backend, room: &QString, nick: &QString) -> bool;
+
+        /// Whether we may ban occupant `nick` (admin/owner outranking them; real JID known).
+        #[qinvokable]
+        #[cxx_name = "mucCanBan"]
+        fn muc_can_ban(self: &Backend, room: &QString, nick: &QString) -> bool;
+
+        /// A present occupant's XEP-0421 occupant id, or "".
+        #[qinvokable]
+        #[cxx_name = "mucOccupantId"]
+        fn muc_occupant_id(self: &Backend, room: &QString, nick: &QString) -> QString;
+
+        /// XEP-0045 kick (role none) with an optional reason.
+        #[qinvokable]
+        #[cxx_name = "kickOccupant"]
+        fn kick_occupant(self: &Backend, room: &QString, nick: &QString, reason: &QString);
+
+        /// XEP-0045 ban (affiliation outcast) with an optional reason. Returns the banned real
+        /// JID ("" if unknown / not sent); `mucAffiliationChanged` confirms it.
+        #[qinvokable]
+        #[cxx_name = "banOccupant"]
+        fn ban_occupant(self: &Backend, room: &QString, nick: &QString, reason: &QString) -> QString;
+
+        /// Whether we may read/edit `room`'s member and ban lists (admin or owner).
+        #[qinvokable]
+        #[cxx_name = "mucCanManageMembers"]
+        fn muc_can_manage_members(self: &Backend, room: &QString) -> bool;
+
+        /// Fetch `room`'s member and ban lists (→ `mucAffiliationsChanged`).
+        #[qinvokable]
+        #[cxx_name = "fetchMucAffiliations"]
+        fn fetch_muc_affiliations(self: &Backend, room: &QString) -> bool;
+
+        /// `{"offline":[{jid,affiliation}],"banned":[{jid,affiliation}]}` for `room`.
+        #[qinvokable]
+        #[cxx_name = "mucMemberListsJson"]
+        fn muc_member_lists_json(self: &Backend, room: &QString) -> QString;
+
+        /// Changes we may make for a listed `jid`: JSON `[{"action","affiliation"}]`.
+        #[qinvokable]
+        #[cxx_name = "mucJidChoices"]
+        fn muc_jid_choices(self: &Backend, room: &QString, jid: &QString) -> QString;
+
+        /// XEP-0045: set a listed `jid`'s affiliation (`outcast` bans, `none` unbans).
+        #[qinvokable]
+        #[cxx_name = "setJidAffiliation"]
+        fn set_jid_affiliation(self: &Backend, room: &QString, jid: &QString, affiliation: &QString, reason: &QString);
+
+        /// Permission changes we may make for occupant `nick`: JSON `[{"action","affiliation"}]`.
+        #[qinvokable]
+        #[cxx_name = "mucAffiliationChoices"]
+        fn muc_affiliation_choices(self: &Backend, room: &QString, nick: &QString) -> QString;
+
+        /// XEP-0045: change occupant `nick`'s affiliation (`none`/`member`/`admin`/`owner`).
+        #[qinvokable]
+        #[cxx_name = "setOccupantAffiliation"]
+        fn set_occupant_affiliation(self: &Backend, room: &QString, nick: &QString, affiliation: &QString) -> bool;
+
+        /// XEP-0425: moderate an occupant's recent messages (after a ban).
+        #[qinvokable]
+        #[cxx_name = "moderateRecent"]
+        fn moderate_recent(self: &Backend, room: &QString, nick: &QString, occupant_id: &QString, reason: &QString);
+
         /// JSON array of usable color cameras `[{"name","path"}, …]` for the settings picker.
         #[qinvokable]
         #[cxx_name = "cameraListJson"]
@@ -540,10 +611,26 @@ pub mod qobject {
         #[cxx_name = "isAnimatedImage"]
         fn is_animated_image(self: &Backend, path: &QString) -> bool;
 
-        /// Emitted when a room's OMEMO capability changed (re-query `mucOmemoCapable`).
+        /// Emitted when a room's OMEMO capability or our moderation rights changed (re-query
+        /// `mucOmemoCapable` / `mucCanModerate`).
         #[qsignal]
         #[cxx_name = "mucPrivacyChanged"]
         fn muc_privacy_changed(self: Pin<&mut Backend>);
+
+        /// Emitted when `room`'s member/ban lists changed (re-query `mucMemberListsJson`).
+        #[qsignal]
+        #[cxx_name = "mucAffiliationsChanged"]
+        fn muc_affiliations_changed(self: Pin<&mut Backend>, room: QString);
+
+        /// Emitted when `room`'s member/ban lists couldn't be read at all.
+        #[qsignal]
+        #[cxx_name = "mucAffiliationsFailed"]
+        fn muc_affiliations_failed(self: Pin<&mut Backend>, room: QString, error: QString);
+
+        /// Emitted when the room accepted our change of `jid`'s affiliation (e.g. a ban).
+        #[qsignal]
+        #[cxx_name = "mucAffiliationChanged"]
+        fn muc_affiliation_changed(self: Pin<&mut Backend>, room: QString, jid: QString, affiliation: QString);
 
         /// Emitted when the conversation list changed (models should reload).
         #[qsignal]
@@ -1020,6 +1107,92 @@ impl qobject::Backend {
         crate::session::muc_omemo_capable(&room.to_string())
     }
 
+    /// QML entry point — whether we may moderate messages in a room.
+    pub fn muc_can_moderate(&self, room: &QString) -> bool {
+        crate::muc_admin::can_moderate(&room.to_string())
+    }
+
+    /// QML entry point — whether we may kick occupant `nick` from `room`.
+    pub fn muc_can_kick(&self, room: &QString, nick: &QString) -> bool {
+        crate::muc_admin::can_kick(&room.to_string(), &nick.to_string())
+    }
+
+    /// QML entry point — whether we may ban occupant `nick` from `room`.
+    pub fn muc_can_ban(&self, room: &QString, nick: &QString) -> bool {
+        crate::muc_admin::can_ban(&room.to_string(), &nick.to_string())
+    }
+
+    /// QML entry point — a present occupant's XEP-0421 occupant id ("" if unknown).
+    pub fn muc_occupant_id(&self, room: &QString, nick: &QString) -> QString {
+        let occ = crate::muc_admin::occupant(&room.to_string(), &nick.to_string());
+        QString::from(occ.and_then(|o| o.occupant_id).unwrap_or_default().as_str())
+    }
+
+    /// QML entry point — kick an occupant (empty `reason` sends none).
+    pub fn kick_occupant(&self, room: &QString, nick: &QString, reason: &QString) {
+        crate::session::kick_occupant(room.to_string(), nick.to_string(), non_empty(reason));
+    }
+
+    /// QML entry point — ban an occupant by their real JID. False if it isn't known.
+    pub fn ban_occupant(&self, room: &QString, nick: &QString, reason: &QString) -> QString {
+        let jid = crate::session::set_occupant_affiliation(
+            room.to_string(),
+            nick.to_string(),
+            "outcast".into(),
+            non_empty(reason),
+        );
+        QString::from(jid.unwrap_or_default().as_str())
+    }
+
+    /// QML entry point — the permission changes we may make for occupant `nick`, as a JSON
+    /// array of `{"action", "affiliation"}` (see `muc_admin::affiliation_choices`).
+    pub fn muc_affiliation_choices(&self, room: &QString, nick: &QString) -> QString {
+        choices_json(crate::muc_admin::affiliation_choices(&room.to_string(), &nick.to_string()))
+    }
+
+    /// QML entry point — whether we may manage `room`'s member and ban lists.
+    pub fn muc_can_manage_members(&self, room: &QString) -> bool {
+        crate::muc_admin::can_manage_members(&room.to_string())
+    }
+
+    /// QML entry point — fetch `room`'s member and ban lists.
+    pub fn fetch_muc_affiliations(&self, room: &QString) -> bool {
+        crate::session::fetch_muc_affiliations(room.to_string())
+    }
+
+    /// QML entry point — the offline members and banned users of `room`, as JSON.
+    pub fn muc_member_lists_json(&self, room: &QString) -> QString {
+        let (offline, banned) = crate::muc_admin::offline_and_banned(&room.to_string());
+        let list = |v: Vec<(String, String)>| {
+            v.into_iter()
+                .map(|(jid, affiliation)| serde_json::json!({ "jid": jid, "affiliation": affiliation }))
+                .collect::<Vec<_>>()
+        };
+        let json = serde_json::json!({ "offline": list(offline), "banned": list(banned) });
+        QString::from(json.to_string().as_str())
+    }
+
+    /// QML entry point — the changes we may make for a listed `jid`, as JSON.
+    pub fn muc_jid_choices(&self, room: &QString, jid: &QString) -> QString {
+        choices_json(crate::muc_admin::jid_choices(&room.to_string(), &jid.to_string()))
+    }
+
+    /// QML entry point — change a listed `jid`'s affiliation (empty `reason` sends none).
+    pub fn set_jid_affiliation(&self, room: &QString, jid: &QString, affiliation: &QString, reason: &QString) {
+        crate::session::set_jid_affiliation(room.to_string(), jid.to_string(), affiliation.to_string(), non_empty(reason));
+    }
+
+    /// QML entry point — change occupant `nick`'s affiliation (membership/admin/owner).
+    pub fn set_occupant_affiliation(&self, room: &QString, nick: &QString, affiliation: &QString) -> bool {
+        crate::session::set_occupant_affiliation(room.to_string(), nick.to_string(), affiliation.to_string(), None)
+            .is_some()
+    }
+
+    /// QML entry point — moderate a (just banned) occupant's recent messages.
+    pub fn moderate_recent(&self, room: &QString, nick: &QString, occupant_id: &QString, reason: &QString) {
+        crate::session::moderate_recent(room.to_string(), nick.to_string(), occupant_id.to_string(), non_empty(reason));
+    }
+
     /// QML entry point — remove a conversation from the chats list.
     pub fn delete_chat(self: Pin<&mut Self>, jid: &QString) {
         crate::session::delete_chat(jid.to_string());
@@ -1239,4 +1412,18 @@ impl qobject::Backend {
     pub fn audio_seek(self: Pin<&mut Self>, ms: i64) {
         crate::media::seek(ms);
     }
+}
+
+/// A trimmed QML string, `None` when empty (an optional reason).
+fn non_empty(s: &QString) -> Option<String> {
+    Some(s.to_string().trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// `(action, affiliation)` permission choices as the JSON array QML reads.
+fn choices_json(choices: Vec<(&'static str, &'static str)>) -> QString {
+    let v: Vec<_> = choices
+        .into_iter()
+        .map(|(action, affiliation)| serde_json::json!({ "action": action, "affiliation": affiliation }))
+        .collect();
+    QString::from(serde_json::Value::Array(v).to_string().as_str())
 }
