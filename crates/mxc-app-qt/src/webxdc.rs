@@ -2,7 +2,8 @@
 //! JS API (`window.webxdc`) to the chat — status updates + realtime sync to the peers, exactly
 //! like monocles Android and the GTK client.
 //!
-//! The `.xdc` (a zip) is extracted to a cache dir and served over a private `webxdc://` URI
+//! The `.xdc` (a zip) is cached encrypted like other media, extracted into the volatile view
+//! dir (see `mxc_store::cache`) and served over a private `webxdc://` URI
 //! scheme implemented by the C++ shim (`cpp/webxdc_shim.cpp` — QtWebEngine's scheme handler and
 //! `QtWebEngineQuick::initialize` have no Rust bindings). `webxdc.js` (served at `/webxdc.js`)
 //! defines the JS API; the app talks back by `fetch()`-POSTing JSON to `/__bridge__` on its origin,
@@ -101,10 +102,7 @@ pub fn open(peer: String, thread: String, url: String) {
         if !path.is_file() {
             match mxc_proto::xeps::http_upload::download_any(&url, MAX_XDC_DOWNLOAD).await {
                 Ok(bytes) => {
-                    if let Some(dir) = path.parent() {
-                        let _ = std::fs::create_dir_all(dir);
-                    }
-                    if let Err(e) = std::fs::write(&path, &bytes) {
+                    if let Err(e) = mxc_store::cache::write(&path, &bytes) {
                         tracing::warn!(error = %e, "webxdc: cache write failed");
                         return;
                     }
@@ -398,8 +396,7 @@ fn bridge_message(msg: &str) {
                     .chars()
                     .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
                     .collect();
-                let dir = webxdc_cache_dir().join("out");
-                let _ = std::fs::create_dir_all(&dir);
+                let Some(dir) = mxc_store::cache::view_subdir("webxdc-out") else { return };
                 let out = dir.join(format!("{:08x}-{safe}", hash_str(&b64) as u32));
                 if std::fs::write(&out, &bytes).is_err() {
                     return;
@@ -423,18 +420,15 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
-fn webxdc_cache_dir() -> PathBuf {
-    directories::ProjectDirs::from("de", "monocles", "monocles-chat")
-        .map(|d| d.cache_dir().join("webxdc"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/monocles-webxdc"))
-}
-
-/// Extract a `.xdc` zip into a private cache dir keyed by its instance thread. Reuses a previous
-/// extraction when the source file is unchanged (fingerprint = size+mtime in a marker file) —
-/// an instance's app file is immutable, so re-unzipping every open is a visible stall.
+/// Extract the (encrypted) cached `.xdc` zip into a private dir of the volatile view dir, keyed
+/// by its instance thread. Reuses an extraction from this run when the source file is unchanged
+/// (fingerprint = size+mtime in a marker file) — an instance's app file is immutable, so
+/// re-unzipping every open is a visible stall.
 fn extract_xdc(xdc_path: &std::path::Path, thread: &str) -> anyhow::Result<PathBuf> {
     let safe: String = thread.chars().filter(|c| c.is_alphanumeric() || *c == '-').collect();
-    let dir = webxdc_cache_dir().join(safe);
+    let root = mxc_store::cache::view_subdir("webxdc")
+        .ok_or_else(|| anyhow::anyhow!("no view dir for webxdc apps"))?;
+    let dir = root.join(safe);
 
     let marker = dir.join(".xdc-src");
     let fingerprint = std::fs::metadata(xdc_path).ok().map(|m| {
@@ -456,8 +450,8 @@ fn extract_xdc(xdc_path: &std::path::Path, thread: &str) -> anyhow::Result<PathB
 
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    let file = std::fs::File::open(xdc_path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
+    let bytes = mxc_store::cache::read(xdc_path)?;
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
     if zip.len() > MAX_XDC_ENTRIES {
         let _ = std::fs::remove_dir_all(&dir);
         anyhow::bail!("webxdc bundle has too many entries ({})", zip.len());

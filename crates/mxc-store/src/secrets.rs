@@ -155,4 +155,6 @@ pub mod kinds {
     pub const OMEMO_PQ_IDENTITY: &str = "omemo2-pq-identity";
     /// Hex-encoded 32-byte SQLCipher key for the local database (not account-specific).
     pub const DB_KEY: &str = "db-key";
+    /// Hex-encoded 32-byte AES-256-GCM key for the on-disk media caches (see `cache`).
+    pub const CACHE_KEY: &str = "cache-key";
 }

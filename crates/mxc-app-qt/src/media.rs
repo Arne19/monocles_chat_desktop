@@ -28,8 +28,12 @@ fn init() {
 // --- recording -----------------------------------------------------------------------------
 
 fn voice_tmp_path() -> PathBuf {
-    let dir = std::env::temp_dir().join("monocles-voice");
-    let _ = std::fs::create_dir_all(&dir);
+    // In the volatile view dir (RAM-backed on Linux, wiped at exit), not the shared temp dir.
+    let dir = mxc_store::cache::view_subdir("voice").unwrap_or_else(|| {
+        let dir = std::env::temp_dir().join("monocles-voice");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    });
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())

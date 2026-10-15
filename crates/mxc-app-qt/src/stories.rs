@@ -212,7 +212,6 @@ impl qobject::StoryModel {
         let Some(s) = self.items.get(index as usize).filter(|s| s.local_path.is_empty()) else { return };
         crate::session::prefetch_story_media(
             s.url.clone(),
-            s.mime.clone(),
             mxc_proto::xeps::http_upload::MANUAL_DOWNLOAD_LIMIT,
             &self.qt_thread(),
         );

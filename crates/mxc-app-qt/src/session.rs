@@ -385,18 +385,15 @@ pub fn load_stories(jid: String, contact: Option<String>, qt: CxxQtThread<StoryM
         rows.retain(|s| seen.insert((s.contact.to_lowercase(), s.uuid.clone())));
         let mut items = Vec::with_capacity(rows.len());
         for s in &rows {
-            let cached = story_cache_path(&s.url, &s.r#type);
-            let local_path = if cached.is_file() {
-                cached.to_string_lossy().into_owned()
-            } else {
+            let local_path = story_view(&s.url, &s.r#type);
+            if local_path.is_empty() {
                 // Images are fetched right away; videos (larger) only when the viewer reaches
                 // them (`StoryModel::fetchMedia`), as Android streams them on view. A failed
                 // download is only retried on request, or every reload would retry it.
                 if !s.r#type.starts_with("video/") && !STORY_MEDIA_FAILED.lock().unwrap().contains(&s.url) {
-                    prefetch_story_media(s.url.clone(), s.r#type.clone(), mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT, &qt);
+                    prefetch_story_media(s.url.clone(), mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT, &qt);
                 }
-                String::new()
-            };
+            }
             request_avatar(&s.contact, false);
             items.push(StoryEntry {
                 uuid: s.uuid.clone(),
@@ -419,26 +416,29 @@ pub fn load_stories(jid: String, contact: Option<String>, qt: CxxQtThread<StoryM
 /// Story media URLs whose last download failed (the viewer offers a retry).
 static STORY_MEDIA_FAILED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Where a story's media is cached. Like [`image_cache_path`], but a video whose URL has no
-/// usable extension gets one from its type — the cached file is handed to the system player,
+/// The decrypted copy of a story's cached media (see [`media_view`]), or "". A video whose URL
+/// has no usable extension gets one from its type — the copy is handed to the system player,
 /// which can't play a `.img`.
-pub(crate) fn story_cache_path(url: &str, mime: &str) -> PathBuf {
-    let path = image_cache_path(url);
+pub(crate) fn story_view(url: &str, mime: &str) -> String {
+    let url_ext = url_ext(url);
     let ext = match mime {
+        _ if url_ext != "img" => url_ext.as_str(),
         "video/mp4" => "mp4",
         "video/webm" => "webm",
         "video/quicktime" => "mov",
         "video/x-matroska" => "mkv",
         "video/3gpp" => "3gp",
-        _ => return path,
+        _ => "img",
     };
-    if path.extension().is_some_and(|e| e == "img") { path.with_extension(ext) } else { path }
+    mxc_store::cache::view(&image_cache_path(url), Some(ext))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Download + cache a story's media once (at most `limit` bytes), then reload the story model
 /// (also to show a failure).
-pub(crate) fn prefetch_story_media(url: String, mime: String, limit: u64, qt: &CxxQtThread<StoryModel>) {
-    let path = story_cache_path(&url, &mime);
+pub(crate) fn prefetch_story_media(url: String, limit: u64, qt: &CxxQtThread<StoryModel>) {
+    let path = image_cache_path(&url);
     if path.is_file() {
         return;
     }
@@ -450,14 +450,8 @@ pub(crate) fn prefetch_story_media(url: String, mime: String, limit: u64, qt: &C
     runtime().spawn(async move {
         let result = mxc_proto::xeps::http_upload::download_any(&url, limit).await;
         let stored = match result {
-            Ok(bytes) => {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                // Written under a temporary name: the player must never get a partial file.
-                let tmp = path.with_extension("part");
-                std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)).is_ok()
-            }
+            // Written atomically: the player must never get a partial file.
+            Ok(bytes) => mxc_store::cache::write(&path, &bytes).is_ok(),
             Err(e) => {
                 tracing::debug!(error = %e, "story media download failed");
                 false
@@ -682,8 +676,7 @@ fn to_entry(p: &FeedPost, comment_count: i64, like_count: i64, liked: bool) -> F
     let own = p.author.eq_ignore_ascii_case(&OWN_JID.lock().unwrap());
     // Only cached images are shown inline; anything else is a link to open.
     let attachment_path = if is_image(&p.attachment_type) {
-        let cached = image_cache_path(&p.attachment_url);
-        if cached.is_file() { cached.to_string_lossy().into_owned() } else { String::new() }
+        media_view(&p.attachment_url)
     } else {
         String::new()
     };
@@ -820,10 +813,7 @@ fn prefetch_feed_media(posts: &[FeedPost], qt: &CxxQtThread<Backend>) {
             .await;
             IMAGE_REQUESTED.lock().unwrap().remove(&url);
             if let Ok(bytes) = result {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if std::fs::write(&path, &bytes).is_ok() {
+                if mxc_store::cache::write(&path, &bytes).is_ok() {
                     let _ = qt.queue(|mut backend: Pin<&mut Backend>| backend.as_mut().feeds_changed());
                 }
             }
@@ -1187,7 +1177,7 @@ fn presence_for(bare: &str) -> String {
     best_presence(&PRESENCE.lock().unwrap(), bare).to_string()
 }
 
-// --- Avatar disk cache (shared with the GTK client: same dir + hash) ------------------------
+// --- Avatar disk cache (same dir + hash as the GTK client; encrypted, see mxc_store::cache) --
 
 fn avatar_cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
@@ -1216,16 +1206,20 @@ fn save_avatar_to_disk(jid: &str, data: &[u8]) {
     if data.is_empty() {
         return;
     }
-    let _ = std::fs::create_dir_all(avatar_cache_dir());
-    let _ = std::fs::write(avatar_cache_path(jid), data);
+    let _ = mxc_store::cache::write(&avatar_cache_path(jid), data);
 }
 
-/// The cached avatar file path for `jid` (as a string) if present, else "".
+/// The (decrypted view copy of the) cached avatar for `jid` as a path string if present,
+/// else "".
 pub(crate) fn avatar_path_for(jid: &str) -> String {
     let path = avatar_cache_path(jid);
     let Ok(meta) = std::fs::metadata(&path) else { return String::new() };
     if !meta.is_file() {
         return String::new();
+    }
+    let view = cache_view(&path);
+    if view.is_empty() {
+        return view;
     }
     // Append the mtime as a query: QML Images can then `cache: true` (no reload flash when
     // list models reset) while a republished avatar still busts the cache. QUrl drops the
@@ -1236,7 +1230,7 @@ pub(crate) fn avatar_path_for(jid: &str) -> String {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("{}?m={mtime}", path.to_string_lossy())
+    format!("{view}?m={mtime}")
 }
 
 /// Encode a decoded RGBA call frame as a downscaled JPEG `data:` URL for a QML `Image`. The
@@ -1296,7 +1290,8 @@ const SAFE_OPEN_EXTENSIONS: &[&str] = &[
 ];
 
 /// The deterministic on-disk cache path a media URL maps to (its existence = "downloaded").
-/// Named by SHA-256 of the URL: with a non-cryptographic hash a sender could craft a URL that
+/// The file is encrypted (see [`mxc_store::cache`]) and has no extension, so its name doesn't
+/// give away the media type; [`media_view`] gives the readable copy. Named by SHA-256 of the URL: with a non-cryptographic hash a sender could craft a URL that
 /// collides with another one and have its file shown in that one's place (and std's hasher
 /// isn't even stable across Rust releases).
 pub fn image_cache_path(url: &str) -> PathBuf {
@@ -1308,7 +1303,7 @@ pub fn image_cache_path(url: &str) -> PathBuf {
     }
     let base = avatar_cache_dir();
     let media = base.parent().map(|p| p.join("media")).unwrap_or_else(|| base.join("media"));
-    media.join(format!("{name}.{}", url_ext(url)))
+    media.join(name)
 }
 
 /// Whether a file the user just downloaded may be opened automatically with the system's
@@ -1348,10 +1343,7 @@ fn prefetch_images(rows: &[mxc_store::MessageRow], qt: &CxxQtThread<MessageModel
             .await;
             IMAGE_REQUESTED.lock().unwrap().remove(&url);
             if let Ok(bytes) = result {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if std::fs::write(&path, &bytes).is_ok() {
+                if mxc_store::cache::write(&path, &bytes).is_ok() {
                     // Reload the open conversation so `from_row` now resolves the cached file.
                     let _ = qt.queue(|model: Pin<&mut MessageModel>| model.reload_current());
                 }
@@ -1384,10 +1376,7 @@ pub fn fetch_media(url: String, qt: CxxQtThread<MessageModel>) {
         .await;
         IMAGE_REQUESTED.lock().unwrap().remove(&url);
         if let Ok(bytes) = result {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if std::fs::write(&path, &bytes).is_ok() {
+            if mxc_store::cache::write(&path, &bytes).is_ok() {
                 let _ = qt.queue(|model: Pin<&mut MessageModel>| model.reload_current());
             }
         }
@@ -1428,11 +1417,43 @@ fn db_path() -> PathBuf {
     dir.join("monocles.db")
 }
 
-/// The shared store, opening it on first use.
+/// The shared store, opening it (and loading the media-cache key) on first use.
 pub(crate) async fn store() -> anyhow::Result<&'static Store> {
     STORE
-        .get_or_try_init(|| async { Store::open(db_path()).await.map_err(|e| anyhow::anyhow!("{e}")) })
+        .get_or_try_init(|| async {
+            let store = Store::open(db_path()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            mxc_store::cache::init().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            // Seal media cached unencrypted by older builds (a no-op once done).
+            tokio::task::spawn_blocking(|| {
+                let base = avatar_cache_dir();
+                mxc_store::cache::seal_dir(&base);
+                if let Some(root) = base.parent() {
+                    // Older builds named media files by extension; that's left to the view copy.
+                mxc_store::cache::strip_extensions(&root.join("media"));
+                mxc_store::cache::seal_dir(&root.join("media"));
+                    // Older builds extracted WebXDC apps here, unencrypted; now they're
+                    // extracted into the volatile view dir.
+                    let _ = std::fs::remove_dir_all(root.join("webxdc"));
+                }
+                mxc_store::cache::seal_dir(&mxc_proto::xeps::bob::cache_dir());
+            });
+            Ok(store)
+        })
         .await
+}
+
+/// The decrypted copy of the (encrypted) cache file at `path` as a string for QML / players,
+/// or "" when it isn't cached. See [`mxc_store::cache::view`].
+pub(crate) fn cache_view(path: &std::path::Path) -> String {
+    mxc_store::cache::view(path, None).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// The decrypted copy of the cached media at `url` (see [`cache_view`]), with the URL's
+/// extension (if a safe one), or "" when it isn't cached.
+pub(crate) fn media_view(url: &str) -> String {
+    mxc_store::cache::view(&image_cache_path(url), Some(&url_ext(url)))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Manual login (from the login form): persist the credentials, then connect.
@@ -1667,7 +1688,7 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
                 // reactions); also drop the media file the old body may have cached.
                 Event::MessageRetracted { conversation_id, body, .. } => {
                     if let Some(url) = body.as_deref().and_then(crate::messages::media_url) {
-                        let _ = std::fs::remove_file(image_cache_path(&url));
+                        mxc_store::cache::remove(&image_cache_path(&url));
                     }
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                         backend.as_mut().message_stored(conversation_id);
@@ -3010,8 +3031,8 @@ mod received_file_tests {
         let b = image_cache_path("https://u.example/b.jpg");
         assert_ne!(a, b);
         let name = a.file_name().unwrap().to_str().unwrap().to_string();
-        assert_eq!(name.len(), 40 + ".jpg".len());
-        assert!(name[..40].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(name.len(), 40, "no extension");
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

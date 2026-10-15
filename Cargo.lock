@@ -2790,6 +2790,7 @@ dependencies = [
 name = "mxc-store"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "chrono",
  "hex",
@@ -2797,6 +2798,7 @@ dependencies = [
  "libsqlite3-sys",
  "oo7",
  "rand 0.9.4",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",

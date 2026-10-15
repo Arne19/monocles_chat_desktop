@@ -2,7 +2,8 @@
 //!
 //! Holds accounts, roster/presence, conversations, messages and the PQ OMEMO2 key
 //! stores. Passwords and the OMEMO identity private key never touch SQLite; they are
-//! sealed in the platform secret service (libsecret) via [`secrets`].
+//! sealed in the platform secret service (libsecret) via [`secrets`]. The media caches are
+//! encrypted on disk via [`cache`].
 //!
 //! The pool is opened with `runtime-tokio` so it lives on the same tokio runtime that
 //! drives `mxc-proto`. The GTK side never touches the DB directly — it goes through the
@@ -14,9 +15,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
 /// Secret-service key (not account-specific) for the local SQLCipher database.
-const DB_KEY_ACCOUNT: &str = "@local";
+pub(crate) const DB_KEY_ACCOUNT: &str = "@local";
 
 pub mod accounts;
+pub mod cache;
 pub mod calls;
 pub mod feeds;
 pub mod roster;

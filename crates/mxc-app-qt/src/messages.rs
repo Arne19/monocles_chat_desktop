@@ -394,12 +394,7 @@ impl MessageItem {
             let tiles: Vec<serde_json::Value> = shared_files
                 .iter()
                 .map(|f| {
-                    let cached = crate::session::image_cache_path(&f.url);
-                    let path = if cached.is_file() {
-                        cached.to_string_lossy().into_owned()
-                    } else {
-                        String::new()
-                    };
+                    let path = crate::session::media_view(&f.url);
                     serde_json::json!({
                         "url": f.url, "name": f.name, "kind": f.kind(), "path": path,
                     })
@@ -422,8 +417,8 @@ impl MessageItem {
             // Rendered as an app card with an Open button (the QML checks the webxdc role).
             (String::new(), String::new(), String::new())
         } else if is_sticker_cid(&raw) {
-            match bob::cache_path(raw.trim()).filter(|p| p.is_file()) {
-                Some(p) => (String::new(), p.to_string_lossy().into_owned(), String::new()),
+            match bob::cache_path(raw.trim()).map(|p| crate::session::cache_view(&p)).filter(|p| !p.is_empty()) {
+                Some(p) => (String::new(), p, String::new()),
                 None => ("🙂 Sticker".to_string(), String::new(), String::new()),
             }
         } else if !auto_download {
@@ -437,11 +432,16 @@ impl MessageItem {
                 .or_else(|| other_file_url(&raw))
             {
                 Some(url) => {
-                    let cached = crate::session::image_cache_path(&url);
-                    if image_url(&url).is_some() && cached.is_file() {
-                        (caption.clone(), cached.to_string_lossy().into_owned(), String::new())
-                    } else if audio_url(&url).is_some() && cached.is_file() {
-                        (caption.clone(), String::new(), cached.to_string_lossy().into_owned())
+                    let is_media = image_url(&url).is_some() || audio_url(&url).is_some();
+                    let cached = if is_media {
+                        crate::session::media_view(&url)
+                    } else {
+                        String::new()
+                    };
+                    if image_url(&url).is_some() && !cached.is_empty() {
+                        (caption.clone(), cached, String::new())
+                    } else if audio_url(&url).is_some() && !cached.is_empty() {
+                        (caption.clone(), String::new(), cached)
                     } else {
                         // Not downloaded yet (or a non-media file): a typed download button.
                         file_name = file_type_label(&url);
@@ -455,15 +455,15 @@ impl MessageItem {
             // A shared image / large or animated sticker sent as an upload URL. Show it once the
             // background fetch has cached it (see session::prefetch_images), else a placeholder.
             // `caption` (empty for caption-less files) renders beneath the image.
-            match crate::session::image_cache_path(&url) {
-                p if p.is_file() => (caption.clone(), p.to_string_lossy().into_owned(), String::new()),
+            match crate::session::media_view(&url) {
+                p if !p.is_empty() => (caption.clone(), p, String::new()),
                 _ if caption.is_empty() => ("🖼 Loading image…".to_string(), String::new(), String::new()),
                 _ => (caption.clone(), String::new(), String::new()),
             }
         } else if let Some(url) = audio_url(&media_src) {
             // A voice message / shared audio file — rendered as an in-bubble player once cached.
-            match crate::session::image_cache_path(&url) {
-                p if p.is_file() => (caption.clone(), String::new(), p.to_string_lossy().into_owned()),
+            match crate::session::media_view(&url) {
+                p if !p.is_empty() => (caption.clone(), String::new(), p),
                 _ if caption.is_empty() => ("🎤 Voice message".to_string(), String::new(), String::new()),
                 _ => (caption.clone(), String::new(), String::new()),
             }

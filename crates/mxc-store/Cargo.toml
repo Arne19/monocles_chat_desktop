@@ -15,6 +15,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+# Media-cache encryption at rest (src/cache.rs).
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
 # Build SQLite as SQLCipher (encrypted DB at rest). Feature-unifies with sqlx's
 # libsqlite3-sys so the linked engine supports `PRAGMA key`. Links system OpenSSL.
 # Pinned to 0.37: sqlx 0.9 requires libsqlite3-sys >=0.30.1,<0.38, so they must share 0.37.x.

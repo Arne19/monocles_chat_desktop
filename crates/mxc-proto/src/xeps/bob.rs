@@ -92,7 +92,8 @@ pub fn cache_path(cid: &str) -> Option<std::path::PathBuf> {
     Some(cache_dir().join(hex))
 }
 
-fn cache_dir() -> std::path::PathBuf {
+/// The sticker cache directory (files in it are encrypted, see `mxc_store::cache`).
+pub fn cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
@@ -163,7 +164,7 @@ pub fn is_cached(cid: &str) -> bool {
     cache_path(cid).map(|p| p.exists()).unwrap_or(false)
 }
 
-/// Persist sticker `bytes` into the cache under `cid` (no-op if already present).
+/// Persist sticker `bytes` into the (encrypted) cache under `cid` (no-op if already present).
 pub fn save(cid: &str, bytes: &[u8]) -> std::io::Result<()> {
     let Some(path) = cache_path(cid) else {
         return Ok(());
@@ -171,10 +172,7 @@ pub fn save(cid: &str, bytes: &[u8]) -> std::io::Result<()> {
     if path.exists() {
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, bytes)
+    mxc_store::cache::write(&path, bytes)
 }
 
 #[cfg(test)]
