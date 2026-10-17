@@ -20,6 +20,11 @@
       <li>1:1 and group chats, reactions, replies, corrections, retraction and read markers</li>
       <li>Audio and video calls (XEP-0166/0353 Jingle over GStreamer WebRTC)</li>
       <li>Voice messages, stickers, encrypted file sharing, Stories and social Feeds</li>
+      <li>Message styling: bold, italic, strikethrough and code (XEP-0393)</li>
+      <li>WebXDC mini-apps shared in chats</li>
+      <li>Hardened connections: TLS 1.3 only by default, DNSSEC-verified server lookup and DANE certificate checks (can be enforced)</li>
+      <li>Protection against login downgrade attacks: channel binding and SCRAM downgrade protection (XEP-0440/0474), never PLAIN after SCRAM</li>
+      <li>Works offline: cached conversations and an outbox for messages written while offline</li>
     </ul>
   </description>
 
