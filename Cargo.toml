@@ -80,6 +80,10 @@ gstreamer = "0.25"
 gstreamer-webrtc = "0.25"
 gstreamer-sdp = "0.25"
 gstreamer-app = "0.25"
+# DTLS certificate for calls: an ECDSA P-256 self-signed cert, as browsers/libwebrtc use. GStreamer's
+# dtls generates RSA by default, and with that current libwebrtc fails against us whenever we're the
+# DTLS server (we placed the call) with "no shared cipher".
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 # --- misc ---
 anyhow = "1"

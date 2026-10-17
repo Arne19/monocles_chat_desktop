@@ -12,9 +12,14 @@ gstreamer-app.workspace = true
 async-channel.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
 # Screen sharing: xdg-desktop-portal ScreenCast (Wayland + X11) → a PipeWire fd we feed to
 # GStreamer's pipewiresrc. The `tokio` feature routes its D-Bus over our tokio runtime. As of
 # ashpd 0.13 each portal is its own feature, so the ScreenCast portal must be opted into
 # explicitly; no GUI/pipewire ashpd features are needed (we drive pipewiresrc ourselves from
 # the fd + node id).
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
+
+[dev-dependencies]
+base64.workspace = true

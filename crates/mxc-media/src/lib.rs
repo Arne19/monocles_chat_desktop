@@ -133,7 +133,6 @@ impl CallEngine {
         shared_camera: bool,
     ) -> Result<(Self, async_channel::Receiver<EngineEvent>, async_channel::Receiver<VideoFrame>)> {
         Self::init()?;
-        let (tx, rx) = async_channel::unbounded::<EngineEvent>();
         // Bounded so a slow UI drops frames rather than growing memory.
         let (vtx, vrx) = async_channel::bounded::<VideoFrame>(4);
 
@@ -164,6 +163,11 @@ impl CallEngine {
             // The AEC attempt waits only briefly so a failure falls back fast (the local audio
             // graph reaches Playing almost instantly); the plain attempt gets the full window.
             let wait_secs = if aec { 2 } else { 3 };
+            // Each attempt gets its own signalling channel: a discarded attempt's webrtcbin may
+            // already have created an offer (caller) + gathered ICE before it was torn down. On a
+            // shared channel that stale SDP — other ICE credentials, a transport that no longer
+            // exists — would reach the peer as a second session-initiate.
+            let (tx, rx) = async_channel::unbounded::<EngineEvent>();
             match build_and_play(&desc, role, &tx, vtx.clone(), wait_secs, shared_camera) {
                 Ok((pipeline, webrtc, _negotiated)) => {
                     tracing::info!(video, aec, shared_camera, "call pipeline started");
@@ -1013,6 +1017,106 @@ fn configure_ice(webrtc: &gst::Element, muji: bool) {
     }
 }
 
+/// Our DTLS identity: an ECDSA P-256 self-signed certificate. GStreamer otherwise generates an
+/// RSA-2048 cert, and with that, current libwebrtc (monocles Android, webrtc-android 149) as DTLS
+/// client fails against us as DTLS *server* (we placed the call: we offer `actpass`, it answers
+/// `active`) with OpenSSL "no shared cipher" — its ClientHello evidently has no RSA-authenticated
+/// suite. As DTLS client (we answered) the
+/// server's cert decides, which is why only outgoing calls broke. Generated once per process,
+/// like GStreamer's own default cert (its agent table caches one agent per distinct PEM, forever).
+struct DtlsIdentity {
+    /// Certificate + private key in one PEM, as `dtlsdec`'s `pem` / the transport's
+    /// `certificate` property expects.
+    pem: String,
+    /// `sha-256` fingerprint of the certificate DER, SDP-formatted (`AB:CD:…`).
+    fingerprint: String,
+}
+
+fn dtls_identity() -> Option<&'static DtlsIdentity> {
+    static ID: std::sync::OnceLock<Option<DtlsIdentity>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let gen = || -> Result<DtlsIdentity> {
+            use sha2::Digest as _;
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params.distinguished_name.push(rcgen::DnType::CommonName, "WebRTC");
+            let cert = params.self_signed(&key)?;
+            let fingerprint = sha2::Sha256::digest(cert.der())
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(":");
+            Ok(DtlsIdentity { pem: format!("{}{}", cert.pem(), key.serialize_pem()), fingerprint })
+        };
+        gen()
+            .inspect_err(|e| tracing::warn!(error = %e, "ECDSA DTLS cert generation failed — using GStreamer's RSA default"))
+            .ok()
+    })
+    .as_ref()
+}
+
+/// The DTLS transports of webrtcbin's sending transceivers (one per sink pad — every call
+/// pipeline sends on each transceiver it has).
+fn dtls_transports(webrtc: &gst::Element) -> Vec<gst_webrtc::WebRTCDTLSTransport> {
+    webrtc
+        .sink_pads()
+        .iter()
+        .filter_map(|pad| pad.property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver"))
+        .filter_map(|t| t.property::<Option<gst_webrtc::WebRTCRTPSender>>("sender"))
+        .filter_map(|s| s.property::<Option<gst_webrtc::WebRTCDTLSTransport>>("transport"))
+        .collect()
+}
+
+/// Put our ECDSA [`dtls_identity`] on a `dtlssrtpdec` webrtcbin has just added. This must happen
+/// while the element is still in NULL: setting `pem` rebuilds its DTLS connection, and dtlsdec only
+/// hooks its key / peer-certificate handlers onto the connection at NULL→READY (and the paired
+/// encoder fetches it then too). webrtcbin adds a transport's bins inside create-offer /
+/// create-answer and syncs their state right after, so `deep-element-added` is the window.
+fn install_dtls_cert(element: &gst::Element) {
+    let Some(id) = dtls_identity() else { return };
+    if element.factory().map(|f| f.name()).as_deref() != Some("dtlssrtpdec") {
+        return;
+    }
+    if element.current_state() != gst::State::Null {
+        tracing::warn!(element = %element.name(), "DTLS transport already running — keeping its default certificate");
+        return;
+    }
+    if element.property::<Option<String>>("pem").as_deref() != Some(id.pem.as_str()) {
+        element.set_property("pem", id.pem.as_str());
+    }
+}
+
+/// Rewrite the `a=fingerprint` lines of a local SDP to our certificate's real fingerprint when
+/// webrtcbin's transports carry our [`dtls_identity`]. Needed because webrtcbin (1.26) derives the
+/// fingerprint by base64-decoding *every* non-`-----` line of the transport's PEM — fine for its own
+/// cert-only PEM, but with a cert+key PEM it hashes the key too and advertises a fingerprint that
+/// matches nothing, so the peer would reject our certificate. With BUNDLE all m-lines share the one
+/// transport, so every fingerprint line is ours. Returns `None` when there's nothing to rewrite.
+fn fix_local_fingerprint(webrtc: &gst::Element, sdp: &str) -> Option<String> {
+    let id = dtls_identity()?;
+    let transports = dtls_transports(webrtc);
+    let ours = |t: &gst_webrtc::WebRTCDTLSTransport| {
+        t.property::<Option<String>>("certificate").as_deref() == Some(id.pem.as_str())
+    };
+    if transports.is_empty() || !transports.iter().all(ours) {
+        if transports.iter().any(ours) {
+            tracing::warn!("mixed DTLS certificates across transports — leaving fingerprints as-is");
+        }
+        return None;
+    }
+    let mut out = String::with_capacity(sdp.len());
+    for line in sdp.split_inclusive('\n') {
+        if line.starts_with("a=fingerprint:") {
+            let eol = if line.ends_with("\r\n") { "\r\n" } else if line.ends_with('\n') { "\n" } else { "" };
+            out.push_str(&format!("a=fingerprint:sha-256 {}{eol}", id.fingerprint));
+        } else {
+            out.push_str(line);
+        }
+    }
+    Some(out)
+}
+
 /// Parse a pipeline description, wire webrtcbin's signals, and bring it to `Playing`. Returns
 /// an error (after tearing the pipeline back down) if it can't reach `Playing`.
 fn build_and_play(
@@ -1031,6 +1135,11 @@ fn build_and_play(
     let negotiated = Arc::new(AtomicBool::new(false));
     // STUN (server-reflexive candidates) + TURN relays (XEP-0215) so ICE works behind NAT.
     configure_ice(&webrtc, muji);
+    // Our ECDSA DTLS certificate on every transport webrtcbin creates. They're created lazily
+    // (inside create-offer/-answer); deep-element-added also reports the children of an added bin.
+    if let Ok(bin) = webrtc.clone().dynamic_cast::<gst::Bin>() {
+        bin.connect_deep_element_added(|_, _, element| install_dtls_cert(element));
+    }
 
     // Surface GStreamer's async errors/warnings (otherwise pipeline failures during
     // negotiation are silent — there's no glib main loop on this thread to run a bus watch).
@@ -1220,6 +1329,15 @@ fn send_local_description(
     let Some(webrtc) = webrtc else { return };
     let Ok(Some(reply)) = reply else { return };
     let Ok(desc) = reply.get::<gst_webrtc::WebRTCSessionDescription>(field) else { return };
+    // Advertise our ECDSA certificate's real fingerprint (see `fix_local_fingerprint`).
+    let fixed = desc
+        .sdp()
+        .as_text()
+        .ok()
+        .and_then(|text| fix_local_fingerprint(&webrtc, &text))
+        .and_then(|text| gst_sdp::SDPMessage::parse_buffer(text.as_bytes()).ok())
+        .map(|msg| gst_webrtc::WebRTCSessionDescription::new(desc.type_(), msg));
+    let desc = fixed.unwrap_or(desc);
     webrtc.emit_by_name::<()>("set-local-description", &[&desc, &None::<gst::Promise>]);
     if let Ok(sdp) = desc.sdp().as_text() {
         tracing::debug!(?kind, renegotiation, "local description SDP:\n{sdp}");
@@ -1341,5 +1459,130 @@ mod tests {
             .unwrap_or_else(|e| panic!("video send bin failed to parse: {e}\n{desc}"))
             .upcast::<gst::Element>();
         assert_eq!(bin.src_pads().len(), 1, "expected one ghosted src pad on the video bin");
+    }
+
+    /// A caller's offer must advertise the fingerprint of our ECDSA certificate (not GStreamer's
+    /// RSA default) — otherwise the peer either can't negotiate a cipher with us as DTLS server or
+    /// rejects the certificate we present.
+    #[test]
+    fn caller_offer_uses_ecdsa_dtls_cert() {
+        use base64::Engine as _;
+        let _ = gst::init();
+        let pem = &dtls_identity().expect("ECDSA cert generated").pem;
+        let b64: String = pem
+            .lines()
+            .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("-----END CERTIFICATE"))
+            .collect();
+        let der = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let want = <sha2::Sha256 as sha2::Digest>::digest(&der)
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+
+        let desc = "audiotestsrc is-live=true ! opusenc ! rtpopuspay pt=111 ! \
+            application/x-rtp,media=audio,encoding-name=OPUS,payload=111 ! \
+            webrtcbin name=webrtc bundle-policy=max-bundle";
+        let (tx, rx) = async_channel::unbounded::<EngineEvent>();
+        let (vtx, _vrx) = async_channel::bounded::<VideoFrame>(4);
+        let (pipeline, _webrtc, _) = build_and_play(desc, Role::Caller, &tx, vtx, 3, false).unwrap();
+        let sdp = loop {
+            match rx.recv_blocking().unwrap() {
+                EngineEvent::LocalDescription { sdp, .. } => break sdp,
+                _ => continue,
+            }
+        };
+        let got = sdp
+            .lines()
+            .find_map(|l| l.strip_prefix("a=fingerprint:sha-256 "))
+            .expect("offer has a sha-256 fingerprint")
+            .trim()
+            .to_string();
+        let _ = pipeline.set_state(gst::State::Null);
+        assert_eq!(got, want, "offer fingerprint must be our ECDSA cert's");
+    }
+
+    /// End to end over loopback: we place the call (so we're the DTLS server with the swapped-in
+    /// ECDSA cert), the handshake completes, and the callee sees exactly the certificate whose
+    /// fingerprint we advertised. Guards the connection rebuild that setting the cert triggers.
+    #[test]
+    fn loopback_call_handshakes_with_ecdsa_cert() {
+        let _ = gst::init();
+        let id = dtls_identity().expect("ECDSA cert generated");
+        let desc = "audiotestsrc is-live=true ! opusenc ! rtpopuspay pt=111 ! \
+            application/x-rtp,media=audio,encoding-name=OPUS,payload=111 ! \
+            webrtcbin name=webrtc bundle-policy=max-bundle";
+        let (ctx, crx) = async_channel::unbounded::<EngineEvent>();
+        let (etx, erx) = async_channel::unbounded::<EngineEvent>();
+        let (vtx, _vrx) = async_channel::bounded::<VideoFrame>(4);
+        let (cp, caller, _) = build_and_play(desc, Role::Caller, &ctx, vtx.clone(), 3, false).unwrap();
+        let (ep, callee, _) = build_and_play(desc, Role::Callee, &etx, vtx, 3, false).unwrap();
+        let set_remote = |w: &gst::Element, ty, sdp: &str| {
+            let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
+            w.emit_by_name::<()>(
+                "set-remote-description",
+                &[&gst_webrtc::WebRTCSessionDescription::new(ty, msg), &None::<gst::Promise>],
+            );
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let (mut offer_fp, mut answer_fp) = (None, None);
+        let connected = loop {
+            assert!(std::time::Instant::now() < deadline, "DTLS did not connect");
+            while let Ok(ev) = crx.try_recv() {
+                match ev {
+                    EngineEvent::LocalDescription { sdp, .. } => {
+                        offer_fp = sdp.lines().find_map(|l| l.strip_prefix("a=fingerprint:sha-256 ")).map(str::to_string);
+                        set_remote(&callee, gst_webrtc::WebRTCSDPType::Offer, &sdp);
+                        create_answer(&callee, etx.clone(), false);
+                    }
+                    EngineEvent::IceCandidate { mline_index, candidate } => {
+                        callee.emit_by_name::<()>("add-ice-candidate", &[&mline_index, &candidate]);
+                    }
+                    _ => {}
+                }
+            }
+            while let Ok(ev) = erx.try_recv() {
+                match ev {
+                    EngineEvent::LocalDescription { sdp, .. } => {
+                        answer_fp = sdp.lines().find_map(|l| l.strip_prefix("a=fingerprint:sha-256 ")).map(str::to_string);
+                        set_remote(&caller, gst_webrtc::WebRTCSDPType::Answer, &sdp)
+                    }
+                    EngineEvent::IceCandidate { mline_index, candidate } => {
+                        caller.emit_by_name::<()>("add-ice-candidate", &[&mline_index, &candidate]);
+                    }
+                    _ => {}
+                }
+            }
+            let up = |w: &gst::Element| {
+                dtls_transports(w).first().map(|t| {
+                    t.property::<gst_webrtc::WebRTCDTLSTransportState>("state")
+                        == gst_webrtc::WebRTCDTLSTransportState::Connected
+                }) == Some(true)
+            };
+            if up(&caller) && up(&callee) {
+                break dtls_transports(&callee)[0].property::<Option<String>>("remote-certificate");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let _ = cp.set_state(gst::State::Null);
+        let _ = ep.set_state(gst::State::Null);
+
+        // GStreamer doesn't check the peer's fingerprint, so the handshake alone can't catch a
+        // wrong one — both sides' SDPs must carry our certificate's real fingerprint (incoming
+        // calls rely on the answer's being right, outgoing on the offer's).
+        assert_eq!(offer_fp.as_deref(), Some(id.fingerprint.as_str()), "offer fingerprint");
+        assert_eq!(answer_fp.as_deref(), Some(id.fingerprint.as_str()), "answer fingerprint");
+        // The callee received our ECDSA cert (the same one the PEM holds).
+        let remote = connected.expect("callee saw a peer certificate");
+        let cert_block = |pem: &str| -> String {
+            pem.lines()
+                .skip_while(|l| !l.starts_with("-----BEGIN CERTIFICATE"))
+                .take_while(|l| !l.starts_with("-----END CERTIFICATE"))
+                .collect()
+        };
+        assert_eq!(cert_block(&remote), cert_block(&id.pem));
     }
 }

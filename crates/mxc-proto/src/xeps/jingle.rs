@@ -622,9 +622,16 @@ fn start_call(
     tokio::task::spawn_local(async move {
         let (mut ufrag, mut pwd, mut mid) = (String::new(), String::new(), "0".to_string());
         let peer_bare = bare(&peer_full).to_string();
+        // One initial offer/answer per session: a second one would carry different ICE
+        // credentials / DTLS certificate than what the peer already bound to.
+        let mut sent_initial = false;
         while let Ok(ev) = rx.recv().await {
             match ev {
                 mxc_media::EngineEvent::LocalDescription { kind, sdp, renegotiation } => {
+                    if !renegotiation && std::mem::replace(&mut sent_initial, true) {
+                        tracing::warn!(%sid, "dropping duplicate initial local description");
+                        continue;
+                    }
                     let (u, p, m) = local_transport(&sdp);
                     ufrag = u;
                     pwd = p;
@@ -816,7 +823,7 @@ pub async fn handle_message(
     events: &Sender<Event>,
     msg: &Element,
 ) -> bool {
-    let actions = ["propose", "proceed", "reject", "retract", "accept", "finish"];
+    let actions = ["propose", "ringing", "proceed", "reject", "retract", "accept", "finish"];
     let Some(el) = msg.children().find(|c| c.ns() == NS_JMI && actions.contains(&c.name())) else {
         return false;
     };
@@ -849,6 +856,29 @@ pub async fn handle_message(
                 ts: now(),
             });
             emit(events, cfg.account_id, &sid, &peer_bare, video, CallState::Incoming).await;
+            // Tell the caller we're ringing (XEP-0353 `ringing`, to its full JID). Android shows
+            // "Discovering devices" until a callee device rings and, for contacts it shares
+            // presence with, gives up after ~6 s without one. Like Android, only answer callers
+            // in our roster (or our own account) — `ringing` reveals that we're online.
+            let store = calls.borrow().store.clone();
+            let known = peer_bare.eq_ignore_ascii_case(cfg.bare())
+                || matches!(
+                    store.roster_item(cfg.account_id, &peer_bare).await,
+                    Ok(Some(item)) if item.subscription != "remove"
+                );
+            if known {
+                if let Err(e) = w.send(jmi(&from, "ringing", &sid)) {
+                    tracing::warn!(error = %e, %sid, "send JMI ringing");
+                }
+            } else {
+                tracing::debug!(%sid, %from, "caller not in roster — not sending JMI ringing");
+            }
+        }
+        "ringing" => {
+            // The peer's device is ringing for a call we placed; it answers with proceed/reject.
+            if jmi_from_peer(calls, &sid, &from) && calls.borrow().proposed.contains_key(&sid) {
+                tracing::debug!(%sid, %from, "peer is ringing");
+            }
         }
         "proceed" => {
             if !jmi_from_peer(calls, &sid, &from) {
