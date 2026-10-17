@@ -2830,7 +2830,10 @@ ApplicationWindow {
 
                                         Label {
                                             id: bubbleText
-                                            textFormat: Text.PlainText
+                                            // XEP-0393 styling: `bodyHtml` is escaped rich text
+                                            // built in Rust (only <b>/<i>/<s>/<code>, no links or
+                                            // images); empty when nothing is styled.
+                                            textFormat: model.bodyHtml.length > 0 ? Text.RichText : Text.PlainText
                                             visible: model.body.length > 0
                                             // A caption wraps to the width of the media above it
                                             // (image / audio / file) so it never stretches the
@@ -2843,7 +2846,7 @@ ApplicationWindow {
                                                 : fileRow.visible && fileRow.width > 0 ? Math.max(fileRow.width, 140)
                                                 : msgDelegate.maxw
                                             width: Math.min(implicitWidth, captionCap, msgDelegate.maxw)
-                                            text: model.body
+                                            text: model.bodyHtml.length > 0 ? model.bodyHtml : model.body
                                             color: "white"
                                             // Retracted messages render as a dimmed tombstone.
                                             font.italic: model.retracted
@@ -4323,7 +4326,7 @@ ApplicationWindow {
                 }
                 Label {
                     textFormat: Text.PlainText
-                    text: "© 2020–2026 Arne-Brün Vogelsang"
+                    text: "© 2020–2026 Arne-Brün Vogelsang and contributors"
                     Layout.alignment: Qt.AlignHCenter
                     font.pixelSize: 12
                     opacity: 0.6
@@ -4333,7 +4336,7 @@ ApplicationWindow {
                 Label {
                     textFormat: Text.RichText
                     text: "<a href=\"https://monocles.eu/more/\">" + qsTr("Website") + "</a> · " +
-                          "<a href=\"https://codeberg.org/monocles/monocles_chat_desktop\">" + qsTr("Source code") + "</a> · " +
+                          "<a href=\"https://github.com/Arne19/monocles_chat_desktop\">" + qsTr("Source code") + "</a> · " +
                           "<a href=\"https://monocles.eu/legal-privacy/#policies-section\">" + qsTr("Privacy policy") + "</a>"
                     linkColor: Material.accent
                     onLinkActivated: link => Qt.openUrlExternally(link)
@@ -4350,7 +4353,7 @@ ApplicationWindow {
                 }
                 Label {
                     textFormat: Text.PlainText
-                    text: qsTr("This application is licensed under the GNU GPL v3 or later. It bundles the AGPLv3 libsignal library, so the combined work is distributed under the terms of the GNU AGPL v3.")
+                    text: qsTr("This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License version 3 only (AGPL-3.0-only), as published by the Free Software Foundation. It bundles the libsignal library, which is licensed under AGPL-3.0-only, so the combined work is distributed under the terms of the AGPLv3, including its requirement to make the complete corresponding source code available to its users. This program is distributed WITHOUT ANY WARRANTY; see the GNU Affero General Public License for details: https://www.gnu.org/licenses/agpl-3.0.html")
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
                     font.pixelSize: 12
@@ -4365,11 +4368,12 @@ ApplicationWindow {
                 }
                 Label {
                     textFormat: Text.RichText
-                    text: "<b>libsignal</b> — © Signal Messenger, LLC · AGPLv3<br>" +
+                    text: "<b>libsignal</b> — © Signal Messenger, LLC · AGPL-3.0-only<br>" +
                           qsTr("PQ OMEMO2 / PQXDH cryptography") +
                           " · <a href=\"https://codeberg.org/monocles/pq-omemo-2\">codeberg.org/monocles/pq-omemo-2</a><br><br>" +
                           "<b>Qt</b> — © The Qt Company Ltd. and contributors · LGPLv3<br><br>" +
-                          "<b>GStreamer</b> — © The GStreamer contributors · LGPL 2.1"
+                          "<b>GStreamer</b> — © The GStreamer contributors · LGPL 2.1<br><br>" +
+                          "<b>libnice</b> — © The libnice contributors · LGPL 2.1 or later (patched)"
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
                     font.pixelSize: 12
@@ -4504,6 +4508,68 @@ ApplicationWindow {
                 valueRole: "path"
                 model: settingsDialog.cameraOptions
                 onActivated: backend.selectPreferredCamera(currentValue)
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.topMargin: 6
+                implicitHeight: 1
+                color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
+            }
+            // --- Connection security (as on monocles Android; read on every connection) ---
+            Label {
+                textFormat: Text.PlainText
+                text: qsTr("Connection security")
+                font.bold: true
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 1
+                    Label { textFormat: Text.PlainText; text: qsTr("Require TLS 1.3"); font.pixelSize: 13 }
+                    Label {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        text: qsTr("Require TLS 1.3 for all connections")
+                        wrapMode: Text.Wrap
+                        opacity: 0.6
+                        font.pixelSize: 11
+                    }
+                }
+                Switch {
+                    checked: backend.requireTls13
+                    onToggled: backend.changeRequireTls13(checked)
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 1
+                    Label { textFormat: Text.PlainText; text: qsTr("Enforce DANE"); font.pixelSize: 13 }
+                    Label {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        text: qsTr("Only connect if the server is verified via DANE")
+                        wrapMode: Text.Wrap
+                        opacity: 0.6
+                        font.pixelSize: 11
+                    }
+                }
+                Switch {
+                    checked: backend.enforceDane
+                    onToggled: backend.changeEnforceDane(checked)
+                }
+            }
+            Label {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: qsTr("Changes apply to the next connection.")
+                wrapMode: Text.Wrap
+                opacity: 0.6
+                font.pixelSize: 11
             }
             Rectangle {
                 Layout.fillWidth: true
@@ -5622,6 +5688,16 @@ ApplicationWindow {
             ColumnLayout {
             width: ownKeysScroll.availableWidth
             spacing: 10
+            // How the connection to the server is secured (DNSSEC / DANE / TLS version).
+            Label {
+                textFormat: Text.PlainText
+                visible: backend.linkSecurity.length > 0
+                Layout.fillWidth: true
+                text: backend.linkSecurity
+                wrapMode: Text.Wrap
+                opacity: 0.7
+                font.pixelSize: 11
+            }
             // Who we are: click the avatar (or the camera chip) to publish a new photo.
             RowLayout {
                 Layout.fillWidth: true

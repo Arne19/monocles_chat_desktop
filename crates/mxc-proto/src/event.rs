@@ -85,8 +85,9 @@ pub struct ConfParticipant {
 #[derive(Debug, Clone)]
 pub enum ConnectionState {
     Connecting,
-    /// Authenticated + resource bound; carries the full JID.
-    Online { full_jid: String },
+    /// Authenticated + resource bound; carries the full JID and how the link was secured
+    /// (DNSSEC / DANE / TLS 1.3).
+    Online { full_jid: String, security: crate::connect::LinkSecurity },
     Disconnected { reason: String },
 }
 

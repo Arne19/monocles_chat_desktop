@@ -93,6 +93,7 @@ pub async fn send_message(
             occupant_id: None,
             timestamp: now,
             thread: None,
+            unstyled: false,
         },
         false,
         /*live=*/ true,
@@ -738,6 +739,7 @@ async fn persist_file_message(
             occupant_id: None,
             timestamp: now,
             thread: None,
+            unstyled: false,
         },
         false,
         /*live=*/ true,
@@ -818,6 +820,7 @@ pub async fn send_sticker(
             occupant_id: None,
             timestamp: now,
             thread: None,
+            unstyled: false,
         },
         false,
         /*live=*/ true,
@@ -956,6 +959,7 @@ pub async fn send_webxdc_file(
             occupant_id: None,
             timestamp: now,
             thread: Some(thread),
+            unstyled: false,
         },
         false, /*live=*/ true, /*mentioned=*/ false, /*reply_to_me=*/ false,
     ).await?;
@@ -1049,6 +1053,7 @@ pub async fn send_webxdc_update(
                 occupant_id: None,
                 timestamp: now,
                 thread: Some(thread.to_string()),
+                unstyled: false,
             },
             false, /*live=*/ true, /*mentioned=*/ false, /*reply_to_me=*/ false,
         ).await?;
@@ -1397,6 +1402,7 @@ async fn persist_decrypt_failure(
         occupant_id,
         timestamp: ts.to_string(),
         thread: None,
+        unstyled: false,
     };
     if let Err(e) = persist_and_emit(
         store, cfg, events, conv, row,
@@ -1793,6 +1799,13 @@ async fn process_payload(
 
     // XEP-0424 retraction. Only the original sender may retract (find_from_sender).
     if let Some(retract) = content.get_child("retract", NS_RETRACT) {
+        // A retraction claiming to be a XEP-0425 moderation that didn't come from the room
+        // itself (those were consumed above) is forged and MUST be discarded - not treated as
+        // the sender's own retraction.
+        if retract.get_child("moderated", super::moderation::NS_MODERATE).is_some() {
+            tracing::debug!(%from, "discarding a moderation not sent by the room");
+            return Ok(());
+        }
         if let Some(target) = retract.attr("id") {
             let mid = match sender_filter(kind, own_side, occupant_id.as_deref()) {
                 // Like corrections: an encrypted message can only be retracted under the
@@ -2028,6 +2041,8 @@ async fn process_payload(
             occupant_id,
             timestamp: ts,
             thread: content.get_child("thread", NS_CLIENT).map(|t| t.text()).filter(|s| !s.is_empty()),
+            // XEP-0393: from the SCE content for OMEMO2, else from the stanza itself
+            unstyled: content.get_child("unstyled", crate::xeps::styling::NS_STYLING).is_some(),
         },
         /*bump_unread=*/ direction == Direction::In && live,
         live,
@@ -2359,6 +2374,9 @@ async fn persist_and_emit(
         // attach it now so the row fetched + emitted below already carries it.
         if let Some(att) = &msg.attachment {
             store.set_attachment(id, att).await.ok();
+        }
+        if msg.unstyled {
+            store.set_unstyled(id).await.ok();
         }
         if bump_unread {
             store.bump_unread(conv).await.ok();

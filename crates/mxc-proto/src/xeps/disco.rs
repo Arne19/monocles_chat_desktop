@@ -46,6 +46,7 @@ pub const FEATURES: &[&str] = &[
     "urn:xmpp:receipts",                            // XEP-0184
     "urn:xmpp:reply:0",                             // XEP-0461
     "urn:xmpp:sid:0",                               // XEP-0359 stanza/origin id
+    "urn:xmpp:styling:0",                           // XEP-0393 message styling
 ];
 
 /// Build the `<query xmlns=disco#info>` reply body for our client.

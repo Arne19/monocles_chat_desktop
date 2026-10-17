@@ -41,6 +41,8 @@ pub struct MessageRow {
     pub moderated: bool,
     /// XEP-0425: the moderator's reason, if one was given.
     pub moderation_reason: Option<String>,
+    /// XEP-0393: the sender asked for the body not to be styled.
+    pub unstyled: bool,
 }
 
 /// One full-text search hit: a message joined with its conversation, for the chats-list
@@ -94,6 +96,9 @@ pub struct NewMessage {
     pub timestamp: String,
     /// XEP-7397 thread id — set for WebXDC `.xdc` app messages (the instance key).
     pub thread: Option<String>,
+    /// XEP-0393 `<unstyled/>`. Like `attachment`, not part of the INSERT; persist_and_emit
+    /// sets it right after.
+    pub unstyled: bool,
 }
 
 impl Store {
@@ -213,7 +218,7 @@ impl Store {
         let mut rows = sqlx::query_as::<_, MessageRow>(
             r#"SELECT id, conversation_id, stanza_id, origin_id, counterpart, direction,
                       body, encryption, state, edited_of, retracted, attachment, reply_to,
-                      omemo_fingerprint, timestamp, thread, moderated, moderation_reason
+                      omemo_fingerprint, timestamp, thread, moderated, moderation_reason, unstyled
                FROM messages WHERE conversation_id = ?1
                ORDER BY timestamp DESC, id DESC LIMIT ?2"#,
         )
@@ -382,6 +387,7 @@ impl Store {
             occupant_id: None,
             timestamp: timestamp.to_string(),
             thread: None,
+            unstyled: false,
         };
         // Dedup-aware: if this id already exists (e.g. a retry), don't double-insert.
         if self.insert_message(&msg).await?.is_none() {
@@ -401,7 +407,7 @@ impl Store {
         let row = sqlx::query_as::<_, MessageRow>(
             r#"SELECT id, conversation_id, stanza_id, origin_id, counterpart, direction,
                       body, encryption, state, edited_of, retracted, attachment, reply_to,
-                      omemo_fingerprint, timestamp, thread, moderated, moderation_reason
+                      omemo_fingerprint, timestamp, thread, moderated, moderation_reason, unstyled
                FROM messages
                WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2)
                ORDER BY id DESC LIMIT 1"#,
@@ -660,6 +666,15 @@ impl Store {
     }
 
     /// Attach XEP-0066/0363 media metadata JSON to a message.
+    /// XEP-0393: mark a message whose sender asked for it not to be styled.
+    pub async fn set_unstyled(&self, message_id: i64) -> Result<()> {
+        sqlx::query("UPDATE messages SET unstyled = 1 WHERE id = ?1")
+            .bind(message_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_attachment(&self, message_id: i64, attachment_json: &str) -> Result<()> {
         sqlx::query!(
             "UPDATE messages SET attachment = ?1 WHERE id = ?2",
@@ -1265,6 +1280,7 @@ mod sender_auth_tests {
             occupant_id: occ.map(str::to_string),
             timestamp: "2026-10-04T00:00:00Z".into(),
             thread: None,
+            unstyled: false,
         }
     }
 

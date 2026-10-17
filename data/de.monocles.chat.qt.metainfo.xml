@@ -2,7 +2,7 @@
 <component type="desktop-application">
   <id>de.monocles.chat.qt</id>
   <metadata_license>CC0-1.0</metadata_license>
-  <project_license>GPL-3.0-or-later</project_license>
+  <project_license>AGPL-3.0-only</project_license>
 
   <name>monocles chat</name>
   <summary>Encrypted XMPP messaging with post-quantum PQ OMEMO2</summary>
@@ -29,7 +29,7 @@
     <name>monocles</name>
   </developer>
 
-  <url type="homepage">https://codeberg.org/monocles/monocles-chat-desktop</url>
+  <url type="homepage">https://github.com/Arne19/monocles_chat_desktop</url>
 
   <content_rating type="oars-1.1">
     <content_attribute id="social-chat">intense</content_attribute>

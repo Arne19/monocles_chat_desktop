@@ -1458,7 +1458,7 @@ pub(crate) fn media_view(url: &str) -> String {
 
 /// Manual login (from the login form): persist the credentials, then connect.
 pub fn start(jid: String, password: String, qt: CxxQtThread<Backend>) {
-    runtime().spawn(run_session(jid, password, qt));
+    runtime().spawn(run_session(jid, password, qt, true));
 }
 
 /// Startup auto-login: reconnect the first enabled account whose password is sealed in the
@@ -1471,14 +1471,15 @@ pub fn try_autologin(qt: CxxQtThread<Backend>) {
             mxc_store::secrets::retrieve(mxc_store::secrets::kinds::PASSWORD, &account.jid).await;
         let Ok(Some(bytes)) = secret else { return };
         let Ok(password) = String::from_utf8(bytes) else { return };
-        run_session(account.jid, password, qt).await;
+        run_session(account.jid, password, qt, false).await;
     });
 }
 
 /// Open the store, ensure + persist the account, spawn the core and pump events into the QObject.
 /// The password is sealed in the OS secret service (Linux Secret Service / macOS Keychain /
 /// Windows Credential Manager, via `mxc-store`) so the next launch can auto-login.
-async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
+/// `manual`: the user typed the password (login form), as opposed to auto-login.
+async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, manual: bool) {
     // Publish the account JID up front so QML can switch to the shell on auto-login.
     let jid_for_qt = jid.clone();
     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
@@ -1496,6 +1497,11 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
         Err(e) => return backend_update(&qt, &format!("Account error: {e}"), false),
     };
     let _ = store.set_account_enabled(account_id, true).await;
+    if manual {
+        // Typing the password again resets the XEP-0474 SASL pin, so a server whose mechanism
+        // list changed legitimately (without downgrade protection) can be used again.
+        let _ = store.set_sasl_pin(account_id, -1).await;
+    }
     load_local_state(store, account_id).await;
 
     // Seal the password for next-launch auto-login (idempotent; references used before move).
@@ -1611,6 +1617,21 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
             });
         }
 
+        // Connection security switches: apply the saved choice.
+        {
+            let qt = qt.clone();
+            runtime().spawn(async move {
+                let policy = match crate::session::store().await {
+                    Ok(s) => mxc_proto::connect::TlsPolicy::load(&s).await,
+                    Err(_) => mxc_proto::connect::TlsPolicy::default(),
+                };
+                let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                    backend.as_mut().set_require_tls13(policy.require_tls13);
+                    backend.as_mut().set_enforce_dane(policy.enforce_dane);
+                });
+            });
+        }
+
         // Chat background: apply the saved choice (mode + custom image path).
         {
             let qt = qt.clone();
@@ -1651,11 +1672,16 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>) {
         while let Ok(event) = handle.events.recv().await {
             match event {
                 Event::Connection(state) => match state {
-                    ConnectionState::Connecting => backend_update(&qt, "Connecting…", false),
-                    ConnectionState::Online { full_jid } => {
+                    ConnectionState::Connecting => {
+                        set_link_security(&qt, String::new());
+                        backend_update(&qt, "Connecting…", false)
+                    }
+                    ConnectionState::Online { full_jid, security } => {
+                        set_link_security(&qt, link_security_text(&security));
                         backend_update(&qt, &format!("Online as {full_jid}"), true)
                     }
                     ConnectionState::Disconnected { reason } => {
+                        set_link_security(&qt, String::new());
                         backend_update(&qt, &format!("Disconnected: {reason}"), false)
                     }
                 },
@@ -2239,6 +2265,14 @@ pub fn dismiss_support_room() {
         let Ok(store) = store().await else { return };
         let Some(account_id) = account_id else { return };
         let _ = store.dismiss_support_room(account_id).await;
+    });
+}
+
+/// Persist an app-wide on/off setting ("1" / "0"), e.g. the connection security switches.
+pub fn set_flag_setting(key: &'static str, value: bool) {
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let _ = store.set_setting(key, if value { "1" } else { "0" }).await;
     });
 }
 
@@ -3043,4 +3077,23 @@ mod received_file_tests {
             assert!(!safe_to_open(&format!("/home/u/Downloads/{bad}")), "{bad}");
         }
     }
+}
+
+/// The connection's security as shown in the profile dialog (Android's wording).
+fn link_security_text(security: &mxc_proto::connect::LinkSecurity) -> String {
+    let dns = if security.dnssec && security.dane {
+        "DNSSEC + DANE verified"
+    } else if security.dnssec {
+        "DNSSEC verified"
+    } else {
+        "Not DNSSEC verified"
+    };
+    let tls = if security.tls13 { "TLS 1.3" } else { "TLS 1.2" };
+    format!("{dns} · {tls}")
+}
+
+fn set_link_security(qt: &CxxQtThread<Backend>, text: String) {
+    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+        backend.as_mut().set_link_security(QString::from(&text));
+    });
 }

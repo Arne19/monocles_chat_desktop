@@ -78,6 +78,25 @@ impl Store {
         Ok(())
     }
 
+    /// XEP-0474: priority of the strongest SASL mechanism used for the account so far (-1: none).
+    pub async fn sasl_pin(&self, account_id: i64) -> Result<i32> {
+        let pin: Option<i64> = sqlx::query_scalar("SELECT sasl_pin FROM accounts WHERE id = ?1")
+            .bind(account_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(pin.unwrap_or(-1) as i32)
+    }
+
+    /// Record the SASL pin; `-1` resets it (when the user re-enters the password).
+    pub async fn set_sasl_pin(&self, account_id: i64, pin: i32) -> Result<()> {
+        sqlx::query("UPDATE accounts SET sasl_pin = ?1 WHERE id = ?2")
+            .bind(pin as i64)
+            .bind(account_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     /// The first enabled account that has a stored secret (for auto-login on startup).
     pub async fn autologin_account(&self) -> Result<Option<Account>> {
         let acc = sqlx::query_as::<_, Account>(

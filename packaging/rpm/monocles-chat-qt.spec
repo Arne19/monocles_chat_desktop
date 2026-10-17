@@ -21,8 +21,8 @@ Version:        %{appversion}
 Release:        1%{?dist}
 Summary:        Encrypted XMPP desktop client with post-quantum PQ OMEMO2 (Qt)
 
-License:        GPL-3.0-or-later
-URL:            https://codeberg.org/monocles/monocles-chat-desktop
+License:        AGPL-3.0-only
+URL:            https://github.com/Arne19/monocles_chat_desktop
 
 Source0:        monocles-chat-qt
 Source1:        de.monocles.chat.qt.desktop

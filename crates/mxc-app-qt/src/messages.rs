@@ -41,6 +41,7 @@ const ROLE_FILE_URL: i32 = 276;
 const ROLE_FILE_NAME: i32 = 277;
 const ROLE_ATTACHMENTS: i32 = 278;
 const ROLE_STANZA_ID: i32 = 279;
+const ROLE_BODY_HTML: i32 = 280;
 
 /// One message row, resolved for display.
 #[derive(Clone, Default, PartialEq)]
@@ -93,6 +94,9 @@ pub struct MessageItem {
     /// The archive-assigned XEP-0359 stanza-id (the room's, in a MUC), or empty — the target
     /// of a XEP-0425 moderation.
     pub stanza_id: String,
+    /// XEP-0393 styled `body` as escaped Qt rich text, or empty when nothing is styled (or the
+    /// sender sent `<unstyled/>`): then `body` renders as plain text.
+    pub body_html: String,
 }
 
 /// How a reloaded message list lines up with the shown one: `old[old_start..][..overlap]` are
@@ -480,8 +484,15 @@ impl MessageItem {
         } else {
             (raw, String::new(), String::new())
         };
+        // Only the sender's own text is styled - never our placeholders or tombstones.
+        let body_html = if m.retracted || m.moderated || m.unstyled {
+            String::new()
+        } else {
+            mxc_proto::xeps::styling::to_html(&body).unwrap_or_default()
+        };
         Self {
             id: m.id,
+            body_html,
             body,
             image_path,
             outgoing: m.direction == "out",
@@ -931,6 +942,7 @@ impl qobject::MessageModel {
             ROLE_FILE_NAME => QVariant::from(&QString::from(item.file_name.as_str())),
             ROLE_ATTACHMENTS => QVariant::from(&QString::from(item.attachments.as_str())),
             ROLE_STANZA_ID => QVariant::from(&QString::from(item.stanza_id.as_str())),
+            ROLE_BODY_HTML => QVariant::from(&QString::from(item.body_html.as_str())),
             _ => QVariant::default(),
         }
     }
@@ -977,6 +989,7 @@ impl qobject::MessageModel {
         roles.insert(ROLE_FILE_NAME, QByteArray::from("fileName"));
         roles.insert(ROLE_ATTACHMENTS, QByteArray::from("attachments"));
         roles.insert(ROLE_STANZA_ID, QByteArray::from("stanzaId"));
+        roles.insert(ROLE_BODY_HTML, QByteArray::from("bodyHtml"));
         roles
     }
 }

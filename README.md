@@ -13,6 +13,10 @@ monocles clients, for byte-level interop with monocles chat for Android.
 - **Stories** (social feed over PEP), **stickers**, voice messages, file transfer
 - **WebXDC mini-apps** (QtWebEngine) with realtime/status-update sync
 - Offline support: cached conversations on startup, outbox for messages sent while offline
+- Hardened connections: **DNSSEC**-validated server lookup, **DANE** certificate checks
+  (optionally enforced), **TLS 1.3 only** by default, channel binding and SCRAM downgrade
+  protection (XEP-0440 / XEP-0474), never PLAIN after SCRAM
+- **Message styling** (XEP-0393): `*bold*`, `_italic_`, `~strike~`, monospace and code blocks
 
 ## Architecture
 
@@ -145,5 +149,18 @@ Each packaging directory has a README with details and known gaps.
 
 ## License
 
-GPL-3.0-or-later. Bundles [libsignal](https://codeberg.org/monocles/pq-omemo-2) (AGPL-3.0;
-monocles `pq-omemo-2` fork of [signalapp/libsignal](https://github.com/signalapp/libsignal)).
+monocles chat desktop is free software, licensed under the [GNU Affero General Public License
+version 3 only](LICENSE) (AGPL-3.0-only).
+
+It bundles [libsignal](https://codeberg.org/monocles/pq-omemo-2) (Copyright © Signal Messenger,
+LLC; the monocles `pq-omemo-2` fork of [signalapp/libsignal](https://github.com/signalapp/libsignal)),
+which is licensed under AGPL-3.0-only, so the application as a whole is distributed under the
+terms of the AGPLv3, version 3 only. That includes the requirement to make the complete
+corresponding source code available to its users. Other bundled components: Qt (LGPLv3),
+GStreamer (LGPL-2.1) and a patched libnice (LGPL-2.1-or-later).
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See
+the [LICENSE](LICENSE) file for details.
+
+Copyright © 2020-2026 Arne-Brün Vogelsang and contributors

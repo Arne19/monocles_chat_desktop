@@ -24,7 +24,6 @@
 //! `xso::transform`. This module is the single place to reconcile if the pin differs.
 
 use async_channel::{Receiver, Sender};
-use futures_util::StreamExt;
 use minidom::Element;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -139,7 +138,7 @@ impl CoreActor {
         cfg: AccountConfig,
         commands: Receiver<Command>,
     ) -> anyhow::Result<()> {
-        use tokio_xmpp::{Client as XmppClient, Event as XmppEvent};
+        use crate::session::{LoginNotice, Session, SessionEvent};
 
         let _ = self.events.send(Event::Connection(ConnectionState::Connecting)).await;
 
@@ -151,8 +150,8 @@ impl CoreActor {
             .jid
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid jid {}: {e}", cfg.jid))?;
-        // Prefer XEP-0368 direct TLS on 5223 (works through firewalls that block STARTTLS
-        // 5222), falling back to STARTTLS automatically. See [`crate::directtls`].
+        // Prefer XEP-0368 direct TLS (works through firewalls that block STARTTLS on 5222),
+        // falling back to STARTTLS automatically. See [`crate::connect`].
         // A reconnecting client factory. tokio-xmpp's `set_reconnect` only re-establishes an
         // *already-online* session — it does NOT retry a failed initial connect (e.g. starting
         // offline). So we drive reconnection ourselves and keep this loop alive throughout,
@@ -162,12 +161,25 @@ impl CoreActor {
         // `new_with_connector(jid, password, connector, timeouts)`; the StanzaStream reconnects
         // on its own. We keep the outer self-driven reconnect loop below as a belt-and-braces
         // rebuild path (also covers a fully failed initial connect).
+        // Login goes through our own SASL step (XEP-0440/0474 rules, PLAIN never after SCRAM,
+        // SCRAM server signature verified) instead of tokio-xmpp's; see [`crate::sasl_auth`].
+        // `pinned` is the strongest mechanism used for this account so far.
+        let pinned = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(
+            self.store.sasl_pin(cfg.account_id).await.unwrap_or(-1),
+        ));
+        let (login_tx, mut login_rx) = mpsc::unbounded_channel::<LoginNotice>();
+        // DNSSEC-validated resolution, DANE and the TLS 1.3-only setting (see [`crate::connect`]);
+        // `link` reports how the current connection was secured.
+        let link = std::sync::Arc::new(std::sync::Mutex::new(crate::connect::LinkSecurity::default()));
+        let connector = crate::connect::SecureConnector::new(self.store.clone(), link.clone());
         let make_client = || {
-            XmppClient::new_with_connector(
+            Session::new(
                 jid.clone(),
-                cfg.password(),
-                crate::directtls::PreferDirectTls,
+                zeroize::Zeroizing::new(cfg.password()),
+                connector.clone(),
                 tokio_xmpp::xmlstream::Timeouts::default(),
+                pinned.clone(),
+                login_tx.clone(),
             )
         };
         let mut client = make_client();
@@ -223,12 +235,15 @@ impl CoreActor {
                         continue;
                     };
                     match ev {
-                        XmppEvent::Online { bound_jid, resumed, .. } => {
+                        SessionEvent::Online { bound_jid, resumed } => {
                             info!(%bound_jid, resumed, "online");
                             online.set(true);
                             backoff = std::time::Duration::from_secs(2); // reset on success
                             let _ = self.events.send(Event::Connection(
-                                ConnectionState::Online { full_jid: bound_jid.to_string() })).await;
+                                ConnectionState::Online {
+                                    full_jid: bound_jid.to_string(),
+                                    security: link.lock().unwrap().clone(),
+                                })).await;
                             if !resumed {
                                 // Spawn bootstrap so it can await iq replies without
                                 // blocking the reader loop.
@@ -254,13 +269,7 @@ impl CoreActor {
                                 });
                             }
                         }
-                        XmppEvent::Disconnected(err) => {
-                            warn!(%err, "disconnected");
-                            online.set(false);
-                            let _ = self.events.send(Event::Connection(
-                                ConnectionState::Disconnected { reason: err.to_string() })).await;
-                        }
-                        XmppEvent::Stanza(stanza) => {
+                        SessionEvent::Stanza(stanza) => {
                             // tokio-xmpp 6 delivers a typed `Stanza`; the XEP layer works on raw
                             // `Element`, so convert back at the boundary.
                             let stanza: Element = match xso::transform::<Element, _>(&stanza) {
@@ -296,6 +305,22 @@ impl CoreActor {
                                     debug!(error = %e, "stanza handling error");
                                 }
                             });
+                        }
+                    }
+                }
+
+                // --- login results: persist the SASL pin, surface refused logins ---
+                Some(notice) = login_rx.recv() => {
+                    match notice {
+                        LoginNotice::Pinned(pin) => {
+                            if let Err(e) = self.store.set_sasl_pin(cfg.account_id, pin).await {
+                                warn!(error = %e, "storing the SASL pin");
+                            }
+                        }
+                        LoginNotice::Refused(reason) => {
+                            online.set(false);
+                            let _ = self.events.send(Event::Connection(
+                                ConnectionState::Disconnected { reason })).await;
                         }
                     }
                 }

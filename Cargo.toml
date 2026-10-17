@@ -21,9 +21,9 @@ exclude = ["deps"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-only"
 authors = ["Arne-Brün Vogelsang <arne@monocles.eu>"]
-repository = "https://codeberg.org/monocles/monocles-chat-desktop"
+repository = "https://github.com/Arne19/monocles_chat_desktop"
 rust-version = "1.85"
 
 [workspace.dependencies]

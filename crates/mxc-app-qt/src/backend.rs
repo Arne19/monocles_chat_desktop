@@ -45,6 +45,13 @@ pub mod qobject {
         #[qproperty(bool, donation_due, cxx_name = "donationDue")]
         /// Whether the default monocles support-room entry is shown in Contacts (until dismissed).
         #[qproperty(bool, support_room_visible, cxx_name = "supportRoomVisible")]
+        /// Connection security settings (as on monocles Android): TLS 1.3 only (default on) and
+        /// enforce DANE (default off). Read from the store on every connection attempt.
+        #[qproperty(bool, require_tls13, cxx_name = "requireTls13")]
+        #[qproperty(bool, enforce_dane, cxx_name = "enforceDane")]
+        /// How the current connection is secured, e.g. "DNSSEC + DANE verified · TLS 1.3"; empty
+        /// while offline.
+        #[qproperty(QString, link_security, cxx_name = "linkSecurity")]
         /// Chat-background mode: "default" (bundled doodle tile), "none", or "custom".
         #[qproperty(QString, chat_bg_mode, cxx_name = "chatBgMode")]
         /// Custom chat-background image path (used when chatBgMode == "custom").
@@ -128,6 +135,16 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "dismissSupportRoom"]
         fn dismiss_support_room(self: Pin<&mut Backend>);
+
+        /// Set + persist "Require TLS 1.3" (applies to the next connection).
+        #[qinvokable]
+        #[cxx_name = "changeRequireTls13"]
+        fn change_require_tls13(self: Pin<&mut Backend>, value: bool);
+
+        /// Set + persist "Enforce DANE" (applies to the next connection).
+        #[qinvokable]
+        #[cxx_name = "changeEnforceDane"]
+        fn change_enforce_dane(self: Pin<&mut Backend>, value: bool);
 
         /// Set + persist the chat-background mode ("default" | "none" | "custom").
         #[qinvokable]
@@ -767,6 +784,9 @@ pub struct BackendRust {
     own_nick: QString,
     donation_due: bool,
     support_room_visible: bool,
+    require_tls13: bool,
+    enforce_dane: bool,
+    link_security: QString,
     chat_bg_mode: QString,
     chat_bg_custom_path: QString,
     preferred_camera: QString,
@@ -814,6 +834,10 @@ impl Default for BackendRust {
             donation_due: false,
             // Shown by default; the startup check hides it if the user dismissed it before.
             support_room_visible: true,
+            // Android's defaults; the startup check applies the saved choice.
+            require_tls13: true,
+            enforce_dane: false,
+            link_security: QString::default(),
             // Bundled doodle background by default; the startup check applies the saved choice.
             chat_bg_mode: QString::from("default"),
             chat_bg_custom_path: QString::default(),
@@ -881,6 +905,18 @@ impl qobject::Backend {
     pub fn dismiss_support_room(mut self: Pin<&mut Self>) {
         self.as_mut().set_support_room_visible(false);
         crate::session::dismiss_support_room();
+    }
+
+    /// QML entry point — set + persist "Require TLS 1.3".
+    pub fn change_require_tls13(mut self: Pin<&mut Self>, value: bool) {
+        self.as_mut().set_require_tls13(value);
+        crate::session::set_flag_setting(mxc_proto::connect::SETTING_REQUIRE_TLS13, value);
+    }
+
+    /// QML entry point — set + persist "Enforce DANE".
+    pub fn change_enforce_dane(mut self: Pin<&mut Self>, value: bool) {
+        self.as_mut().set_enforce_dane(value);
+        crate::session::set_flag_setting(mxc_proto::connect::SETTING_ENFORCE_DANE, value);
     }
 
     /// QML entry point — set + persist the chat-background mode.

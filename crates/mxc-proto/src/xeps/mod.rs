@@ -48,6 +48,7 @@ pub mod roster;
 pub mod router;
 pub mod stanza_id;
 pub mod stories;
+pub mod styling;
 pub mod vcard;
 pub mod webxdc;
 

@@ -68,24 +68,24 @@ else
   SHLIBDEPS_OBJS="$STAGE/usr/bin/monocles-chat-qt"
 fi
 
-# copyright (GPL-3)
+# copyright (AGPL-3.0-only)
 install -d "$STAGE/usr/share/doc/$PKG"
 cat > "$STAGE/usr/share/doc/$PKG/copyright" <<'EOF'
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: monocles chat desktop (Qt)
-Source: https://codeberg.org/monocles/monocles-chat-desktop
+Source: https://github.com/Arne19/monocles_chat_desktop
 
 Files: *
 Copyright: Arne-Brün Vogelsang <arne@monocles.eu>
-License: GPL-3+
+License: AGPL-3.0-only
  This program is free software: you can redistribute it and/or modify it under
- the terms of the GNU General Public License as published by the Free Software
- Foundation, either version 3 of the License, or (at your option) any later
- version. On Debian systems the full text is in /usr/share/common-licenses/GPL-3.
+ the terms of the GNU Affero General Public License version 3 only, as published
+ by the Free Software Foundation. The full text is at
+ https://www.gnu.org/licenses/agpl-3.0.txt and in the LICENSE file of the source.
  .
- Note: this package bundles libsignal (AGPL-3.0-only) for PQ OMEMO2 — the monocles
+ The application bundles libsignal (AGPL-3.0-only) for PQ OMEMO2 — the monocles
  pq-omemo-2 fork of signalapp/libsignal; see https://codeberg.org/monocles/pq-omemo-2
- for its source and licence.
+ for its source. The combined work is therefore distributed under AGPL-3.0-only.
  .
  Note: this package also bundles a patched libnice (LGPL-2.1-or-later) in
  /usr/lib/monocles-chat-qt — libnice 0.1.23 with a graceful-nomination fix for group calls
@@ -128,7 +128,7 @@ Priority: optional
 Installed-Size: $INSTALLED_KB
 Depends: $DEPENDS
 Recommends: gnome-keyring
-Homepage: https://codeberg.org/monocles/monocles-chat-desktop
+Homepage: https://github.com/Arne19/monocles_chat_desktop
 Description: monocles chat (Qt) - encrypted XMPP desktop client
  Cross-platform Qt/QML XMPP client, wire- and feature-compatible with
  monocles chat for Android. Features post-quantum PQ OMEMO2 (PQXDH + SPQR)
