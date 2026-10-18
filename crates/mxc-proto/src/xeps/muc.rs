@@ -115,12 +115,18 @@ pub async fn join(
     // The room answers with every current occupant's presence, then ours: drop what we knew
     // about it (we may have missed departures while disconnected) before any of that arrives.
     let _ = events.send(Event::MucJoining { account_id: cfg.account_id, room: room.to_string() }).await;
-    let presence = Element::builder("presence", "jabber:client")
+    // XEP-0272 Muji: the call coordinator forgets the room's old participant state, and if we're
+    // still in its group call (a reconnect), the join presence keeps announcing it.
+    super::muji::mark_room_joining(cfg.account_id, room);
+    super::muji::mark_room_joined(cfg.account_id, room);
+    let mut presence = Element::builder("presence", "jabber:client")
         .attr(crate::ncname("to"), format!("{room}/{nick}"))
         .append(x.build())
-        .append(caps::caps_element())
-        .build();
-    w.send(presence)?;
+        .append(caps::caps_element());
+    if let Some(muji) = super::muji::active_payload(cfg.account_id, room) {
+        presence = presence.append(muji);
+    }
+    w.send(presence.build())?;
 
     if let Ok(items) = store.conversations(cfg.account_id).await {
         let _ = events.send(Event::ConversationsUpdated { account_id: cfg.account_id, items }).await;

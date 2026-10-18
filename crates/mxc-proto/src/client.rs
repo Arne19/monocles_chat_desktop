@@ -172,9 +172,35 @@ impl CoreActor {
         // `link` reports how the current connection was secured.
         let link = std::sync::Arc::new(std::sync::Mutex::new(crate::connect::LinkSecurity::default()));
         let connector = crate::connect::SecureConnector::new(self.store.clone(), link.clone());
+        // Bind a stable per-install resource (like Android's `monocles chat.<random>`): a restart
+        // then REPLACES the previous session on the server instead of leaving it behind. A stale
+        // session lingers as a "ghost" occupant of every joined room under our nick, and with
+        // multi-session nicks the room keeps presenting the ghost's presence — other members then
+        // don't see our group-call `<muji>` advertisement and refuse our legs.
+        let identity: tokio_xmpp::jid::Jid = if jid.resource().is_some() {
+            jid.clone() // a resource configured explicitly
+        } else {
+            let key = format!("resource:{}", cfg.account_id);
+            let stored = self.store.setting(&key).await.ok().flatten();
+            let resource = match stored.filter(|r| valid_resource(r)) {
+                Some(r) => r,
+                None => {
+                    let r = new_resource();
+                    if let Err(e) = self.store.set_setting(&key, &r).await {
+                        warn!(error = %e, "could not persist the XMPP resource");
+                    }
+                    r
+                }
+            };
+            match jid.to_bare().with_resource_str(&resource) {
+                Ok(full) => full.into(),
+                Err(_) => jid.clone(),
+            }
+        };
         let make_client = || {
             Session::new(
                 jid.clone(),
+                identity.clone(),
                 zeroize::Zeroizing::new(cfg.password()),
                 connector.clone(),
                 tokio_xmpp::xmlstream::Timeouts::default(),
@@ -637,6 +663,8 @@ impl CoreActor {
                     .ok()
                     .flatten()
                     .unwrap_or_else(|| cfg.bare().split('@').next().unwrap_or("user").to_string());
+                // XEP-0272 Muji: leaving the room ends our part in its group call.
+                xeps::jingle::on_room_left(w, calls, &self.events, account_id, &room).await;
                 let _ = xeps::muc::leave(w, &room, &nick);
                 if let Err(e) = xeps::bookmarks::remove(w, &room).await {
                     tracing::warn!(error = %e, "bookmark remove");
@@ -1015,6 +1043,10 @@ impl CoreActor {
                 xeps::jingle::place_group_call(w, calls, &self.events, cfg, &room, video).await;
                 Ok(())
             }
+            Command::UpgradeGroupCallToVideo { room, .. } => {
+                xeps::jingle::upgrade_group_call_to_video(w, calls, &self.events, cfg, &room).await;
+                Ok(())
+            }
             Command::LeaveGroupCall { room, .. } => {
                 xeps::jingle::leave_group_call(w, calls, &self.events, cfg, &room).await;
                 Ok(())
@@ -1175,5 +1207,45 @@ async fn device_fingerprint(
     {
         Some(pq) => mxc_omemo::hybrid_fingerprint_display(identity_key, &pq),
         None => mxc_omemo::fingerprint(identity_key),
+    }
+}
+
+/// A fresh per-install XMPP resource: `monocles chat desktop.` plus 8 random alphanumerics (the
+/// suffix keeps it from being guessable; the full resource is visible to contacts and rooms anyway).
+fn new_resource() -> String {
+    use rand::Rng;
+    let suffix: String = rand::rng()
+        .sample_iter(rand::distr::Alphanumeric)
+        .take(8)
+        .map(char::from)
+        .collect();
+    format!("monocles chat desktop.{suffix}")
+}
+
+/// Whether a stored resource is still usable (a valid, non-empty resourcepart).
+fn valid_resource(resource: &str) -> bool {
+    !resource.trim().is_empty() && tokio_xmpp::jid::ResourcePart::new(resource).is_ok()
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn generated_resources_are_valid_and_distinct() {
+        let a = new_resource();
+        let b = new_resource();
+        assert!(a.starts_with("monocles chat desktop."));
+        assert_eq!(a.len(), "monocles chat desktop.".len() + 8);
+        assert!(a["monocles chat desktop.".len()..].chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(valid_resource(&a));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn invalid_stored_resources_are_rejected() {
+        assert!(!valid_resource(""));
+        assert!(!valid_resource("   "));
+        assert!(valid_resource("monocles chat desktop.abcd1234"));
     }
 }

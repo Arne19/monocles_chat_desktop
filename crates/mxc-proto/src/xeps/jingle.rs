@@ -52,7 +52,44 @@ struct ActiveCall {
     /// `None` for an ordinary 1:1 call. Muji sessions opportunistically OMEMO-verify their DTLS
     /// fingerprint (like 1:1) and carry a `<muji room=…/>` on their session-initiate.
     room: Option<String>,
+    /// Whether we are the Jingle session initiator (we sent the session-initiate).
+    we_initiator: bool,
+    /// Muji: names of the contents negotiated on this leg so far — a renegotiation signals only
+    /// the contents that are new (a content-add/-accept must not repeat an existing name).
+    negotiated: Vec<String>,
+    /// Muji: whether our current local description sends video on some m-line.
+    sends_video: bool,
+    /// Muji: our video content-add awaits the peer's content-accept/-reject.
+    video_offer_pending: bool,
+    /// Muji: don't offer our camera on this leg again before this instant (the peer refused it).
+    video_retry_after: Option<std::time::Instant>,
+    /// Muji: ICE has connected at least once (renegotiation is only signalled after that).
+    connected: bool,
+    /// Muji leg of a call placed under the OMEMO2 lock: DTLS fingerprints MUST be OMEMO2-encrypted
+    /// both ways, from a trusted identity — never cleartext (a leg that can't comply fails).
+    require_verified: bool,
+    /// Muji: the OMEMO device id the room advertised for the peer (`<muji device>`); the device
+    /// that encrypted the peer's fingerprint must be this one.
+    peer_device: Option<u32>,
+    /// The peer's negotiated DTLS role (`active`/`passive`), once known. The stored peer
+    /// description may still say `actpass` (it was an offer); when we rebuild the peer's
+    /// description for a renegotiation it must carry the role actually in use — an ANSWER with
+    /// `a=setup:actpass` is invalid and webrtcbin can't apply it (→ no video after an upgrade).
+    peer_setup: Option<String>,
+    /// The OMEMO2 identity (fingerprint, device) that authenticated this leg's DTLS fingerprint at
+    /// setup. Once set, every renegotiated fingerprint (content-add/-accept) must be encrypted and
+    /// come from this same identity — otherwise a renegotiation could quietly drop the call's
+    /// verification (cleartext) or switch identity. Mirrors Android's `OmemoVerification`.
+    verified_identity: Option<(String, i64)>,
 }
+
+/// At most this many video contents per group-call leg: the peer's camera, plus a second m-line
+/// when one side upgrades over a receive-only one. More would only be a resource-exhaustion
+/// attack (each accepted m-line is decoded).
+const MAX_MUJI_VIDEO_CONTENTS: usize = 2;
+
+/// How long a Muji leg waits before offering our camera again after the peer refused it.
+const MUJI_VIDEO_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ============================ Muji conference (group calls) ================
 
@@ -95,6 +132,8 @@ struct Member {
 struct MujiPeer {
     state: MujiState,
     real_jid: String,
+    /// The OMEMO device id advertised in their `<muji device>`, if any.
+    device: Option<u32>,
 }
 
 /// A live Muji group call we're participating in, keyed in [`Calls::conferences`] by room JID.
@@ -102,7 +141,20 @@ struct Conference {
     nick: String,
     /// Our own occupant JID (`room/nick`), used for the glare tie-break + as Jingle initiator.
     our_occupant: String,
+    /// Whether we send video in this call (from the start, or after upgrading mid-call).
     video: bool,
+    /// Placed/joined while the room's encryption was OMEMO2: every leg must be verified.
+    verified: bool,
+    /// For the call history (one row per group call): the room as the store spells it, when we
+    /// placed/joined, whether we started the call (no participant was in it yet) or joined a
+    /// running one, and whether any leg ever connected.
+    stored_room: String,
+    started_at: String,
+    outgoing: bool,
+    answered: bool,
+    /// The room has rebroadcast our READY `<muji>` (XEP-0272: only then do we start legs — a leg
+    /// request travels directly and could overtake our presence, which goes via the room).
+    announced: bool,
     /// Whether our mic is muted across the whole conference (applied to each per-pair engine).
     muted: bool,
     /// Whether our camera is on (applied to each per-pair engine; new legs inherit it).
@@ -146,6 +198,10 @@ pub struct Calls {
     /// Rooms for which we've surfaced a group-call invite (so we prompt once per call, and emit a
     /// cancellation when the call ends). Only used while we are NOT in that conference.
     invited: std::collections::HashSet<String>,
+    /// Sessions we ended locally, as (sid, peer full JID) — bounded. The peer's own
+    /// `session-terminate` for such a session usually crosses ours; it's acknowledged quietly
+    /// instead of being answered with an unknown-session error (see `handle_iq`).
+    recently_ended: std::collections::VecDeque<(String, String)>,
     /// Sink for decoded video frames, forwarded to the UI (tagged with the call's sid).
     video_tx: Sender<crate::event::CallVideoFrame>,
     /// For persisting the call history.
@@ -168,10 +224,41 @@ pub fn registry(
         conferences: HashMap::new(),
         muji_seen: HashMap::new(),
         invited: std::collections::HashSet::new(),
+        recently_ended: std::collections::VecDeque::new(),
         video_tx,
         store,
         account_id,
     }))
+}
+
+/// A room's bare JID as the conference key: bare JIDs are case-insensitive, and the room string
+/// reaches us spelled differently (from the UI / a bookmark, from the server's presence `from`,
+/// from a peer's `<muji room>`). Keying by the raw string made the desktop not recognise its own
+/// call — it declined every leg a peer initiated, which then retried forever.
+pub fn room_key(room: &str) -> String {
+    bare(room).to_lowercase()
+}
+
+const RECENTLY_ENDED_CAP: usize = 32;
+
+/// Remove a live session from the registry, remembering it as recently ended.
+fn remove_active(calls: &CallRegistry, sid: &str) -> Option<ActiveCall> {
+    let mut c = calls.borrow_mut();
+    let call = c.active.remove(sid)?;
+    remember_ended(&mut c.recently_ended, sid, &call.peer_full);
+    Some(call)
+}
+
+fn remember_ended(ring: &mut std::collections::VecDeque<(String, String)>, sid: &str, peer_full: &str) {
+    if ring.len() >= RECENTLY_ENDED_CAP {
+        ring.pop_front();
+    }
+    ring.push_back((sid.to_string(), peer_full.to_string()));
+}
+
+/// Whether `from` is the peer of session `sid` that we ended recently.
+fn was_recently_ended(ring: &std::collections::VecDeque<(String, String)>, sid: &str, from: &str) -> bool {
+    ring.iter().any(|(s, peer)| s == sid && super::origin::jid_eq(peer, from))
 }
 
 fn bare(jid: &str) -> &str {
@@ -204,6 +291,22 @@ fn log_call_end(calls: &CallRegistry, sid: &str) {
             let _ = store.insert_call_log(account, &peer, &dir, video, answered, &ts).await;
         });
     }
+}
+
+/// Write the call-history row for a group call that ended (one row per call, not per leg; the
+/// peer is the room, so the Calls list can show the group).
+fn log_conference_end(store: &mxc_store::Store, account_id: i64, conf: &Conference) {
+    let store = store.clone();
+    let (room, dir, video, answered, ts) = (
+        conf.stored_room.clone(),
+        if conf.outgoing { "out" } else { "in" }.to_string(),
+        conf.video,
+        conf.answered,
+        conf.started_at.clone(),
+    );
+    tokio::task::spawn_local(async move {
+        let _ = store.insert_call_log(account_id, &room, &dir, video, answered, &ts).await;
+    });
 }
 
 // ============================ JMI (ringing) ================================
@@ -393,21 +496,24 @@ fn content_with_transport(content: &Element, new_transport: Element) -> Element 
     b.append(new_transport).build()
 }
 
-/// OMEMO2-encrypt the plaintext DTLS fingerprint in each content's transport (best-effort: on
-/// any failure / missing session, the plaintext fingerprint is left as-is so the call still
-/// connects — just unverified). Mirrors Android's `encryptTransport`.
+/// OMEMO2-encrypt the plaintext DTLS fingerprint in each content's transport. Best-effort unless
+/// `strict`: on any failure / missing session the plaintext fingerprint is left as-is so the call
+/// still connects — just unverified. With `strict` (a verified group-call leg) any failure
+/// returns `None` instead: the leg must fail rather than leak a cleartext fingerprint. Mirrors
+/// Android's `encryptTransport`. (`encrypt_for` only ever encrypts to trusted devices.)
 async fn encrypt_call_fingerprints(
     w: &Writer,
     store: &mxc_store::Store,
     cfg: &AccountConfig,
     peer_bare: &str,
     contents: Vec<Element>,
-) -> Vec<Element> {
+    strict: bool,
+) -> Option<Vec<Element>> {
     let mut out = Vec::with_capacity(contents.len());
     for content in contents {
-        out.push(encrypt_one_fingerprint(w, store, cfg, peer_bare, content).await);
+        out.push(encrypt_one_fingerprint(w, store, cfg, peer_bare, content, strict).await?);
     }
-    out
+    Some(out)
 }
 
 async fn encrypt_one_fingerprint(
@@ -416,12 +522,13 @@ async fn encrypt_one_fingerprint(
     cfg: &AccountConfig,
     peer_bare: &str,
     content: Element,
-) -> Element {
+    strict: bool,
+) -> Option<Element> {
     let Some(transport) = content.get_child("transport", jingle_sdp::NS_ICE) else {
-        return content;
+        return Some(content);
     };
     let Some(fp) = transport.get_child("fingerprint", jingle_sdp::NS_DTLS) else {
-        return content;
+        return Some(content);
     };
     let hex = fp.text();
     let setup = fp.attr("setup").unwrap_or("actpass").to_string();
@@ -444,9 +551,13 @@ async fn encrypt_one_fingerprint(
     );
     let encrypted = match crate::xeps::omemo::encrypt_for(w, store, cfg, peer_bare, envelope.to_xml().as_bytes()).await {
         Ok(e) => e,
+        Err(e) if strict => {
+            tracing::warn!(error = %e, "OMEMO call-fingerprint encrypt failed — verified leg, refusing cleartext");
+            return None;
+        }
         Err(e) => {
             tracing::warn!(error = %e, "OMEMO call-fingerprint encrypt failed — sending plaintext");
-            return content;
+            return Some(content);
         }
     };
     let new_fp = Element::builder("fingerprint", NS_OMEMO_DTLS)
@@ -454,7 +565,153 @@ async fn encrypt_one_fingerprint(
         .attr(crate::ncname("hash"), hash)
         .append(encrypted)
         .build();
-    content_with_transport(&content, transport_with_fingerprint(transport, new_fp))
+    Some(content_with_transport(&content, transport_with_fingerprint(transport, new_fp)))
+}
+
+/// Whether every content that carries a DTLS fingerprint carries it OMEMO-encrypted (checked
+/// BEFORE decrypting, on a verified group-call leg).
+fn all_fingerprints_encrypted(contents: &[Element]) -> bool {
+    contents.iter().all(|c| match c.get_child("transport", jingle_sdp::NS_ICE) {
+        Some(t) => t.get_child("fingerprint", jingle_sdp::NS_DTLS).is_none(),
+        None => true,
+    })
+}
+
+/// A renegotiation (content-add/-accept) on a leg whose setup was OMEMO-authenticated must keep
+/// that authentication: every fingerprint encrypted (`was_encrypted`, checked before decrypting),
+/// decrypted, and from the identity that authenticated the leg. A leg that was never
+/// authenticated (`identity` None) imposes nothing here.
+fn keeps_leg_identity(
+    identity: &Option<(String, i64)>,
+    was_encrypted: bool,
+    contents: &[Element],
+    verified: &Option<(String, i64, i64)>,
+) -> bool {
+    let Some((fp, device)) = identity else { return true };
+    was_encrypted
+        && all_fingerprints_decrypted(contents)
+        && verified.as_ref().is_some_and(|(vfp, vdev, _)| vfp == fp && vdev == device)
+}
+
+/// Number of video contents in a content set.
+fn video_contents(contents: &[Element]) -> usize {
+    contents
+        .iter()
+        .filter(|c| c.get_child("description", jingle_sdp::NS_RTP).and_then(|d| d.attr("media")) == Some("video"))
+        .count()
+}
+
+/// Whether every DTLS fingerprint could be decrypted back to plaintext (checked AFTER decrypting:
+/// a failed decryption leaves the encrypted element in place).
+fn all_fingerprints_decrypted(contents: &[Element]) -> bool {
+    contents.iter().all(|c| match c.get_child("transport", jingle_sdp::NS_ICE) {
+        Some(t) => t.get_child("fingerprint", NS_OMEMO_DTLS).is_none(),
+        None => true,
+    })
+}
+
+/// The `a=setup:` value of an SDP (first occurrence — BUNDLE shares one transport).
+fn sdp_setup(sdp: &str) -> Option<String> {
+    sdp.lines()
+        .find_map(|l| l.trim_end().strip_prefix("a=setup:"))
+        .map(str::to_string)
+}
+
+/// The DTLS `setup` of the first content carrying a fingerprint.
+fn contents_setup(contents: &[Element]) -> Option<String> {
+    contents.iter().find_map(|c| {
+        c.get_child("transport", jingle_sdp::NS_ICE)?
+            .get_child("fingerprint", jingle_sdp::NS_DTLS)?
+            .attr("setup")
+            .map(str::to_string)
+    })
+}
+
+fn opposite_setup(setup: &str) -> Option<String> {
+    match setup {
+        "active" => Some("passive".to_string()),
+        "passive" => Some("active".to_string()),
+        _ => None,
+    }
+}
+
+/// Replace `setup='actpass'` on every content's DTLS fingerprint with the peer's negotiated role
+/// (no-op while the role is unknown).
+fn with_peer_setup(contents: Vec<Element>, peer_setup: Option<&str>) -> Vec<Element> {
+    let Some(role) = peer_setup else { return contents };
+    contents
+        .into_iter()
+        .map(|content| {
+            let Some(transport) = content.get_child("transport", jingle_sdp::NS_ICE) else {
+                return content;
+            };
+            let Some(fp) = transport.get_child("fingerprint", jingle_sdp::NS_DTLS) else {
+                return content;
+            };
+            if fp.attr("setup") != Some("actpass") {
+                return content;
+            }
+            let mut b = Element::builder("fingerprint", jingle_sdp::NS_DTLS);
+            for ((ns, name), v) in fp.attrs() {
+                if name.as_str() != "setup" {
+                    b = b.attr_ns(ns.clone(), name.clone(), v.clone());
+                }
+            }
+            let new_fp = b.attr(crate::ncname("setup"), role).append(fp.text()).build();
+            content_with_transport(&content, transport_with_fingerprint(transport, new_fp))
+        })
+        .collect()
+}
+
+/// Whether a local SDP sends video on some m-line (direction absent = sendrecv).
+fn sdp_sends_video(sdp: &str) -> bool {
+    let mut result = false;
+    // Some(sends) while inside a video section.
+    let mut cur: Option<bool> = None;
+    for line in sdp.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line.strip_prefix("m=") {
+            result |= cur == Some(true);
+            cur = rest.starts_with("video").then_some(true);
+        } else if let Some(sends) = cur.as_mut() {
+            match line {
+                "a=recvonly" | "a=inactive" => *sends = false,
+                "a=sendrecv" | "a=sendonly" => *sends = true,
+                _ => {}
+            }
+        }
+    }
+    result || cur == Some(true)
+}
+
+/// A verified group-call leg that can't be verified: terminate it with `security-error` (only
+/// that leg — the rest of the call goes on, as on Android).
+async fn fail_verified_leg(
+    w: &Writer,
+    calls: &CallRegistry,
+    events: &Sender<Event>,
+    account_id: i64,
+    sid: &str,
+    peer_full: &str,
+    room: Option<&str>,
+) {
+    tracing::warn!(%sid, %peer_full, "verified group-call leg could not be verified — terminating it");
+    let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
+        .append(Element::builder("security-error", jingle_sdp::NS_JINGLE).build())
+        .build();
+    let _ = w.send(jingle_iq(peer_full, sid, "", "session-terminate", vec![reason]));
+    terminate_local(calls, sid);
+    log_call_end(calls, sid);
+    set_member_state(calls, sid, MemberCallState::Ended);
+    match room {
+        Some(r) => emit_conference(calls, events, account_id, r).await,
+        None => {
+            emit(events, account_id, sid, bare(peer_full), false, CallState::Ended {
+                reason: "Call verification failed".into(),
+            })
+            .await
+        }
+    }
 }
 
 /// Decrypt any OMEMO-verified DTLS fingerprints back to plaintext (so webrtcbin can use them),
@@ -589,6 +846,16 @@ fn start_call(
             pending_video: Vec::new(),
             peer_used_omemo: false,
             room: room.clone(),
+            we_initiator: role == mxc_media::Role::Caller,
+            negotiated: Vec::new(),
+            sends_video: false,
+            video_offer_pending: false,
+            video_retry_after: None,
+            connected: false,
+            require_verified: false,
+            peer_device: None,
+            peer_setup: None,
+            verified_identity: None,
         },
     );
 
@@ -636,25 +903,64 @@ fn start_call(
                     ufrag = u;
                     pwd = p;
                     mid = m;
+                    // Muji legs advertise honest `senders` (a receive-only m-line is not "both").
+                    let (we_initiator, require_verified) = calls
+                        .borrow()
+                        .active
+                        .get(&sid)
+                        .map(|c| (c.we_initiator, c.require_verified))
+                        .unwrap_or((matches!(kind, mxc_media::SdpKind::Offer), false));
+                    if is_muji {
+                        if let Some(call) = calls.borrow_mut().active.get_mut(&sid) {
+                            call.sends_video = sdp_sends_video(&sdp);
+                        }
+                    }
                     if renegotiation {
                         // Mid-call upgrade: send ONLY the newly-added (video) content as a Jingle
                         // content-add (our re-offer) / content-accept (our answer to the peer's
                         // content-add). The audio content is already negotiated.
-                        let (contents, mids) = jingle_sdp::sdp_to_contents(&sdp);
+                        let (contents, mids) = if is_muji {
+                            jingle_sdp::sdp_to_contents_for(&sdp, we_initiator)
+                        } else {
+                            jingle_sdp::sdp_to_contents(&sdp)
+                        };
+                        let negotiated: Vec<String> = calls
+                            .borrow()
+                            .active
+                            .get(&sid)
+                            .map(|c| c.negotiated.clone())
+                            .unwrap_or_default();
                         let mut video: Vec<Element> = contents
                             .into_iter()
                             .filter(|c| {
-                                c.get_child("description", jingle_sdp::NS_RTP)
-                                    .and_then(|d| d.attr("media"))
-                                    .map(|md| md == "video")
-                                    .unwrap_or(false)
+                                if is_muji {
+                                    // Group legs: only contents that are new on this leg. An
+                                    // answer to a senders change (content-modify) adds nothing, so
+                                    // nothing is sent for it.
+                                    !negotiated.iter().any(|n| Some(n.as_str()) == c.attr("name"))
+                                } else {
+                                    c.get_child("description", jingle_sdp::NS_RTP)
+                                        .and_then(|d| d.attr("media"))
+                                        .map(|md| md == "video")
+                                        .unwrap_or(false)
+                                }
                             })
                             .collect();
                         if !video.is_empty() {
-                            // Mirror the call's verification state for the upgrade too.
-                            let do_encrypt = calls.borrow().active.get(&sid).map(|c| c.peer_used_omemo).unwrap_or(false);
+                            let names: Vec<String> =
+                                video.iter().filter_map(|c| c.attr("name")).map(str::to_string).collect();
+                            // Mirror the call's verification state for the upgrade too (a verified
+                            // group leg always encrypts, and fails rather than going cleartext).
+                            let do_encrypt = require_verified
+                                || calls.borrow().active.get(&sid).map(|c| c.peer_used_omemo).unwrap_or(false);
                             if do_encrypt {
-                                video = encrypt_call_fingerprints(&w, &store, &cfg, &peer_bare, video).await;
+                                match encrypt_call_fingerprints(&w, &store, &cfg, &peer_bare, video, require_verified).await {
+                                    Some(v) => video = v,
+                                    None => {
+                                        fail_verified_leg(&w, &calls, &events, account_id, &sid, &peer_full, room.as_deref()).await;
+                                        break;
+                                    }
+                                }
                             }
                             // The content-add must carry the FULL BUNDLE group (audio + the new
                             // video mid): the peer (Conversations/monocles) adopts THIS group for
@@ -674,16 +980,48 @@ fn start_call(
                                 mxc_media::SdpKind::Offer => "content-add",
                                 mxc_media::SdpKind::Answer => "content-accept",
                             };
+                            if is_muji {
+                                if let Some(call) = calls.borrow_mut().active.get_mut(&sid) {
+                                    match kind {
+                                        mxc_media::SdpKind::Offer => call.video_offer_pending = true,
+                                        // our content-accept completes the peer's content-add
+                                        mxc_media::SdpKind::Answer => call.negotiated.extend(names.iter().cloned()),
+                                    }
+                                }
+                            }
                             let iq = jingle_iq(&peer_full, &sid, &initiator, action, video);
-                            tracing::info!(%sid, action, xml = %String::from(&iq), "sending renegotiation (video upgrade)");
+                            // The full IQ carries ICE candidates (IP addresses): trace only.
+                            tracing::info!(%sid, action, contents = ?names, "sending renegotiation (video upgrade)");
+                            tracing::trace!(%sid, xml = %String::from(&iq), "renegotiation IQ");
                             let _ = w.send(iq);
+                        }
+                        if is_muji {
+                            // e.g. the peer's camera just appeared / disappeared on this leg
+                            emit_conference(&calls, &events, account_id, room.as_deref().unwrap_or("")).await;
                         }
                     } else {
                         let action = match kind {
                             mxc_media::SdpKind::Offer => "session-initiate",
                             mxc_media::SdpKind::Answer => "session-accept",
                         };
-                        let (contents, mids) = jingle_sdp::sdp_to_contents(&sdp);
+                        let (contents, mids) = if is_muji {
+                            jingle_sdp::sdp_to_contents_for(&sdp, we_initiator)
+                        } else {
+                            jingle_sdp::sdp_to_contents(&sdp)
+                        };
+                        if is_muji {
+                            if let Some(call) = calls.borrow_mut().active.get_mut(&sid) {
+                                call.negotiated = mids.clone();
+                            }
+                        }
+                        if matches!(kind, mxc_media::SdpKind::Answer) {
+                            // We answered: the peer (offerer) takes the opposite DTLS role.
+                            if let Some(ours) = sdp_setup(&sdp) {
+                                if let Some(call) = calls.borrow_mut().active.get_mut(&sid) {
+                                    call.peer_setup = opposite_setup(&ours);
+                                }
+                            }
+                        }
                         if !contents.is_empty() {
                             // Encrypt the DTLS fingerprint on the initial OFFER (bootstraps
                             // verification — the callee handles an encrypted offer fine), but on
@@ -695,10 +1033,18 @@ fn start_call(
                             // give verified group calls. `encrypt_call_fingerprints` is best-effort
                             // — if no OMEMO session can be built it leaves the fingerprint
                             // plaintext, so an unverified group call still works.
-                            let do_encrypt = matches!(kind, mxc_media::SdpKind::Offer)
+                            let do_encrypt = require_verified
+                                || matches!(kind, mxc_media::SdpKind::Offer)
                                 || calls.borrow().active.get(&sid).map(|c| c.peer_used_omemo).unwrap_or(false);
                             let contents = if do_encrypt {
-                                encrypt_call_fingerprints(&w, &store, &cfg, &peer_bare, contents).await
+                                // A verified group leg never falls back to a cleartext fingerprint.
+                                match encrypt_call_fingerprints(&w, &store, &cfg, &peer_bare, contents, require_verified).await {
+                                    Some(c) => c,
+                                    None => {
+                                        fail_verified_leg(&w, &calls, &events, account_id, &sid, &peer_full, room.as_deref()).await;
+                                        break;
+                                    }
+                                }
                             } else {
                                 contents
                             };
@@ -737,11 +1083,23 @@ fn start_call(
                     tracing::info!(%sid, "call media connected (ICE)");
                     mark_answered(&calls, &sid);
                     if is_muji {
+                        if let Some(call) = calls.borrow_mut().active.get_mut(&sid) {
+                            call.connected = true;
+                        }
                         set_member_state(&calls, &sid, MemberCallState::Active);
-                        emit_conference(&calls, &events, account_id, room.as_deref().unwrap_or("")).await;
-                        // Serialized mesh: now that this leg is up, start the next pending peer's.
                         if let Some(r) = room.as_deref() {
-                            initiate_next_pending(&w, &calls, &events, &cfg, r, video).await;
+                            if let Some(conf) = calls.borrow_mut().conferences.get_mut(r) {
+                                conf.answered = true; // for the call history
+                            }
+                        }
+                        emit_conference(&calls, &events, account_id, room.as_deref().unwrap_or("")).await;
+                        if let Some(r) = room.as_deref() {
+                            // We send video in this call but this leg doesn't carry it yet (we
+                            // answered an audio-only offer): add our camera now.
+                            ensure_leg_video(&calls, r, &sid);
+                            // Serialized mesh: now that this leg is up, start the next pending peer's.
+                            let conf_video = calls.borrow().conferences.get(r).map(|c| c.video).unwrap_or(video);
+                            initiate_next_pending(&w, &calls, &events, &cfg, r, conf_video).await;
                         }
                     } else {
                         emit(&events, account_id, &sid, &peer_bare, video, CallState::Active).await;
@@ -749,14 +1107,15 @@ fn start_call(
                 }
                 mxc_media::EngineEvent::Failed(reason) => {
                     tracing::warn!(%sid, %reason, "call media failed");
-                    calls.borrow_mut().active.remove(&sid);
+                    remove_active(&calls, &sid);
                     log_call_end(&calls, &sid);
                     if is_muji {
                         set_member_state(&calls, &sid, MemberCallState::Ended);
                         emit_conference(&calls, &events, account_id, room.as_deref().unwrap_or("")).await;
                         // This leg freed the serialization slot — start the next pending peer's.
                         if let Some(r) = room.as_deref() {
-                            initiate_next_pending(&w, &calls, &events, &cfg, r, video).await;
+                            let conf_video = calls.borrow().conferences.get(r).map(|c| c.video).unwrap_or(video);
+                            initiate_next_pending(&w, &calls, &events, &cfg, r, conf_video).await;
                         }
                     } else {
                         emit(&events, account_id, &sid, &peer_bare, video, CallState::Ended { reason }).await;
@@ -796,7 +1155,7 @@ pub fn accept(
 /// Hang up / cancel a call. If it's a live session, send `session-terminate`; if it's still
 /// ringing out, `retract`. Either way tear down any engine.
 pub fn hang_up(w: &Writer, calls: &CallRegistry, peer_hint: &str, sid: &str) -> anyhow::Result<()> {
-    let active = calls.borrow_mut().active.remove(sid);
+    let active = remove_active(&calls, sid);
     calls.borrow_mut().proposed.remove(sid);
     calls.borrow_mut().incoming.remove(sid);
     log_call_end(calls, sid);
@@ -951,12 +1310,40 @@ pub async fn handle_iq(
                         .is_some_and(|(caller, _)| super::origin::jid_eq(caller, &from)))
         }
     };
+    if !allowed
+        && action == "session-terminate"
+        && was_recently_ended(&calls.borrow().recently_ended, &sid, &from)
+    {
+        // Their terminate crossed ours for a session we already ended: nothing left to do, and it
+        // is that session's own peer — acknowledge instead of answering with an error.
+        tracing::debug!(%sid, %from, "session-terminate for a session we already ended");
+        ack(w, iq);
+        return true;
+    }
     if !allowed {
         tracing::warn!(%action, %sid, %from, "rejecting Jingle IQ for a session that isn't the sender's");
         unknown_session(w, iq);
         return true;
     }
+    // Crossed content-adds on a group-call leg (both sides turned their camera on at once): as the
+    // session initiator ours wins (XEP-0166 tie-break); the peer accepts ours instead.
+    if action == "content-add"
+        && calls
+            .borrow()
+            .active
+            .get(&sid)
+            .is_some_and(|c| c.room.is_some() && c.video_offer_pending && c.we_initiator)
+    {
+        tie_break(w, iq);
+        return true;
+    }
     ack(w, iq); // every accepted Jingle IQ gets an empty result
+    // (room, we_initiator, require_verified, peer_device) of a Muji leg we already have.
+    let muji_leg = calls
+        .borrow()
+        .active
+        .get(&sid)
+        .and_then(|c| c.room.clone().map(|r| (r, c.we_initiator, c.require_verified, c.peer_device)));
 
     match action {
         "session-initiate" | "session-accept" => {
@@ -966,75 +1353,50 @@ pub async fn handle_iq(
                 mxc_media::SdpKind::Answer
             };
             // XEP-0272 Muji: a session-initiate tagged with `<muji room=…>` belongs to a group
-            // call. If we're participating in that conference, spin up a callee engine for it
-            // (no JMI ring — Muji peers call each other directly via presence coordination).
+            // call. If we're participating in that conference (and the sender is a participant),
+            // spin up a callee engine for it (no JMI ring — Muji peers call each other directly).
             if action == "session-initiate" {
                 if let Some(room) = jingle
                     .get_child("muji", muji::NS_MUJI)
                     .and_then(|m| m.attr("room"))
-                    .map(str::to_string)
+                    .map(room_key)
                 {
-                    let setup = {
-                        let c = calls.borrow();
-                        if c.active.contains_key(&sid) {
-                            None // already have this session
-                        } else {
-                            c.conferences.get(&room).map(|conf| (conf.our_occupant.clone(), conf.video))
-                        }
-                    };
-                    match setup {
-                        Some((our_occ, conf_video)) => {
-                            // SECURITY: only accept a Muji leg from someone who is actually a
-                            // participant of this room — i.e. an occupant who announced `<muji>`
-                            // presence, whose real JID the (non-anonymous) MUC vouched for in
-                            // `<item jid>`. Without this, any JID that learns we're in a call could
-                            // send a `<muji room=…>` session-initiate and inject unsolicited media
-                            // (it auto-accepts with no ring). Match on the bare JID.
-                            let occupant = {
-                                let c = calls.borrow();
-                                c.muji_seen.get(&room).and_then(|m| {
-                                    m.iter()
-                                        .find(|(occ, p)| {
-                                            bare(&p.real_jid) == bare(&from) || bare(occ) == bare(&from)
-                                        })
-                                        .map(|(occ, _)| occ.clone())
-                                })
-                            };
-                            let Some(occupant) = occupant else {
-                                tracing::warn!(%room, %from, "rejecting muji session-initiate from a non-participant");
-                                let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
-                                    .append(Element::builder("security-error", jingle_sdp::NS_JINGLE).build())
-                                    .build();
-                                let _ = w.send(jingle_iq(&from, &sid, "", "session-terminate", vec![reason]));
-                                return true;
-                            };
-                            if let Err(e) = start_call(
-                                w, calls, events, cfg, sid.clone(), from.clone(),
-                                mxc_media::Role::Callee, conf_video, Some(room.clone()), our_occ,
-                            ) {
-                                tracing::warn!(error = %e, "start muji callee engine");
-                            } else {
-                                register_member_session(calls, &room, &occupant, &from, &sid);
-                                apply_conf_state_to_leg(calls, &room, &sid);
-                            }
-                        }
-                        None if !calls.borrow().active.contains_key(&sid) => {
-                            tracing::debug!(%room, %from, "ignoring muji session-initiate for a conference we're not in");
-                            return true;
-                        }
-                        None => {}
+                    if !calls.borrow().active.contains_key(&sid)
+                        && !accept_muji_initiate(w, calls, events, cfg, &room, &from, &sid).await
+                    {
+                        return true;
                     }
                 }
             }
+            let (leg_room, we_initiator, require_verified, peer_device) = calls
+                .borrow()
+                .active
+                .get(&sid)
+                .map(|c| (c.room.clone(), c.we_initiator, c.require_verified, c.peer_device))
+                .unwrap_or((None, false, false, None));
             let owned: Vec<Element> =
                 jingle.children().filter(|c| c.name() == "content").cloned().collect();
+            if require_verified && !all_fingerprints_encrypted(&owned) {
+                fail_verified_leg(w, calls, events, cfg.account_id, &sid, &from, leg_room.as_deref()).await;
+                return true;
+            }
             // OMEMO-verified DTLS: decrypt the fingerprint(s) back to plaintext for webrtcbin and
             // capture the peer's verified OMEMO2 identity (for the call shield).
             let store = calls.borrow().store.clone();
             let (contents, verified) =
                 decrypt_call_fingerprints(&store, cfg, events, bare(&from), owned).await;
+            if leg_room.is_some() && !muji_leg_acceptable(&contents, &verified, require_verified, peer_device) {
+                fail_verified_leg(w, calls, events, cfg.account_id, &sid, &from, leg_room.as_deref()).await;
+                return true;
+            }
             let refs: Vec<&Element> = contents.iter().collect();
-            if let Some(sdp) = jingle_sdp::contents_to_sdp(&refs) {
+            let sdp = if leg_room.is_some() {
+                // the sender's description: honest directions on group-call legs
+                jingle_sdp::contents_to_sdp_for(&refs, !we_initiator)
+            } else {
+                jingle_sdp::contents_to_sdp(&refs)
+            };
+            if let Some(sdp) = sdp {
                 let mut c = calls.borrow_mut();
                 if let Some(call) = c.active.get_mut(&sid) {
                     if let Err(e) = call.engine.set_remote_description(kind, &sdp) {
@@ -1043,8 +1405,16 @@ pub async fn handle_iq(
                     // Remember the peer's (plaintext) content set so a later content-add/accept
                     // (video upgrade) can be merged into a full SDP.
                     call.remote_contents = contents.clone();
+                    if kind == mxc_media::SdpKind::Answer {
+                        // The peer answered: its DTLS role is the one it chose there.
+                        if let Some(setup) = contents_setup(&contents).filter(|s| s != "actpass") {
+                            call.peer_setup = Some(setup);
+                        }
+                    }
                     // Mirror the peer: only encrypt our fingerprint back if they encrypted theirs.
                     call.peer_used_omemo = verified.is_some();
+                    call.verified_identity =
+                        verified.as_ref().map(|(fp, device, _)| (fp.clone(), *device));
                 }
             }
             if let Some((fingerprint, device_id, trust)) = verified {
@@ -1065,21 +1435,53 @@ pub async fn handle_iq(
         "content-accept" => {
             let new_owned: Vec<Element> =
                 jingle.children().filter(|c| c.name() == "content").cloned().collect();
+            if let Some((room, _, true, _)) = &muji_leg {
+                if !all_fingerprints_encrypted(&new_owned) {
+                    fail_verified_leg(w, calls, events, cfg.account_id, &sid, &from, Some(room)).await;
+                    return true;
+                }
+            }
+            let identity = calls.borrow().active.get(&sid).and_then(|c| c.verified_identity.clone());
+            let was_encrypted = all_fingerprints_encrypted(&new_owned);
             let store = calls.borrow().store.clone();
-            let (new_contents, _verified) =
+            let (new_contents, verified) =
                 decrypt_call_fingerprints(&store, cfg, events, bare(&from), new_owned).await;
+            if let Some((room, _, require_verified, peer_device)) = &muji_leg {
+                if !muji_leg_acceptable(&new_contents, &verified, *require_verified, *peer_device) {
+                    fail_verified_leg(w, calls, events, cfg.account_id, &sid, &from, Some(room)).await;
+                    return true;
+                }
+            }
+            if !keeps_leg_identity(&identity, was_encrypted, &new_contents, &verified) {
+                tracing::warn!(%sid, "content-accept would drop/switch the call's OMEMO verification");
+                let room = muji_leg.as_ref().map(|(r, ..)| r.clone());
+                fail_verified_leg(w, calls, events, cfg.account_id, &sid, &from, room.as_deref()).await;
+                return true;
+            }
             let mut applied = false;
             {
                 let mut c = calls.borrow_mut();
                 if let Some(call) = c.active.get_mut(&sid) {
                     let mut full = call.remote_contents.clone();
                     full.extend(new_contents.iter().cloned());
+                    // This becomes the peer's ANSWER: it must name the DTLS role in use, not
+                    // the `actpass` its original offer carried.
+                    let full = with_peer_setup(full, call.peer_setup.as_deref());
                     let refs: Vec<&Element> = full.iter().collect();
-                    if let Some(sdp) = jingle_sdp::contents_to_sdp(&refs) {
+                    let sdp = if call.room.is_some() {
+                        jingle_sdp::contents_to_sdp_for(&refs, !call.we_initiator)
+                    } else {
+                        jingle_sdp::contents_to_sdp(&refs)
+                    };
+                    if let Some(sdp) = sdp {
                         match call.engine.set_remote_description(mxc_media::SdpKind::Answer, &sdp) {
                             Ok(()) => {
                                 call.remote_contents = full;
                                 call.video = true;
+                                call.video_offer_pending = false;
+                                call.negotiated.extend(
+                                    new_contents.iter().filter_map(|c| c.attr("name")).map(str::to_string),
+                                );
                                 applied = true;
                             }
                             Err(e) => tracing::warn!(error = %e, "content-accept set remote"),
@@ -1089,11 +1491,30 @@ pub async fn handle_iq(
             }
             if applied {
                 tracing::info!(%sid, "content-accept applied — call upgraded to video");
-                emit(events, cfg.account_id, &sid, bare(&from), true, CallState::Active).await;
+                match &muji_leg {
+                    // a group-call leg: the conference view (not a 1:1 call screen) updates
+                    Some((room, ..)) => emit_conference(calls, events, cfg.account_id, room).await,
+                    None => emit(events, cfg.account_id, &sid, bare(&from), true, CallState::Active).await,
+                }
             }
         }
         "content-reject" => {
             tracing::info!(%sid, "peer rejected our video upgrade (content-reject)");
+            if let Some(call) = calls.borrow_mut().active.get_mut(&sid) {
+                if call.room.is_some() {
+                    call.video_offer_pending = false;
+                    call.video_retry_after = Some(std::time::Instant::now() + MUJI_VIDEO_RETRY);
+                }
+            }
+        }
+        // XEP-0272 Muji: a participant turned their camera on — accept it without asking.
+        "content-add" if muji_leg.is_some() => {
+            muji_content_add(w, calls, events, cfg, &sid, &from, jingle).await;
+        }
+        // XEP-0272 Muji: the peer changed who sends on existing contents (e.g. it turned its
+        // camera on over a video m-line it so far only received on). Apply it as a re-offer.
+        "content-modify" if muji_leg.is_some() => {
+            muji_content_modify(calls, &sid, jingle);
         }
         // Peer is upgrading the call to video: stash their new video content and ask the user
         // for consent (Android-style). `accept_video_upgrade` / `decline_video_upgrade` act on it.
@@ -1102,9 +1523,16 @@ pub async fn handle_iq(
                 jingle.children().filter(|c| c.name() == "content").cloned().collect();
             // Decrypt the OMEMO-verified fingerprint now so the stashed (consent-pending) content
             // is plaintext-ready when the user accepts.
+            let identity = calls.borrow().active.get(&sid).and_then(|c| c.verified_identity.clone());
+            let was_encrypted = all_fingerprints_encrypted(&new_owned);
             let store = calls.borrow().store.clone();
-            let (new_contents, _verified) =
+            let (new_contents, verified) =
                 decrypt_call_fingerprints(&store, cfg, events, bare(&from), new_owned).await;
+            if !keeps_leg_identity(&identity, was_encrypted, &new_contents, &verified) {
+                tracing::warn!(%sid, "content-add would drop/switch the call's OMEMO verification");
+                fail_verified_leg(w, calls, events, cfg.account_id, &sid, &from, None).await;
+                return true;
+            }
             let mut prompt = false;
             {
                 let mut c = calls.borrow_mut();
@@ -1177,6 +1605,429 @@ pub async fn handle_iq(
         _ => {}
     }
     true
+}
+
+/// Reply to a Jingle IQ with a `<tie-break/>` error (XEP-0166 §8): crossed requests, ours wins.
+fn tie_break(w: &Writer, iq: &Element) {
+    let mut b = Element::builder("iq", NS_CLIENT).attr(crate::ncname("type"), "error");
+    if let Some(from) = iq.attr("from") {
+        b = b.attr(crate::ncname("to"), from);
+    }
+    if let Some(id) = iq.attr("id") {
+        b = b.attr(crate::ncname("id"), id);
+    }
+    let error = Element::builder("error", NS_CLIENT)
+        .attr(crate::ncname("type"), "cancel")
+        .append(Element::builder("conflict", "urn:ietf:params:xml:ns:xmpp-stanzas").build())
+        .append(Element::builder("tie-break", "urn:xmpp:jingle:errors:1").build())
+        .build();
+    let _ = w.send(b.append(error).build());
+}
+
+/// Whether the (decrypted) contents of a group-call leg are acceptable: the OMEMO device that
+/// encrypted the fingerprint must be the one the room advertised for the peer; and on a verified
+/// leg every fingerprint must have been encrypted, decrypted, SCE-bound and from a trusted
+/// identity (call-trust ≥ 1).
+fn muji_leg_acceptable(
+    contents: &[Element],
+    verified: &Option<(String, i64, i64)>,
+    require_verified: bool,
+    peer_device: Option<u32>,
+) -> bool {
+    if let (Some((_, device, _)), Some(advertised)) = (verified, peer_device) {
+        if *device != advertised as i64 {
+            tracing::warn!(device, advertised, "muji: fingerprint encrypted by another device than advertised");
+            return false;
+        }
+    }
+    if !require_verified {
+        return true;
+    }
+    all_fingerprints_decrypted(contents)
+        && verified.as_ref().is_some_and(|(_, _, trust)| *trust >= 1)
+}
+
+/// A `<content>` with its `senders` replaced.
+fn content_with_senders(content: &Element, senders: &str) -> Element {
+    let mut b = Element::builder("content", content.ns());
+    for ((ns, name), v) in content.attrs() {
+        if name.as_str() != "senders" {
+            b = b.attr_ns(ns.clone(), name.clone(), v.clone());
+        }
+    }
+    b = b.attr(crate::ncname("senders"), senders);
+    for child in content.children() {
+        b = b.append(child.clone());
+    }
+    b.build()
+}
+
+/// A stub `<content>` (name, creator, senders, media only) for content-modify / content-reject.
+fn content_stub(content: &Element, senders: Option<&str>) -> Element {
+    let media = content
+        .get_child("description", jingle_sdp::NS_RTP)
+        .and_then(|d| d.attr("media"))
+        .unwrap_or("video");
+    let mut b = Element::builder("content", jingle_sdp::NS_JINGLE)
+        .attr(crate::ncname("creator"), content.attr("creator").unwrap_or("initiator"))
+        .attr(crate::ncname("name"), content.attr("name").unwrap_or(""));
+    if let Some(s) = senders.or(content.attr("senders")) {
+        b = b.attr(crate::ncname("senders"), s);
+    }
+    b.append(Element::builder("description", jingle_sdp::NS_RTP).attr(crate::ncname("media"), media).build())
+        .append(Element::builder("transport", jingle_sdp::NS_ICE).build())
+        .build()
+}
+
+/// Decide on an incoming Muji session-initiate and, if acceptable, start the callee leg. Returns
+/// false if it was refused (a session-terminate has been sent).
+async fn accept_muji_initiate(
+    w: &Writer,
+    calls: &CallRegistry,
+    events: &Sender<Event>,
+    cfg: &AccountConfig,
+    room: &str,
+    from: &str,
+    sid: &str,
+) -> bool {
+    enum Decision {
+        /// (Jingle reason, explanatory text — logged by the peer to diagnose a failing call)
+        Refuse(&'static str, &'static str),
+        Accept {
+            our_occupant: String,
+            video: bool,
+            verified: bool,
+            occupant: String,
+            device: Option<u32>,
+            /// A leg to this participant that the new one replaces: (sid, address).
+            replace: Option<(String, String)>,
+        },
+    }
+    let decision = {
+        let c = calls.borrow();
+        match c.conferences.get(room) {
+            None => {
+                tracing::debug!(%room, %from, "refusing muji session-initiate for a conference we're not in");
+                Decision::Refuse("decline", "not-in-conference")
+            }
+            Some(conf) => {
+                // SECURITY: only accept a Muji leg from someone who is actually a participant of
+                // this room: the `from` must be exactly the real full JID the (non-anonymous) MUC
+                // vouched for in that occupant's `<item jid>` (with a `<muji>` advert). Without
+                // this, any JID that learns we're in a call could inject unsolicited media (it
+                // auto-accepts, no ring). Any advertised state counts: a peer sends <preparing/>,
+                // then ready, then initiates at once — and its initiate (direct) can overtake its
+                // ready presence (via the MUC).
+                let peer = c.muji_seen.get(room).and_then(|m| {
+                    m.iter()
+                        .find(|(_, p)| super::origin::jid_eq(&p.real_jid, from))
+                        .map(|(occ, p)| (occ.clone(), p.device))
+                        .or_else(|| {
+                            // The MUC may report ANOTHER session of the caller's account (a client
+                            // restarted while its old session lingers in the room, or a
+                            // multi-session nick). Accept if exactly one participant has the
+                            // caller's bare JID — the account the MUC vouched for; it's then
+                            // re-addressed to the calling session below.
+                            let mut same: Vec<_> = m
+                                .iter()
+                                .filter(|(_, p)| bare(&p.real_jid).eq_ignore_ascii_case(bare(from)))
+                                .collect();
+                            if same.len() == 1 {
+                                let (occ, p) = same.remove(0);
+                                tracing::info!(%room, occupant = %occ, room_reported = %p.real_jid, %from,
+                                    "muji: participant calls from another session of its account");
+                                Some((occ.clone(), p.device))
+                            } else {
+                                None
+                            }
+                        })
+                });
+                match peer {
+                    None => {
+                        tracing::warn!(%room, %from, "rejecting muji session-initiate from a non-participant");
+                        Decision::Refuse("security-error", "not-a-participant")
+                    }
+                    Some((occupant, device)) => {
+                        let existing = conf
+                            .members
+                            .get(&occupant)
+                            .and_then(|m| m.sid.clone().map(|s| (s, m.real_jid.clone(), m.state)));
+                        let legs = conf.members.values().filter(|m| m.sid.is_some()).count();
+                        let accept = |replace| Decision::Accept {
+                            our_occupant: conf.our_occupant.clone(),
+                            video: conf.video,
+                            verified: conf.verified,
+                            occupant: occupant.clone(),
+                            device,
+                            replace,
+                        };
+                        match existing {
+                            // A working leg stays.
+                            Some((_, _, MemberCallState::Active)) => Decision::Refuse("decline", "duplicate"),
+                            // Crossed initiates (both sides started a leg — e.g. they disagree on
+                            // the occupant-JID tie-break because the server rewrote a nick), or the
+                            // peer restarting its stuck leg: keep the leg with the smaller session
+                            // id. Both sides compare the same two ids, so they always keep the SAME
+                            // leg — deciding by the occupant tie-break could make each side kill
+                            // the other's leg, forever.
+                            Some((old_sid, _, _)) if old_sid.as_str() < sid => {
+                                Decision::Refuse("decline", "duplicate")
+                            }
+                            Some((old_sid, addr, _)) => accept(Some((old_sid, addr))),
+                            None if legs >= muji::MAX_PEERS => {
+                                tracing::warn!(%room, %from, "rejecting muji session-initiate: participant limit reached");
+                                Decision::Refuse("busy", "limit")
+                            }
+                            None => accept(None),
+                        }
+                    }
+                }
+            }
+        }
+    };
+    match decision {
+        Decision::Refuse(reason, text) => {
+            tracing::info!(%room, %from, reason, text, "refusing muji session-initiate");
+            let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
+                .append(Element::builder(reason, jingle_sdp::NS_JINGLE).build())
+                .append(Element::builder("text", jingle_sdp::NS_JINGLE).append(text).build())
+                .build();
+            let _ = w.send(jingle_iq(from, sid, "", "session-terminate", vec![reason]));
+            false
+        }
+        Decision::Accept { our_occupant, video, verified, occupant, device, replace } => {
+            // Address this participant at the session that actually calls us from now on.
+            if let Some(p) = calls.borrow_mut().muji_seen.get_mut(room).and_then(|m| m.get_mut(&occupant)) {
+                p.real_jid = from.to_string();
+            }
+            if let Some((old_sid, addr)) = replace {
+                if let Some(call) = remove_active(&calls, &old_sid) {
+                    let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
+                        .append(Element::builder("success", jingle_sdp::NS_JINGLE).build())
+                        .build();
+                    let _ = w.send(jingle_iq(&addr, &old_sid, "", "session-terminate", vec![reason]));
+                    call.engine.hang_up();
+                }
+            }
+            if let Err(e) = start_call(
+                w, calls, events, cfg, sid.to_string(), from.to_string(),
+                mxc_media::Role::Callee, video, Some(room.to_string()), our_occupant,
+            ) {
+                tracing::warn!(error = %e, "start muji callee engine");
+                return false;
+            }
+            configure_muji_leg(calls, sid, verified, device);
+            register_member_session(calls, room, &occupant, from, sid);
+            apply_conf_state_to_leg(calls, room, sid);
+            true
+        }
+    }
+}
+
+/// Set a freshly created group-call leg's verification requirement + the peer's advertised device
+/// (before its first offer/answer goes out — the engine's pump only runs once we yield).
+fn configure_muji_leg(calls: &CallRegistry, sid: &str, require_verified: bool, peer_device: Option<u32>) {
+    if let Some(call) = calls.borrow_mut().active.get_mut(sid) {
+        call.require_verified = require_verified;
+        call.peer_device = peer_device;
+    }
+}
+
+/// A group-call participant added a video content (turned their camera on). Accept it without a
+/// prompt: with our own camera if we send video in this conference, otherwise receive-only —
+/// first narrowing the content's `senders` to the adder (content-modify on its pending
+/// content-add, XEP-0166), then answering recv-only. Mirrors monocles Android.
+async fn muji_content_add(
+    w: &Writer,
+    calls: &CallRegistry,
+    events: &Sender<Event>,
+    cfg: &AccountConfig,
+    sid: &str,
+    from: &str,
+    jingle: &Element,
+) {
+    let new_owned: Vec<Element> = jingle.children().filter(|c| c.name() == "content").cloned().collect();
+    let Some((room, we_initiator, require_verified, peer_device, peer_full, negotiated, identity, video_now)) =
+        calls.borrow().active.get(sid).and_then(|c| {
+            c.room.clone().map(|r| {
+                (
+                    r,
+                    c.we_initiator,
+                    c.require_verified,
+                    c.peer_device,
+                    c.peer_full.clone(),
+                    c.negotiated.clone(),
+                    c.verified_identity.clone(),
+                    video_contents(&c.remote_contents),
+                )
+            })
+        })
+    else {
+        return;
+    };
+    let reject = |contents: &[Element]| {
+        let stubs = contents.iter().map(|c| content_stub(c, None)).collect();
+        let _ = w.send(jingle_iq(&peer_full, sid, "", "content-reject", stubs));
+    };
+    let only_new_video = !new_owned.is_empty()
+        && new_owned.iter().all(|c| {
+            c.get_child("description", jingle_sdp::NS_RTP).and_then(|d| d.attr("media")) == Some("video")
+                && !negotiated.iter().any(|n| Some(n.as_str()) == c.attr("name"))
+        });
+    if !only_new_video || video_now + new_owned.len() > MAX_MUJI_VIDEO_CONTENTS {
+        tracing::warn!(%sid, video_now, "muji: refusing content-add (not video, or too many video contents)");
+        reject(&new_owned);
+        return;
+    }
+    let was_encrypted = all_fingerprints_encrypted(&new_owned);
+    if require_verified && !was_encrypted {
+        fail_verified_leg(w, calls, events, cfg.account_id, sid, &peer_full, Some(&room)).await;
+        return;
+    }
+    let store = calls.borrow().store.clone();
+    let (new_contents, verified) = decrypt_call_fingerprints(&store, cfg, events, bare(from), new_owned).await;
+    if !muji_leg_acceptable(&new_contents, &verified, require_verified, peer_device)
+        || !keeps_leg_identity(&identity, was_encrypted, &new_contents, &verified)
+    {
+        fail_verified_leg(w, calls, events, cfg.account_id, sid, &peer_full, Some(&room)).await;
+        return;
+    }
+    let (send_video, camera_enabled) = calls
+        .borrow()
+        .conferences
+        .get(&room)
+        .map(|c| (c.video, c.camera_enabled))
+        .unwrap_or((false, false));
+    let contents = if send_video {
+        new_contents
+    } else {
+        let adder_only = if we_initiator { "responder" } else { "initiator" };
+        let stubs = new_contents.iter().map(|c| content_stub(c, Some(adder_only))).collect();
+        let narrow = jingle_iq(&peer_full, sid, "", "content-modify", stubs);
+        match super::iq::request(w, narrow).await {
+            Ok(_) => new_contents.iter().map(|c| content_with_senders(c, adder_only)).collect(),
+            Err(e) => {
+                tracing::info!(%sid, error = %e, "peer refused receive-only for its content-add");
+                reject(&new_contents);
+                return;
+            }
+        }
+    };
+    let applied = {
+        let mut c = calls.borrow_mut();
+        match c.active.get_mut(sid) {
+            Some(call) => {
+                let mut full = call.remote_contents.clone();
+                full.extend(contents);
+                // Keep the established DTLS roles across the re-offer (as Android does).
+                let full = with_peer_setup(full, call.peer_setup.as_deref());
+                let refs: Vec<&Element> = full.iter().collect();
+                match jingle_sdp::contents_to_sdp_for(&refs, !we_initiator) {
+                    Some(sdp) => {
+                        let res = if send_video {
+                            let res = call.engine.apply_video_offer(&sdp);
+                            // Adding the camera branch selects the live camera: keep the user's
+                            // camera-off choice for this conference.
+                            call.engine.set_video_enabled(camera_enabled);
+                            res
+                        } else {
+                            call.engine.apply_remote_offer(&sdp)
+                        };
+                        match res {
+                            Ok(()) => {
+                                call.remote_contents = full;
+                                call.video = true;
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "muji content-add: apply offer");
+                                false
+                            }
+                        }
+                    }
+                    None => false,
+                }
+            }
+            None => false,
+        }
+    };
+    if applied {
+        tracing::info!(%sid, send_video, "muji content-add accepted — answering with content-accept");
+        emit_conference(calls, events, cfg.account_id, &room).await;
+    }
+}
+
+/// A group-call peer changed `senders` of contents already negotiated on the leg: apply the
+/// modified description as a re-offer and answer it locally (the peer completes its side from the
+/// acknowledged IQ; our answer adds no content, so the pump sends nothing). A content-modify for
+/// our own pending content-add (the peer only narrowing it to receive-only) needs nothing — its
+/// content-accept carries the agreed senders.
+fn muji_content_modify(calls: &CallRegistry, sid: &str, jingle: &Element) {
+    let changes: Vec<(String, String)> = jingle
+        .children()
+        .filter(|c| c.name() == "content")
+        .filter_map(|c| Some((c.attr("name")?.to_string(), c.attr("senders")?.to_string())))
+        .filter(|(_, s)| matches!(s.as_str(), "both" | "initiator" | "responder" | "none"))
+        .collect();
+    let mut c = calls.borrow_mut();
+    let Some(call) = c.active.get_mut(sid) else { return };
+    if changes.is_empty()
+        || call.video_offer_pending
+        || !changes.iter().all(|(n, _)| call.negotiated.contains(n))
+    {
+        return;
+    }
+    let full: Vec<Element> = call
+        .remote_contents
+        .iter()
+        .map(|content| {
+            match changes.iter().find(|(n, _)| Some(n.as_str()) == content.attr("name")) {
+                Some((_, senders)) => content_with_senders(content, senders),
+                None => content.clone(),
+            }
+        })
+        .collect();
+    let offer = with_peer_setup(full.clone(), call.peer_setup.as_deref());
+    let refs: Vec<&Element> = offer.iter().collect();
+    let Some(sdp) = jingle_sdp::contents_to_sdp_for(&refs, !call.we_initiator) else { return };
+    match call.engine.apply_remote_offer(&sdp) {
+        Ok(()) => {
+            tracing::info!(%sid, ?changes, "muji content-modify applied");
+            call.remote_contents = full;
+        }
+        Err(e) => tracing::warn!(error = %e, "muji content-modify: apply offer"),
+    }
+}
+
+/// Group call: make sure leg `sid` carries our camera because we send video in this conference —
+/// a content-add of a new video m-line (the peer accepts it, receive-only or with its own camera).
+/// Safe to call repeatedly (on connect, upgrade, every re-mesh tick): does nothing while the leg
+/// isn't connected, already sends video, has a content-add in flight, or is backing off after
+/// the peer refused.
+fn ensure_leg_video(calls: &CallRegistry, room: &str, sid: &str) {
+    let mut c = calls.borrow_mut();
+    let Some(camera_enabled) = c.conferences.get(room).filter(|conf| conf.video).map(|conf| conf.camera_enabled)
+    else {
+        return;
+    };
+    let Some(call) = c.active.get_mut(sid) else { return };
+    if !call.connected
+        || call.sends_video
+        || call.video_offer_pending
+        || call.video_retry_after.is_some_and(|t| std::time::Instant::now() < t)
+    {
+        return;
+    }
+    tracing::info!(%sid, %room, "muji: adding our camera to leg");
+    call.video_offer_pending = true;
+    if let Err(e) = call.engine.offer_video() {
+        tracing::warn!(error = %e, "muji: offer video on leg");
+        call.video_offer_pending = false;
+        call.video_retry_after = Some(std::time::Instant::now() + MUJI_VIDEO_RETRY);
+    }
+    // Adding the camera branch selects the live camera: keep the user's camera-off choice (the
+    // peer then gets black frames, like every other leg while the camera is off).
+    call.engine.set_video_enabled(camera_enabled);
 }
 
 /// Mute / unmute the microphone on the active call `sid`.
@@ -1287,7 +2138,7 @@ pub fn decline_video_upgrade(w: &Writer, calls: &CallRegistry, initiator: &str, 
 
 /// Tear down a local media engine for `sid` if present.
 fn terminate_local(calls: &CallRegistry, sid: &str) {
-    if let Some(call) = calls.borrow_mut().active.remove(sid) {
+    if let Some(call) = remove_active(&calls, sid) {
         call.engine.hang_up();
     }
 }
@@ -1411,7 +2262,7 @@ async fn maybe_initiate(
     cfg: &AccountConfig,
     room: &str,
     peer_occupant: &str,
-    peer_addr: &str, // the peer's real full JID to address the Jingle to (falls back to occupant)
+    peer_addr: &str, // the peer's real full JID to address the Jingle to
     video: bool,
 ) {
     enum Act {
@@ -1426,7 +2277,13 @@ async fn maybe_initiate(
             None => Act::Skip,
             Some(conf) => {
                 let has_session = conf.members.get(peer_occupant).map(|m| m.sid.is_some()).unwrap_or(false);
+                let legs = conf.members.values().filter(|m| m.sid.is_some()).count();
                 if has_session {
+                    Act::Skip
+                } else if !conf.announced {
+                    Act::Wait // not yet: the room hasn't confirmed our participation
+                } else if legs >= muji::MAX_PEERS {
+                    tracing::warn!(%room, %peer_occupant, "muji: not meshing — participant limit reached");
                     Act::Skip
                 } else if muji::should_initiate(&conf.our_occupant, peer_occupant) {
                     // Serialize leg setup: only one per-pair leg negotiates ICE at a time.
@@ -1461,11 +2318,19 @@ async fn maybe_initiate(
         Act::Initiate(our_occ) => {
             tracing::info!(%room, %peer_occupant, %peer_addr, "muji maybe_initiate: initiating (we win the tie-break)");
             let sid = new_id("muji");
+            let (verified, device) = {
+                let c = calls.borrow();
+                (
+                    c.conferences.get(room).map(|cf| cf.verified).unwrap_or(false),
+                    c.muji_seen.get(room).and_then(|m| m.get(peer_occupant)).and_then(|p| p.device),
+                )
+            };
             match start_call(
                 w, calls, events, cfg, sid.clone(), peer_addr.to_string(),
                 mxc_media::Role::Caller, video, Some(room.to_string()), our_occ,
             ) {
                 Ok(()) => {
+                    configure_muji_leg(calls, &sid, verified, device);
                     register_member_session(calls, room, peer_occupant, peer_addr, &sid);
                     apply_conf_state_to_leg(calls, room, &sid);
                 }
@@ -1506,6 +2371,9 @@ async fn initiate_next_pending(
         if has_connecting_leg(&c, room) {
             return; // a leg is still negotiating — it will kick the next one when it settles
         }
+        if !c.conferences.get(room).is_some_and(|conf| conf.announced) {
+            return; // the room hasn't confirmed our participation yet
+        }
         let Some(conf) = c.conferences.get(room) else { return };
         c.muji_seen.get(room).and_then(|seen| {
             seen.iter()
@@ -1538,7 +2406,10 @@ async fn remesh(w: &Writer, calls: &CallRegistry, events: &Sender<Event>, cfg: &
                 .iter()
                 .filter(|(_, m)| {
                     m.state == MemberCallState::Ended
+                        // a leg that never came up; a participant we're only WAITING for (no
+                        // session yet — the peer initiates) is kept, dropping it just churned the UI
                         || (m.state == MemberCallState::Connecting
+                            && m.sid.is_some()
                             && m.connecting_since.elapsed() > STUCK_AFTER)
                 })
                 .map(|(occ, m)| (occ.clone(), m.sid.clone(), m.real_jid.clone()))
@@ -1551,7 +2422,7 @@ async fn remesh(w: &Writer, calls: &CallRegistry, events: &Sender<Event>, cfg: &
             conf.members.remove(occ);
         }
         if let Some(sid) = sid {
-            if let Some(call) = calls.borrow_mut().active.remove(sid) {
+            if let Some(call) = remove_active(&calls, sid) {
                 let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
                     .append(Element::builder("success", jingle_sdp::NS_JINGLE).build())
                     .build();
@@ -1588,6 +2459,137 @@ async fn remesh(w: &Writer, calls: &CallRegistry, events: &Sender<Event>, cfg: &
     if !to_drop.is_empty() {
         emit_conference(calls, events, cfg.account_id, room).await;
     }
+    // 3. Self-heal: every connected leg carries our camera if we send video.
+    ensure_video_on_legs(calls, room);
+}
+
+/// [`ensure_leg_video`] for every leg of `room`'s conference.
+fn ensure_video_on_legs(calls: &CallRegistry, room: &str) {
+    let sids: Vec<String> = calls
+        .borrow()
+        .conferences
+        .get(room)
+        .map(|conf| conf.members.values().filter_map(|m| m.sid.clone()).collect())
+        .unwrap_or_default();
+    for sid in sids {
+        ensure_leg_video(calls, room, &sid);
+    }
+}
+
+/// The room rebroadcast our READY `<muji>` (or, with `timed_out`, didn't within a few seconds):
+/// other participants know us now, so start the legs we initiate (XEP-0272 "wait until the MUC
+/// rebroadcasts its presence"). Idempotent.
+async fn mark_announced(
+    w: &Writer,
+    calls: &CallRegistry,
+    events: &Sender<Event>,
+    cfg: &AccountConfig,
+    room: &str,
+    timed_out: bool,
+) {
+    let (video, ready) = {
+        let mut c = calls.borrow_mut();
+        let Some(conf) = c.conferences.get_mut(room) else { return };
+        if conf.announced {
+            return;
+        }
+        conf.announced = true;
+        let video = conf.video;
+        let ready: Vec<(String, String)> = c
+            .muji_seen
+            .get(room)
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, p)| p.state == MujiState::Ready)
+                    .map(|(occ, p)| (occ.clone(), p.real_jid.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (video, ready)
+    };
+    if timed_out {
+        tracing::warn!(%room, "muji: the room did not reflect our <muji> presence in time — meshing anyway");
+    } else {
+        tracing::info!(%room, "muji: room confirmed our participation");
+    }
+    for (occupant, addr) in ready {
+        maybe_initiate(w, calls, events, cfg, room, &occupant, &addr, video).await;
+    }
+    emit_conference(calls, events, cfg.account_id, room).await;
+}
+
+/// Upgrade our participation in the audio group call in `room` to video: advertise the new
+/// 'webcam' content (XEP-0272 "Adding a Content Type": `<preparing/>`, then the content), then
+/// bring our camera onto every connected leg (legs created later start with video).
+pub async fn upgrade_group_call_to_video(
+    w: &Writer,
+    calls: &CallRegistry,
+    events: &Sender<Event>,
+    cfg: &AccountConfig,
+    room: &str,
+) {
+    let room = &room_key(room);
+    let nick = {
+        let mut c = calls.borrow_mut();
+        let Some(conf) = c.conferences.get_mut(room) else { return };
+        if conf.video {
+            None
+        } else {
+            conf.video = true;
+            conf.camera_enabled = true;
+            Some(conf.nick.clone())
+        }
+    };
+    if let Some(nick) = nick {
+        let device = {
+            let store = calls.borrow().store.clone();
+            crate::xeps::omemo::own_device_id(&store, cfg).await.ok()
+        };
+        let ready = muji::muji_payload(true, true, device);
+        muji::set_active_payload(cfg.account_id, room, Some(ready.clone()));
+        let _ = muji::send_muji_presence(w, room, &nick, Some(muji::muji_payload(false, true, device)));
+        let _ = muji::send_muji_presence(w, room, &nick, Some(ready));
+        tracing::info!(%room, "muji: upgraded our participation to video");
+    }
+    ensure_video_on_legs(calls, room);
+    emit_conference(calls, events, cfg.account_id, room).await;
+}
+
+/// End our part in `room`'s call WITHOUT sending presence (we're no longer an occupant — a
+/// directed presence would re-join the room): we left the room, were kicked/banned, or it was
+/// destroyed. Also forgets the room's participants and any pending invite.
+pub async fn on_room_left(w: &Writer, calls: &CallRegistry, events: &Sender<Event>, account_id: i64, room: &str) {
+    let room = &room_key(room);
+    muji::forget_room(account_id, room);
+    let (sessions, was_invited) = {
+        let mut c = calls.borrow_mut();
+        let removed = c.conferences.remove(room);
+        if let Some(conf) = &removed {
+            log_conference_end(&c.store, c.account_id, conf);
+        }
+        let sessions: Vec<(String, String)> = removed
+            .map(|conf| conf.members.values().filter_map(|m| m.sid.clone().map(|s| (s, m.real_jid.clone()))).collect())
+            .unwrap_or_default();
+        c.muji_seen.remove(room);
+        (sessions, c.invited.remove(room))
+    };
+    muji::set_active_payload(account_id, room, None);
+    for (sid, addr) in sessions {
+        if let Some(call) = remove_active(&calls, &sid) {
+            let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
+                .append(Element::builder("gone", jingle_sdp::NS_JINGLE).build())
+                .build();
+            let _ = w.send(jingle_iq(&addr, &sid, "", "session-terminate", vec![reason]));
+            call.engine.hang_up();
+        }
+        log_call_end(calls, &sid);
+    }
+    if was_invited {
+        let _ = events
+            .send(Event::ConferenceInviteCancelled { account_id, room: room.to_string() })
+            .await;
+    }
+    emit_conference(calls, events, account_id, room).await;
 }
 
 /// Drop a participant who left the conference: terminate their per-pair session (if any) and
@@ -1604,7 +2606,7 @@ fn remove_member(w: &Writer, calls: &CallRegistry, room: &str, occupant: &str) {
         }
     };
     if let Some((sid, addr)) = sid {
-        if let Some(call) = calls.borrow_mut().active.remove(&sid) {
+        if let Some(call) = remove_active(&calls, &sid) {
             let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
                 .append(Element::builder("success", jingle_sdp::NS_JINGLE).build())
                 .build();
@@ -1625,14 +2627,17 @@ pub async fn place_group_call(
     room: &str,
     video: bool,
 ) {
+    // The store is keyed by the room as stored; the call registry by the normalized key.
+    let stored_room = room;
+    let room = &room_key(room);
     let store = calls.borrow().store.clone();
     // Group calls are gated to private groups (members-only + non-anonymous): Muji's per-pair
     // Jingle needs the participants' real JIDs, which only such rooms expose.
-    if !store.muc_omemo_capable(cfg.account_id, room).await.unwrap_or(false) {
+    if !store.muc_omemo_capable(cfg.account_id, stored_room).await.unwrap_or(false) {
         tracing::warn!(%room, "place_group_call: refusing — room is not a private (non-anonymous) group");
         return;
     }
-    let nick = match store.muc_nick_by_jid(cfg.account_id, room).await {
+    let nick = match store.muc_nick_by_jid(cfg.account_id, stored_room).await {
         Ok(Some(n)) => n,
         _ => {
             tracing::warn!(%room, "place_group_call: no stored MUC nick (not joined?)");
@@ -1640,14 +2645,39 @@ pub async fn place_group_call(
         }
     };
     let our_occupant = format!("{room}/{nick}");
+    if calls.borrow().conferences.contains_key(room) {
+        // Already in this call (e.g. a second "join"): replacing the conference would orphan its
+        // legs and start a second re-mesh loop.
+        emit_conference(calls, events, cfg.account_id, room).await;
+        return;
+    }
+    // The group call is PQ OMEMO2-verified only when placed with the room's encryption set to
+    // OMEMO2 (same rule as Android's conversation lock); otherwise legs verify opportunistically.
+    let verified = store
+        .conversation_encryption(cfg.account_id, stored_room)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|e| e == "omemo2");
     let had_invite = {
         let mut c = calls.borrow_mut();
+        // We started the call unless someone was already in it.
+        let outgoing = !c
+            .muji_seen
+            .get(room)
+            .is_some_and(|seen| seen.values().any(|p| p.state == MujiState::Ready));
         c.conferences.insert(
             room.to_string(),
             Conference {
                 nick: nick.clone(),
                 our_occupant,
                 video,
+                verified,
+                stored_room: stored_room.to_string(),
+                started_at: now(),
+                outgoing,
+                answered: false,
+                announced: false,
                 muted: false,
                 camera_enabled: true,
                 screen: None,
@@ -1662,7 +2692,7 @@ pub async fn place_group_call(
             .send(Event::ConferenceInviteCancelled { account_id: cfg.account_id, room: room.to_string() })
             .await;
     }
-    tracing::info!(%room, video, "place_group_call: announcing muji presence");
+    tracing::info!(%room, video, verified, "place_group_call: announcing muji presence");
     // Advertise our OMEMO device id so peers (Android) can OMEMO-encrypt their per-pair DTLS
     // fingerprint to us; None if OMEMO isn't set up (the leg then stays plaintext).
     let device = {
@@ -1671,24 +2701,24 @@ pub async fn place_group_call(
     };
     // XEP-0272: announce `<preparing/>` then the ready content. Our codec set is fixed, so we
     // can advertise readiness immediately.
+    // Every later presence to the room (e.g. the re-join after a reconnect) keeps carrying it.
+    muji::set_active_payload(cfg.account_id, room, Some(muji::muji_payload(true, video, device)));
     let _ = muji::send_muji_presence(w, room, &nick, Some(muji::muji_payload(false, video, device)));
     let _ = muji::send_muji_presence(w, room, &nick, Some(muji::muji_payload(true, video, device)));
-    // Mesh with anyone already ready.
-    let ready: Vec<(String, String)> = calls
-        .borrow()
-        .muji_seen
-        .get(room)
-        .map(|m| {
-            m.iter()
-                .filter(|(_, p)| p.state == MujiState::Ready)
-                .map(|(occ, p)| (occ.clone(), p.real_jid.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    for (occupant, addr) in ready {
-        maybe_initiate(w, calls, events, cfg, room, &occupant, &addr, video).await;
-    }
+    // XEP-0272: mesh only once the room has rebroadcast our `<muji>` (see `mark_announced`,
+    // driven by our reflected self-presence). This timer is the safety net if it never arrives.
     emit_conference(calls, events, cfg.account_id, room).await;
+    {
+        let w = w.clone();
+        let calls = calls.clone();
+        let events = events.clone();
+        let cfg = cfg.clone();
+        let room = room.to_string();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            mark_announced(&w, &calls, &events, &cfg, &room, true).await;
+        });
+    }
 
     // Periodic re-mesh while we're in this call: heal legs that never connected (stuck /
     // one-sided) and re-establish after an ICE failure. Exits once we leave the conference.
@@ -1719,10 +2749,12 @@ pub async fn leave_group_call(
     cfg: &AccountConfig,
     room: &str,
 ) {
+    let room = &room_key(room);
     let (nick, sessions) = {
         let mut c = calls.borrow_mut();
         match c.conferences.remove(room) {
             Some(conf) => {
+                log_conference_end(&c.store, c.account_id, &conf);
                 let sessions: Vec<(String, String)> = conf
                     .members
                     .values()
@@ -1733,11 +2765,12 @@ pub async fn leave_group_call(
             None => (None, Vec::new()),
         }
     };
+    muji::set_active_payload(cfg.account_id, room, None);
     if let Some(nick) = nick {
         let _ = muji::send_muji_presence(w, room, &nick, None);
     }
     for (sid, addr) in sessions {
-        if let Some(call) = calls.borrow_mut().active.remove(&sid) {
+        if let Some(call) = remove_active(&calls, &sid) {
             let reason = Element::builder("reason", jingle_sdp::NS_JINGLE)
                 .append(Element::builder("success", jingle_sdp::NS_JINGLE).build())
                 .build();
@@ -1756,6 +2789,7 @@ pub async fn leave_group_call(
 
 /// Mute / unmute our microphone across every per-pair session of a group call.
 pub fn set_group_mute(calls: &CallRegistry, room: &str, muted: bool) {
+    let room = &room_key(room);
     let sids: Vec<String> = {
         let mut c = calls.borrow_mut();
         match c.conferences.get_mut(room) {
@@ -1774,6 +2808,7 @@ pub fn set_group_mute(calls: &CallRegistry, room: &str, muted: bool) {
 /// Turn our camera on/off across every per-pair session of a group call. The state is remembered
 /// on the conference so legs created later (re-mesh / new joiners) inherit it.
 pub fn set_group_camera(calls: &CallRegistry, room: &str, enabled: bool) {
+    let room = &room_key(room);
     let sids: Vec<String> = {
         let mut c = calls.borrow_mut();
         match c.conferences.get_mut(room) {
@@ -1793,6 +2828,7 @@ pub fn set_group_camera(calls: &CallRegistry, room: &str, enabled: bool) {
 /// shared camera hub switches its source to the screen, so every leg relays it. The portal handle
 /// is kept alive on the conference until [`stop_group_screen_share`].
 pub fn start_group_screen_share(calls: &CallRegistry, room: &str, screen: mxc_media::ScreenShare) {
+    let room = &room_key(room);
     let (fd, node_id) = (screen.raw_fd(), screen.node_id());
     {
         let mut c = calls.borrow_mut();
@@ -1810,6 +2846,7 @@ pub fn start_group_screen_share(calls: &CallRegistry, room: &str, screen: mxc_me
 
 /// Stop a group screen share: the hub returns to the camera and the portal cast ends.
 pub fn stop_group_screen_share(calls: &CallRegistry, room: &str) {
+    let room = &room_key(room);
     mxc_media::stop_group_screen_share();
     if let Some(conf) = calls.borrow_mut().conferences.get_mut(room) {
         conf.screen = None; // drop → portal session ends the cast
@@ -1818,6 +2855,7 @@ pub fn stop_group_screen_share(calls: &CallRegistry, room: &str) {
 
 /// Whether we are currently sharing our screen to the group call in `room`.
 pub fn group_screen_sharing(calls: &CallRegistry, room: &str) -> bool {
+    let room = &room_key(room);
     calls.borrow().conferences.get(room).map(|c| c.screen.is_some()).unwrap_or(false)
 }
 
@@ -1831,46 +2869,132 @@ pub async fn observe_muji_presence(
     events: &Sender<Event>,
     pres: &Element,
 ) {
+    const NS_MUC_USER: &str = "http://jabber.org/protocol/muc#user";
     let Some(from) = pres.attr("from") else { return };
-    let Some((room, _nick)) = from.split_once('/') else { return }; // occupant JIDs only
-    // Skip our own occupant presence (self-presence carries status code 110).
-    if let Some(x) = pres.get_child("x", "http://jabber.org/protocol/muc#user") {
-        if x.children().any(|c| c.name() == "status" && c.attr("code") == Some("110")) {
+    let Some((stored_room, nick)) = from.split_once('/') else { return }; // occupant JIDs only
+    let ptype = pres.attr("type").unwrap_or("available");
+    if ptype == "error" {
+        return; // says nothing about anyone's call participation
+    }
+    let room = room_key(stored_room);
+    let occupant = format!("{room}/{nick}");
+    let x = pres.get_child("x", NS_MUC_USER);
+    let has_status = |code: &str| {
+        x.is_some_and(|x| x.children().any(|c| c.name() == "status" && c.attr("code") == Some(code)))
+    };
+    let item = x.and_then(|x| x.get_child("item", NS_MUC_USER));
+    let unavailable = ptype == "unavailable";
+    let nick_change = unavailable && has_status("303");
+    let parsed = if unavailable { None } else { muji::parse_muji(pres) };
+
+    // Cheap filter first: only a presence carrying `<muji>`, or one for a room whose call we track,
+    // matters here (this runs for EVERY presence).
+    let tracked = {
+        let c = calls.borrow();
+        c.conferences.contains_key(&room) || c.muji_seen.contains_key(&room)
+    };
+    if parsed.is_none() && !tracked {
+        return;
+    }
+    // SECURITY: only occupants of a MUC we joined coordinate group calls. The router hands us
+    // every presence, and a contact's own `user@host/res` would otherwise pose as an occupant of
+    // "room" `user@host` — with a forged `<muji>` + `muc#user <item jid>` it could plant
+    // participants and pop "join group call" prompts. (Android only feeds MUC presences.)
+    if !muji::is_room_joined(cfg.account_id, &room) {
+        tracing::debug!(%from, "ignoring <muji> presence from outside a joined MUC");
+        return;
+    }
+
+    // We (re)joined the room: it replays every occupant's presence, so forget what we saw before
+    // (participants who left while we were disconnected would otherwise linger forever).
+    if muji::take_room_joining(cfg.account_id, &room) {
+        calls.borrow_mut().muji_seen.remove(&room);
+    }
+
+    // Our own occupant presence (status 110).
+    if has_status("110") {
+        if unavailable && !nick_change {
+            // We left the room, were kicked/banned, or it went away: our call there is over.
+            if calls.borrow().conferences.contains_key(&room) || calls.borrow().muji_seen.contains_key(&room) {
+                tracing::info!(%room, "muji: we are no longer in the room — ending its call");
+                on_room_left(w, calls, events, cfg.account_id, &room).await;
+            }
             return;
         }
-    }
-    let occupant = from.to_string();
-    let room = room.to_string();
-    let ptype = pres.attr("type").unwrap_or("available");
-    let state = if ptype == "unavailable" { None } else { muji::parse_muji_state(pres) };
-    // The occupant's REAL full JID (non-anonymous MUC exposes it in `<item jid>`). We address
-    // their per-pair Jingle here so it routes directly instead of via the MUC (which is
-    // unreliable peer-to-peer). Empty → fall back to the occupant JID.
-    let real_jid = pres
-        .get_child("x", "http://jabber.org/protocol/muc#user")
-        .and_then(|x| x.get_child("item", "http://jabber.org/protocol/muc#user"))
-        .and_then(|item| item.attr("jid"))
-        .map(str::to_string)
-        .unwrap_or_default();
-
-    // Track raw Muji state regardless of whether we're in the call yet.
-    {
-        let mut c = calls.borrow_mut();
-        match state {
-            Some(s) => {
-                let addr = if real_jid.is_empty() { occupant.clone() } else { real_jid.clone() };
-                c.muji_seen
-                    .entry(room.clone())
-                    .or_default()
-                    .insert(occupant.clone(), MujiPeer { state: s, real_jid: addr });
+        if unavailable {
+            return; // our new-nick presence follows
+        }
+        let (reannounce, confirm) = {
+            let mut c = calls.borrow_mut();
+            match c.conferences.get_mut(&room) {
+                Some(conf) => {
+                    // Track our (possibly renamed) occupant JID — the tie-break input.
+                    conf.our_occupant = occupant.clone();
+                    if let Some((_, nick)) = occupant.split_once('/') {
+                        conf.nick = nick.to_string();
+                    }
+                    let confirm = !conf.announced && matches!(parsed, Some((MujiState::Ready, _)));
+                    // The room reflected a presence of ours without `<muji>`: peers now think we
+                    // left. Re-assert participation.
+                    (parsed.is_none().then(|| conf.nick.clone()), confirm)
+                }
+                None => (None, false),
             }
-            None => {
-                if let Some(m) = c.muji_seen.get_mut(&room) {
-                    m.remove(&occupant);
+        };
+        tracing::debug!(%room, %occupant, muji = ?parsed, "muji: reflected self-presence");
+        if confirm {
+            mark_announced(w, calls, events, cfg, &room, false).await;
+        }
+        if let Some(nick) = reannounce {
+            if let Some(payload) = muji::active_payload(cfg.account_id, &room) {
+                tracing::info!(%room, "muji: reflected self-presence lost <muji> — re-announcing");
+                let _ = muji::send_muji_presence(w, &room, &nick, Some(payload));
+            }
+        }
+        return;
+    }
+
+    // A participant renaming (unavailable + 303, new nick in <item nick>): keep their leg — it's
+    // keyed by real JID on Android and must survive here too — and move our bookkeeping over.
+    if nick_change {
+        if let Some(new_nick) = item.and_then(|i| i.attr("nick")) {
+            let new_occupant = format!("{room}/{new_nick}");
+            let mut c = calls.borrow_mut();
+            if let Some(peer) = c.muji_seen.get_mut(&room).and_then(|m| m.remove(&occupant)) {
+                c.muji_seen.entry(room.clone()).or_default().insert(new_occupant.clone(), peer);
+            }
+            if let Some(conf) = c.conferences.get_mut(&room) {
+                if let Some(mut m) = conf.members.remove(&occupant) {
+                    m.occupant_jid = new_occupant.clone();
+                    conf.members.insert(new_occupant, m);
                 }
             }
         }
+        return;
     }
+
+    // The occupant's REAL full JID (non-anonymous MUC exposes it in `<item jid>`). Muji legs are
+    // addressed to — and authenticated against — it, so an advert without one is ignored (no
+    // fallback to the occupant JID, XEP-0272 forbids that addressing).
+    let real_jid = item
+        .and_then(|i| i.attr("jid"))
+        .filter(|j| j.contains('/'))
+        .map(str::to_string);
+    let state = match (parsed, &real_jid) {
+        (Some(p), Some(_)) => Some(p),
+        _ => None,
+    };
+
+    // Track raw Muji state regardless of whether we're in the call yet.
+    let previous = {
+        let mut c = calls.borrow_mut();
+        let seen = c.muji_seen.entry(room.clone()).or_default();
+        let previous = seen.remove(&occupant);
+        if let (Some((s, device)), Some(addr)) = (state, &real_jid) {
+            seen.insert(occupant.clone(), MujiPeer { state: s, real_jid: addr.clone(), device });
+        }
+        previous
+    };
 
     let in_conf = calls.borrow().conferences.contains_key(&room);
     if state.is_some() || in_conf {
@@ -1887,6 +3011,16 @@ pub async fn observe_muji_presence(
         };
         if any_participant && !already_invited {
             calls.borrow_mut().invited.insert(room.clone());
+            // A muted group must not ring: any occupant can toggle `<muji>` at will.
+            let store = calls.borrow().store.clone();
+            let mode = match store.conversation_notify_mode(cfg.account_id, stored_room).await {
+                Ok(Some(m)) => Some(m),
+                // the conversation may be stored with another spelling of the room
+                _ => store.conversation_notify_mode(cfg.account_id, &room).await.ok().flatten(),
+            };
+            if mode.as_deref() == Some("none") {
+                return;
+            }
             let nick = occupant.rsplit('/').next().unwrap_or(&occupant).to_string();
             tracing::info!(%room, %nick, "muji: group-call invite");
             let _ = events
@@ -1901,19 +3035,165 @@ pub async fn observe_muji_presence(
         return; // not in this conference — nothing else to coordinate
     }
 
-    let addr = if real_jid.is_empty() { occupant.clone() } else { real_jid.clone() };
-    match state {
-        Some(MujiState::Ready) => {
+    // A different real JID behind this occupant JID than before: the old one's leg goes.
+    if let (Some(prev), Some(addr)) = (&previous, &real_jid) {
+        if state.is_some() && !super::origin::jid_eq(&prev.real_jid, addr) {
+            remove_member(w, calls, &room, &occupant);
+        }
+    }
+    match (state, real_jid) {
+        (Some((MujiState::Ready, _)), Some(addr)) => {
             let video = calls.borrow().conferences.get(&room).map(|c| c.video).unwrap_or(false);
             maybe_initiate(w, calls, events, cfg, &room, &occupant, &addr, video).await;
         }
-        Some(MujiState::Preparing) => {
+        (Some((MujiState::Preparing, _)), Some(addr)) => {
             ensure_member(calls, &room, &occupant, &addr);
             emit_conference(calls, events, cfg.account_id, &room).await;
         }
-        None => {
+        _ => {
             remove_member(w, calls, &room, &occupant);
             emit_conference(calls, events, cfg.account_id, &room).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod muji_leg_tests {
+    use super::*;
+
+    const AUDIO: &str = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendrecv\r\n";
+
+    #[test]
+    fn sends_video_follows_direction() {
+        assert!(!sdp_sends_video(AUDIO));
+        assert!(sdp_sends_video(&format!("{AUDIO}m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=sendrecv\r\n")));
+        assert!(!sdp_sends_video(&format!("{AUDIO}m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:1\r\na=recvonly\r\n")));
+        // a later sending video m-line counts even after a receive-only one
+        assert!(sdp_sends_video(&format!(
+            "{AUDIO}m=video 9 X 96\r\na=mid:1\r\na=recvonly\r\nm=video 9 X 96\r\na=mid:2\r\na=sendonly\r\n"
+        )));
+        // a sending video m-line followed by audio
+        assert!(sdp_sends_video(&format!("m=video 9 X 96\r\na=mid:1\r\n{AUDIO}")));
+    }
+
+    fn content(fp_ns: &str) -> Element {
+        let fp = Element::builder("fingerprint", fp_ns).build();
+        let transport = Element::builder("transport", jingle_sdp::NS_ICE).append(fp).build();
+        Element::builder("content", jingle_sdp::NS_JINGLE)
+            .attr(crate::ncname("name"), "1")
+            .attr(crate::ncname("senders"), "both")
+            .append(transport)
+            .build()
+    }
+
+    #[test]
+    fn verified_leg_requirements() {
+        let plain = vec![content(jingle_sdp::NS_DTLS)];
+        let encrypted = vec![content(NS_OMEMO_DTLS)];
+        assert!(!all_fingerprints_encrypted(&plain));
+        assert!(all_fingerprints_encrypted(&encrypted));
+        assert!(all_fingerprints_decrypted(&plain));
+        assert!(!all_fingerprints_decrypted(&encrypted));
+
+        let trusted = Some(("fp".to_string(), 7, 1));
+        let untrusted = Some(("fp".to_string(), 7, 0));
+        // opportunistic leg: anything goes, except a device other than the advertised one
+        assert!(muji_leg_acceptable(&plain, &None, false, Some(7)));
+        assert!(!muji_leg_acceptable(&plain, &Some(("fp".into(), 8, 1)), false, Some(7)));
+        // verified leg: decrypted, trusted, right device
+        assert!(muji_leg_acceptable(&plain, &trusted, true, Some(7)));
+        assert!(!muji_leg_acceptable(&plain, &untrusted, true, Some(7)));
+        assert!(!muji_leg_acceptable(&plain, &None, true, None));
+        assert!(!muji_leg_acceptable(&encrypted, &trusted, true, None));
+    }
+
+    #[test]
+    fn actpass_is_replaced_by_the_negotiated_role() {
+        let fp = Element::builder("fingerprint", jingle_sdp::NS_DTLS)
+            .attr(crate::ncname("hash"), "sha-256")
+            .attr(crate::ncname("setup"), "actpass")
+            .append("AA:BB")
+            .build();
+        let transport = Element::builder("transport", jingle_sdp::NS_ICE).append(fp).build();
+        let content = Element::builder("content", jingle_sdp::NS_JINGLE)
+            .attr(crate::ncname("name"), "0")
+            .append(transport)
+            .build();
+        let fixed = with_peer_setup(vec![content.clone()], Some("passive"));
+        let fp = fixed[0]
+            .get_child("transport", jingle_sdp::NS_ICE)
+            .unwrap()
+            .get_child("fingerprint", jingle_sdp::NS_DTLS)
+            .unwrap();
+        assert_eq!(fp.attr("setup"), Some("passive"));
+        assert_eq!(fp.attr("hash"), Some("sha-256"));
+        assert_eq!(fp.text(), "AA:BB");
+        assert_eq!(contents_setup(&fixed).as_deref(), Some("passive"));
+        // unknown role → unchanged
+        assert_eq!(contents_setup(&with_peer_setup(vec![content], None)).as_deref(), Some("actpass"));
+        assert_eq!(opposite_setup("active").as_deref(), Some("passive"));
+        assert_eq!(sdp_setup("v=0\r\na=setup:active\r\n").as_deref(), Some("active"));
+    }
+
+    fn video(name: &str, fp_ns: &str) -> Element {
+        let fp = Element::builder("fingerprint", fp_ns).build();
+        Element::builder("content", jingle_sdp::NS_JINGLE)
+            .attr(crate::ncname("name"), name)
+            .append(Element::builder("description", jingle_sdp::NS_RTP).attr(crate::ncname("media"), "video").build())
+            .append(Element::builder("transport", jingle_sdp::NS_ICE).append(fp).build())
+            .build()
+    }
+
+    #[test]
+    fn renegotiation_keeps_leg_identity() {
+        let decrypted = vec![content(jingle_sdp::NS_DTLS)];
+        let identity = Some(("fp".to_string(), 7));
+        let same = Some(("fp".to_string(), 7, 1));
+        // never authenticated → nothing required
+        assert!(keeps_leg_identity(&None, false, &decrypted, &None));
+        // authenticated → encrypted + decrypted + same identity
+        assert!(keeps_leg_identity(&identity, true, &decrypted, &same));
+        assert!(!keeps_leg_identity(&identity, false, &decrypted, &same), "cleartext downgrade");
+        assert!(!keeps_leg_identity(&identity, true, &decrypted, &Some(("other".into(), 7, 1))));
+        assert!(!keeps_leg_identity(&identity, true, &decrypted, &Some(("fp".into(), 8, 1))));
+        assert!(!keeps_leg_identity(&identity, true, &[content(NS_OMEMO_DTLS)], &same), "undecryptable");
+    }
+
+    #[test]
+    fn video_contents_are_counted() {
+        let set = vec![content(jingle_sdp::NS_DTLS), video("1", jingle_sdp::NS_DTLS), video("2", jingle_sdp::NS_DTLS)];
+        assert_eq!(video_contents(&set), 2);
+        assert!(video_contents(&set) + 1 > MAX_MUJI_VIDEO_CONTENTS);
+    }
+
+    #[test]
+    fn recently_ended_ring() {
+        let mut ring = std::collections::VecDeque::new();
+        remember_ended(&mut ring, "sid-1", "peer@example.org/phone");
+        assert!(was_recently_ended(&ring, "sid-1", "peer@example.org/phone"));
+        assert!(was_recently_ended(&ring, "sid-1", "Peer@Example.org/phone"), "bare JID is case-insensitive");
+        assert!(!was_recently_ended(&ring, "sid-1", "peer@example.org/laptop"), "other session");
+        assert!(!was_recently_ended(&ring, "sid-1", "mallory@example.org/phone"), "other peer");
+        assert!(!was_recently_ended(&ring, "sid-2", "peer@example.org/phone"), "unknown sid");
+        for i in 0..RECENTLY_ENDED_CAP {
+            remember_ended(&mut ring, &format!("x-{i}"), "p@e/r");
+        }
+        assert_eq!(ring.len(), RECENTLY_ENDED_CAP);
+        assert!(!was_recently_ended(&ring, "sid-1", "peer@example.org/phone"), "oldest evicted");
+    }
+
+    #[test]
+    fn senders_rewrite_keeps_everything_else() {
+        let c = content(jingle_sdp::NS_DTLS);
+        let r = content_with_senders(&c, "initiator");
+        assert_eq!(r.attr("senders"), Some("initiator"));
+        assert_eq!(r.attr("name"), Some("1"));
+        assert!(r.get_child("transport", jingle_sdp::NS_ICE).is_some());
+        let stub = content_stub(&c, Some("responder"));
+        assert_eq!(stub.attr("senders"), Some("responder"));
+        assert_eq!(
+            stub.get_child("description", jingle_sdp::NS_RTP).and_then(|d| d.attr("media")),
+            Some("video")
+        );
     }
 }

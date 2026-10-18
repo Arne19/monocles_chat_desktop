@@ -401,6 +401,11 @@ pub mod qobject {
         #[cxx_name = "setConferenceCamera"]
         fn set_conference_camera(self: Pin<&mut Backend>, enabled: bool);
 
+        /// Start sending our camera in an audio group call (upgrades every leg to video).
+        #[qinvokable]
+        #[cxx_name = "upgradeGroupCallToVideo"]
+        fn upgrade_group_call_to_video(self: Pin<&mut Backend>);
+
         /// Start / stop sharing our screen to the group video call (runs the portal picker).
         #[qinvokable]
         #[cxx_name = "setConferenceScreenShare"]
@@ -1405,6 +1410,11 @@ impl qobject::Backend {
     pub fn set_conference_camera(mut self: Pin<&mut Self>, enabled: bool) {
         self.as_mut().set_conference_camera_on(enabled);
         crate::session::set_conference_camera(enabled);
+    }
+
+    pub fn upgrade_group_call_to_video(mut self: Pin<&mut Self>) {
+        self.as_mut().set_conference_camera_on(true);
+        crate::session::upgrade_group_call_to_video();
     }
 
     pub fn set_conference_screen_share(self: Pin<&mut Self>, enabled: bool) {

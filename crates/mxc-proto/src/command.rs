@@ -268,6 +268,9 @@ pub enum Command {
     PlaceGroupCall { account_id: i64, room: String, video: bool },
     /// Leave a Muji group call: drop our `<muji>` presence and terminate every per-pair session.
     LeaveGroupCall { account_id: i64, room: String },
+    /// Start sending our camera in an audio group call: re-announce `<muji>` with video and add
+    /// our camera to every per-pair session (content-add / the peers accept automatically).
+    UpgradeGroupCallToVideo { account_id: i64, room: String },
     /// Mute / unmute our microphone across every per-pair session of a group call.
     SetGroupCallMute { account_id: i64, room: String, muted: bool },
     /// Turn our camera on/off across every per-pair session of a group video call.

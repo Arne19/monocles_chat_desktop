@@ -201,9 +201,10 @@ impl CallEngine {
     /// Add a video send branch (camera + black-source selector + VP8) to the live session and
     /// link it to a new webrtcbin sink pad. Shared by the outgoing upgrade (we re-offer) and the
     /// incoming upgrade (we answer the peer's content-add). No-op if video is already present.
-    fn add_video_send_branch(&self) -> Result<()> {
+    /// Returns the new webrtcbin sink pad, or `None` if the branch already existed.
+    fn add_video_send_branch(&self) -> Result<Option<gst::Pad>> {
         if self.pipeline.by_name("vidsel").is_some() {
-            return Ok(());
+            return Ok(None);
         }
         // Group legs relay the shared camera over an `intervideosrc` channel; 1:1 uses autovideosrc.
         let cam_channel = if self.shared_camera {
@@ -238,22 +239,13 @@ impl CallEngine {
             None => tracing::warn!("video upgrade: localvideo appsink not found — no self-preview"),
         }
         // Link the bin's (ghosted) RTP src → a new webrtcbin sink pad.
-        let src = bin
-            .src_pads()
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("video bin has no src pad"))?;
-        let sinkpad = self
-            .webrtc
-            .request_pad_simple("sink_%u")
-            .ok_or_else(|| anyhow!("webrtcbin sink pad request failed"))?;
-        src.link(&sinkpad).context("link video bin → webrtcbin")?;
+        let sinkpad = link_send_bin(&self.webrtc, &bin)?;
         bin.sync_state_with_parent().context("sync video bin")?;
         // Ensure the live camera (sink_0), not the black source (sink_1), is selected.
         self.set_video_enabled(true);
         // A live source just joined → redistribute latency so its buffers aren't treated as late.
         let _ = self.pipeline.recalculate_latency();
-        Ok(())
+        Ok(Some(sinkpad))
     }
 
     /// Mid-call OUTGOING upgrade: add our video branch and re-offer, so the engine emits a
@@ -262,10 +254,11 @@ impl CallEngine {
         if self.pipeline.by_name("vidsel").is_some() {
             return Ok(());
         }
-        self.add_video_send_branch()?;
+        let pad = self.add_video_send_branch()?;
         // Drive the re-offer explicitly (the on-negotiation-needed handler is gated off after the
-        // first offer, so it won't double-offer here).
-        create_offer(&self.webrtc, self.tx.clone(), true);
+        // first offer, so it won't double-offer here) — once the new pad is ready.
+        let (webrtc, tx) = (self.webrtc.clone(), self.tx.clone());
+        after_send_caps(pad, move || create_offer(&webrtc, tx, true));
         Ok(())
     }
 
@@ -278,7 +271,33 @@ impl CallEngine {
     /// m-line recvonly (no SSRC) → we sent nothing (black to peer) and the encoder backed up,
     /// stalling the camera tee (frozen self-preview).
     pub fn apply_video_offer(&self, sdp: &str) -> Result<()> {
-        self.add_video_send_branch()?;
+        let desc = remote_description(SdpKind::Offer, sdp)?;
+        let pad = self.add_video_send_branch()?;
+        // Answer once our camera's pad has caps, so the answer carries our sending track (SSRC).
+        let (webrtc, tx) = (self.webrtc.clone(), self.tx.clone());
+        after_send_caps(pad, move || {
+            webrtc.emit_by_name::<()>("set-remote-description", &[&desc, &None::<gst::Promise>]);
+            create_answer(&webrtc, tx, true);
+        });
+        Ok(())
+    }
+
+    /// Group-call (Muji) leg: start sending our camera on this session — add the video branch if
+    /// the pipeline doesn't have one yet, then re-offer (→ Jingle `content-add` of a new video
+    /// m-line). Unlike [`Self::upgrade_to_video`] this also re-offers when the branch already
+    /// exists but was never negotiated (e.g. we answered an audio-only offer from a participant
+    /// who joined without video).
+    pub fn offer_video(&self) -> Result<()> {
+        let pad = self.add_video_send_branch()?;
+        let (webrtc, tx) = (self.webrtc.clone(), self.tx.clone());
+        after_send_caps(pad, move || create_offer(&webrtc, tx, true));
+        Ok(())
+    }
+
+    /// Mid-call renegotiation offer from the peer that we answer WITHOUT adding our camera: a
+    /// group-call participant turned their camera on (we receive only), or changed which side
+    /// sends on an existing m-line. Emits a renegotiation `LocalDescription{Answer}`.
+    pub fn apply_remote_offer(&self, sdp: &str) -> Result<()> {
         self.set_remote(SdpKind::Offer, sdp)?;
         create_answer(&self.webrtc, self.tx.clone(), true);
         Ok(())
@@ -287,13 +306,7 @@ impl CallEngine {
     /// Set a remote description on webrtcbin (no follow-up). Shared by the initial flow and
     /// renegotiation.
     fn set_remote(&self, kind: SdpKind, sdp: &str) -> Result<()> {
-        let ty = match kind {
-            SdpKind::Offer => gst_webrtc::WebRTCSDPType::Offer,
-            SdpKind::Answer => gst_webrtc::WebRTCSDPType::Answer,
-        };
-        tracing::debug!(?kind, "set_remote_description SDP:\n{sdp}");
-        let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).context("parse remote SDP")?;
-        let desc = gst_webrtc::WebRTCSessionDescription::new(ty, msg);
+        let desc = remote_description(kind, sdp)?;
         self.webrtc
             .emit_by_name::<()>("set-remote-description", &[&desc, &None::<gst::Promise>]);
         Ok(())
@@ -341,11 +354,12 @@ impl CallEngine {
         // If there's no video branch yet (audio-only call) we must also re-offer so the peer
         // learns we now send video. add_video_send_branch is idempotent.
         let need_offer = self.pipeline.by_name("vidsel").is_none();
-        self.add_video_send_branch()?;
+        let pad = self.add_video_send_branch()?;
         self.attach_screen(screen)?;
         if need_offer {
             // Drive the renegotiation offer (→ content-add); on-negotiation-needed is gated off.
-            create_offer(&self.webrtc, self.tx.clone(), true);
+            let (webrtc, tx) = (self.webrtc.clone(), self.tx.clone());
+            after_send_caps(pad, move || create_offer(&webrtc, tx, true));
         }
         Ok(())
     }
@@ -1297,6 +1311,73 @@ fn wire_video_appsink(sink: &gst::Element, vtx: VideoTx, local: bool) {
     );
 }
 
+/// Parse a peer's SDP into a webrtcbin session description.
+fn remote_description(kind: SdpKind, sdp: &str) -> Result<gst_webrtc::WebRTCSessionDescription> {
+    let ty = match kind {
+        SdpKind::Offer => gst_webrtc::WebRTCSDPType::Offer,
+        SdpKind::Answer => gst_webrtc::WebRTCSDPType::Answer,
+    };
+    tracing::debug!(?kind, "set_remote_description SDP:\n{sdp}");
+    let msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).context("parse remote SDP")?;
+    Ok(gst_webrtc::WebRTCSessionDescription::new(ty, msg))
+}
+
+/// The RTP caps of our video send branch (`rtpvp8pay pt=96`).
+fn video_rtp_caps() -> gst::Caps {
+    gst::Caps::builder("application/x-rtp")
+        .field("media", "video")
+        .field("encoding-name", "VP8")
+        .field("payload", 96i32)
+        .field("clock-rate", 90000i32)
+        .build()
+}
+
+/// Link a (mid-call) send bin's ghosted RTP src to a new webrtcbin sink pad. The transceiver gets
+/// its codec preference right away: webrtcbin silently LEAVES OUT of `create-offer` a transceiver
+/// whose sink pad has no caps yet — which, for a branch just added to a running pipeline, is the
+/// case until the first encoded frame — so a re-offer made immediately had no video m-line and no
+/// `content-add` was ever sent.
+fn link_send_bin(webrtc: &gst::Element, bin: &gst::Element) -> Result<gst::Pad> {
+    let src = bin
+        .src_pads()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("video bin has no src pad"))?;
+    let sinkpad = webrtc
+        .request_pad_simple("sink_%u")
+        .ok_or_else(|| anyhow!("webrtcbin sink pad request failed"))?;
+    if let Some(trans) = sinkpad.property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver") {
+        trans.set_property("codec-preferences", &video_rtp_caps());
+    }
+    src.link(&sinkpad).context("link video bin → webrtcbin")?;
+    Ok(sinkpad)
+}
+
+/// Run `f` once the new send pad has negotiated caps (bounded wait), so the SDP we then create
+/// carries the m-line WITH our SSRC — the peer needs it to map our RTP to the right m-line. With
+/// no new pad (`None`), or caps already there, `f` runs immediately. The codec preference set in
+/// [`link_send_bin`] keeps the m-line in the SDP even if the camera is slow to deliver.
+fn after_send_caps(pad: Option<gst::Pad>, f: impl FnOnce() + Send + 'static) {
+    let Some(pad) = pad else {
+        f();
+        return;
+    };
+    if pad.current_caps().is_some() {
+        f();
+        return;
+    }
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while pad.current_caps().is_none() && start.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if pad.current_caps().is_none() {
+            tracing::warn!("video send pad has no caps after 3s — offering without our SSRC");
+        }
+        f();
+    });
+}
+
 /// Create an SDP offer, set it as our local description, and emit it. `renegotiation` tags a
 /// mid-call re-offer (video upgrade) so the signalling layer sends `content-add`, not initiate.
 fn create_offer(webrtc: &gst::Element, tx: Tx, renegotiation: bool) {
@@ -1585,4 +1666,75 @@ mod tests {
         };
         assert_eq!(cert_block(&remote), cert_block(&id.pem));
     }
+
+    /// Regression: adding the video branch to a RUNNING call (as the former answerer — a Muji
+    /// responder leg) and re-offering must produce a video m-line carrying our SSRC. Creating the
+    /// offer right after linking the pad dropped the m-line entirely (no caps yet) → no
+    /// `content-add` → the peer never saw our camera.
+    #[test]
+    fn midcall_video_reoffer_has_video_mline() {
+        let _ = gst::init();
+        let desc = "audiotestsrc is-live=true ! opusenc ! rtpopuspay pt=111 ! \
+            application/x-rtp,media=audio,encoding-name=OPUS,payload=111 ! \
+            webrtcbin name=webrtc bundle-policy=max-bundle";
+        let (ctx, crx) = async_channel::unbounded::<EngineEvent>();
+        let (etx, erx) = async_channel::unbounded::<EngineEvent>();
+        let (vtx, _vrx) = async_channel::bounded::<VideoFrame>(4);
+        let (cp, caller, _) = build_and_play(desc, Role::Caller, &ctx, vtx.clone(), 3, true).unwrap();
+        let (ep, callee, _) = build_and_play(desc, Role::Callee, &etx, vtx, 3, true).unwrap();
+        let set_remote = |w: &gst::Element, kind, sdp: &str| {
+            let d = remote_description(kind, sdp).unwrap();
+            w.emit_by_name::<()>("set-remote-description", &[&d, &None::<gst::Promise>]);
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut answered = false;
+        while !answered {
+            assert!(std::time::Instant::now() < deadline, "initial negotiation did not finish");
+            while let Ok(ev) = crx.try_recv() {
+                match ev {
+                    EngineEvent::LocalDescription { sdp, .. } => {
+                        set_remote(&callee, SdpKind::Offer, &sdp);
+                        create_answer(&callee, etx.clone(), false);
+                    }
+                    EngineEvent::IceCandidate { mline_index, candidate } => {
+                        callee.emit_by_name::<()>("add-ice-candidate", &[&mline_index, &candidate])
+                    }
+                    _ => {}
+                }
+            }
+            while let Ok(ev) = erx.try_recv() {
+                if let EngineEvent::LocalDescription { sdp, .. } = ev {
+                    set_remote(&caller, SdpKind::Answer, &sdp);
+                    answered = true;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let bin = gst::parse::bin_from_description(
+            "videotestsrc is-live=true ! videoconvert ! video/x-raw,width=320,height=240 ! \
+             vp8enc deadline=1 ! rtpvp8pay pt=96",
+            true,
+        )
+        .unwrap()
+        .upcast::<gst::Element>();
+        ep.add(&bin).unwrap();
+        let pad = link_send_bin(&callee, &bin).unwrap();
+        bin.sync_state_with_parent().unwrap();
+        let (webrtc, tx) = (callee.clone(), etx.clone());
+        after_send_caps(Some(pad), move || create_offer(&webrtc, tx, true));
+        let start = std::time::Instant::now();
+        let reoffer = loop {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "no re-offer");
+            match erx.try_recv() {
+                Ok(EngineEvent::LocalDescription { sdp, renegotiation: true, .. }) => break sdp,
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        };
+        let _ = cp.set_state(gst::State::Null);
+        let _ = ep.set_state(gst::State::Null);
+        assert!(reoffer.contains("m=video"), "re-offer lacks the video m-line:\n{reoffer}");
+        let video = &reoffer[reoffer.find("m=video").unwrap()..];
+        assert!(video.contains("a=ssrc:"), "video m-line lacks our SSRC:\n{reoffer}");
+    }
+
 }

@@ -313,6 +313,15 @@ pub fn set_conference_camera(enabled: bool) {
     });
 }
 
+/// Start sending our camera in the active (audio) group call.
+pub fn upgrade_group_call_to_video() {
+    let room = CURRENT_CONFERENCE.lock().unwrap().as_ref().map(|c| c.room.clone());
+    let Some(room) = room else { return };
+    let guard = CLIENT.lock().unwrap();
+    let Some(ctx) = guard.as_ref() else { return };
+    let _ = ctx.commands.try_send(Command::UpgradeGroupCallToVideo { account_id: ctx.account_id, room });
+}
+
 /// Start / stop sharing our screen to the group video call (the core runs the portal picker).
 pub fn set_conference_screen_share(enabled: bool) {
     let room = CURRENT_CONFERENCE.lock().unwrap().as_ref().map(|c| c.room.clone());
@@ -355,7 +364,16 @@ pub fn load_calls(jid: String, qt: CxxQtThread<CallLogModel>) {
         let Ok(store) = store().await else { return };
         let Ok(account_id) = store.upsert_account(&jid).await else { return };
         let rows = store.recent_calls(account_id, 200).await.unwrap_or_default();
-        let items: Vec<CallEntry> = rows.iter().map(CallEntry::from_row).collect();
+        let mut items: Vec<CallEntry> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut item = CallEntry::from_row(row);
+            // A group call's history row names the room (XEP-0272 Muji).
+            if let Ok(Some(name)) = store.muc_display_name(account_id, &row.peer).await {
+                item.group = true;
+                item.name = name;
+            }
+            items.push(item);
+        }
         let _ = qt.queue(move |model: Pin<&mut CallLogModel>| model.reset(items));
     });
 }

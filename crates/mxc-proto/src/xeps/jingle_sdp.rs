@@ -34,6 +34,8 @@ struct Media {
     ssrc: Option<String>,
     cname: Option<String>,
     candidates: Vec<String>,
+    /// The SDP direction attribute (`sendrecv`/`sendonly`/`recvonly`/`inactive`), if present.
+    direction: String,
 }
 
 /// Parse every media section of an SDP blob.
@@ -87,14 +89,42 @@ fn parse_media(sdp: &str) -> Vec<Media> {
                 }
             }
             "candidate" => m.candidates.push(val.to_string()),
+            "sendrecv" | "sendonly" | "recvonly" | "inactive" => m.direction = key.to_string(),
             _ => {}
         }
     }
     out
 }
 
+/// Jingle `senders` (XEP-0166) for a media section of OUR local SDP. The SDP direction is from
+/// our point of view; `senders` names the session role(s) that send. Without a role (`None`) the
+/// legacy behaviour applies: always `both`.
+fn senders_for_local(direction: &str, we_initiator: Option<bool>) -> &'static str {
+    let Some(we_initiator) = we_initiator else { return "both" };
+    match direction {
+        "inactive" => "none",
+        // only we send
+        "sendonly" => if we_initiator { "initiator" } else { "responder" },
+        // only the peer sends
+        "recvonly" => if we_initiator { "responder" } else { "initiator" },
+        _ => "both",
+    }
+}
+
+/// SDP direction for a content of the REMOTE description (from the remote's point of view)
+/// given its Jingle `senders` and whether the remote is the session initiator.
+fn direction_for_remote(senders: Option<&str>, remote_initiator: Option<bool>) -> &'static str {
+    let Some(remote_initiator) = remote_initiator else { return "sendrecv" };
+    match senders.unwrap_or("both") {
+        "none" => "inactive",
+        "initiator" => if remote_initiator { "sendonly" } else { "recvonly" },
+        "responder" => if remote_initiator { "recvonly" } else { "sendonly" },
+        _ => "sendrecv",
+    }
+}
+
 /// Build a Jingle `<content>` element for one media section.
-fn media_to_content(m: &Media) -> Element {
+fn media_to_content(m: &Media, we_initiator: Option<bool>) -> Element {
     let mut desc = Element::builder("description", NS_RTP).attr(crate::ncname("media"), m.kind.as_str());
     for (id, rtpmap) in &m.rtpmap {
         let mut parts = rtpmap.split('/');
@@ -156,25 +186,48 @@ fn media_to_content(m: &Media) -> Element {
     Element::builder("content", NS_JINGLE)
         .attr(crate::ncname("creator"), "initiator")
         .attr(crate::ncname("name"), if m.mid.is_empty() { m.kind.as_str() } else { m.mid.as_str() })
-        .attr(crate::ncname("senders"), "both")
+        .attr(crate::ncname("senders"), senders_for_local(&m.direction, we_initiator))
         .append(desc.build())
         .append(transport.build())
         .build()
 }
 
 /// Convert an SDP into Jingle contents + the BUNDLE mid list (one content per media section).
+/// Every content is advertised as `senders='both'`; see [`sdp_to_contents_for`].
 pub fn sdp_to_contents(sdp: &str) -> (Vec<Element>, Vec<String>) {
+    sdp_to_contents_impl(sdp, None)
+}
+
+/// Like [`sdp_to_contents`], but `senders` reflects the SDP direction, given whether we are the
+/// Jingle session initiator — e.g. a receive-only video m-line is advertised as sent by the peer
+/// only, so the peer doesn't wait for (and show a black tile for) video we never send.
+pub fn sdp_to_contents_for(sdp: &str, we_initiator: bool) -> (Vec<Element>, Vec<String>) {
+    sdp_to_contents_impl(sdp, Some(we_initiator))
+}
+
+fn sdp_to_contents_impl(sdp: &str, we_initiator: Option<bool>) -> (Vec<Element>, Vec<String>) {
     let media = parse_media(sdp);
     let mids: Vec<String> = media
         .iter()
         .map(|m| if m.mid.is_empty() { m.kind.clone() } else { m.mid.clone() })
         .collect();
-    let contents = media.iter().map(media_to_content).collect();
+    let contents = media.iter().map(|m| media_to_content(m, we_initiator)).collect();
     (contents, mids)
 }
 
-/// Rebuild an SDP webrtcbin can consume from a set of Jingle `<content>` elements.
+/// Rebuild an SDP webrtcbin can consume from a set of Jingle `<content>` elements. Every m-line
+/// is `sendrecv`; see [`contents_to_sdp_for`].
 pub fn contents_to_sdp(contents: &[&Element]) -> Option<String> {
+    contents_to_sdp_impl(contents, None)
+}
+
+/// Like [`contents_to_sdp`], but each m-line's direction follows the content's `senders`, given
+/// whether the REMOTE party (whose description this is) is the Jingle session initiator.
+pub fn contents_to_sdp_for(contents: &[&Element], remote_initiator: bool) -> Option<String> {
+    contents_to_sdp_impl(contents, Some(remote_initiator))
+}
+
+fn contents_to_sdp_impl(contents: &[&Element], remote_initiator: Option<bool>) -> Option<String> {
     if contents.is_empty() {
         return None;
     }
@@ -220,7 +273,10 @@ pub fn contents_to_sdp(contents: &[&Element]) -> Option<String> {
             s.push_str(&format!("a=setup:{}\r\n", fp.attr("setup").unwrap_or("active")));
         }
         s.push_str(&format!("a=mid:{mid}\r\n"));
-        s.push_str("a=sendrecv\r\n");
+        s.push_str(&format!(
+            "a={}\r\n",
+            direction_for_remote(content.attr("senders"), remote_initiator)
+        ));
         for pt in &payloads {
             let id = pt.attr("id").unwrap_or("");
             let name = pt.attr("name").unwrap_or("");
@@ -351,6 +407,37 @@ a=mid:1\r\na=sendrecv\r\na=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack\r\na=ssrc:99
         assert!(sdp.contains("a=rtcp-fb:96 nack"));
         assert!(sdp.contains("a=group:BUNDLE 0 1"));
         assert!(sdp.contains("a=fingerprint:sha-256 AA:BB"));
+    }
+
+    #[test]
+    fn senders_follow_sdp_direction() {
+        let recv_video = AUDIO_VIDEO_SDP.replace("a=mid:1\r\na=sendrecv", "a=mid:1\r\na=recvonly");
+        // We answer (responder) and only receive video → only the initiator sends it.
+        let (contents, _) = sdp_to_contents_for(&recv_video, false);
+        assert_eq!(contents[0].attr("senders"), Some("both"));
+        assert_eq!(contents[1].attr("senders"), Some("initiator"));
+        // As initiator, a receive-only m-line is sent by the responder.
+        let (contents, _) = sdp_to_contents_for(&recv_video, true);
+        assert_eq!(contents[1].attr("senders"), Some("responder"));
+        // Legacy conversion keeps advertising both.
+        let (contents, _) = sdp_to_contents(&recv_video);
+        assert_eq!(contents[1].attr("senders"), Some("both"));
+    }
+
+    #[test]
+    fn remote_direction_follows_senders() {
+        let (contents, _) = sdp_to_contents_for(
+            &AUDIO_VIDEO_SDP.replace("a=mid:1\r\na=sendrecv", "a=mid:1\r\na=recvonly"),
+            false,
+        );
+        let refs: Vec<&Element> = contents.iter().collect();
+        // That responder's description, as seen by the initiator: it only receives video.
+        let sdp = contents_to_sdp_for(&refs, false).unwrap();
+        assert!(sdp.contains("a=mid:1\r\na=recvonly"));
+        assert!(sdp.contains("a=mid:0\r\na=sendrecv"));
+        // senders='initiator' coming from the initiator → it only sends.
+        let sdp = contents_to_sdp_for(&refs, true).unwrap();
+        assert!(sdp.contains("a=mid:1\r\na=sendonly"));
     }
 
     #[test]

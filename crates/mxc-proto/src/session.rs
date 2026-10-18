@@ -44,8 +44,11 @@ const REFUSED_RETRY_DELAY: Duration = Duration::from_secs(300);
 impl Session {
     /// `pinned` holds the priority of the strongest mechanism used for the account so far
     /// (-1: none) and is updated on every successful login.
+    /// `jid` is what we log in with; `identity` is the JID to bind — a full JID requests that
+    /// resource (the client passes its stable per-install resource, see `client.rs`).
     pub fn new<C: ServerConnector>(
         jid: Jid,
+        identity: Jid,
         password: zeroize::Zeroizing<String>,
         connector: C,
         timeouts: Timeouts,
@@ -54,6 +57,7 @@ impl Session {
     ) -> Self {
         let reconnector = Box::new(move |_location: Option<String>, slot: oneshot::Sender<Connection>| {
             let jid = jid.clone();
+            let identity = identity.clone();
             let connector = connector.clone();
             let password = password.clone();
             let pinned = pinned.clone();
@@ -72,7 +76,7 @@ impl Session {
                             let _ = slot.send(Connection {
                                 stream: stream.box_stream(),
                                 features,
-                                identity: jid,
+                                identity,
                             });
                             return;
                         }

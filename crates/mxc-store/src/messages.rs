@@ -808,6 +808,19 @@ impl Store {
         Ok(())
     }
 
+    /// A conversation's notification mode ('all'|'mentioned'|'mentions_replies'|'none'), if the
+    /// conversation exists.
+    pub async fn conversation_notify_mode(&self, account_id: i64, jid: &str) -> Result<Option<String>> {
+        let mode: Option<String> = sqlx::query_scalar(
+            "SELECT notify FROM conversations WHERE account_id = ?1 AND jid = ?2",
+        )
+        .bind(account_id)
+        .bind(jid)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(mode)
+    }
+
     /// Set a conversation's notification mode ('all'|'mentioned'|'mentions_replies'|'none').
     pub async fn set_notify_mode(&self, account_id: i64, jid: &str, mode: &str) -> Result<()> {
         sqlx::query!(
@@ -896,6 +909,21 @@ impl Store {
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(|r| r.kind))
+    }
+
+    /// The display name of the group chat (MUC) `jid` — its name, or the JID when unnamed — or
+    /// `None` when `jid` isn't one of our group chats. Matched without regard to ASCII case (room
+    /// spellings vary between bookmarks and the server).
+    pub async fn muc_display_name(&self, account_id: i64, jid: &str) -> Result<Option<String>> {
+        let name: Option<String> = sqlx::query_scalar(
+            "SELECT COALESCE(NULLIF(name, ''), jid) FROM conversations \
+             WHERE account_id = ?1 AND jid = ?2 COLLATE NOCASE AND kind = 'muc' LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(jid)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(name)
     }
 
     /// Our own XEP-0421 occupant id in a MUC, if we've learned it yet.
@@ -1282,6 +1310,27 @@ mod sender_auth_tests {
             thread: None,
             unstyled: false,
         }
+    }
+
+    #[tokio::test]
+    async fn muc_display_name_identifies_group_calls() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        store.upsert_muc(acc, "Team@MUC.example.org", Some("Team chat"), Some("me"), true).await.unwrap();
+        store.upsert_muc(acc, "plain@muc.example.org", None, Some("me"), true).await.unwrap();
+        store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
+        assert_eq!(
+            store.muc_display_name(acc, "team@muc.example.org").await.unwrap().as_deref(),
+            Some("Team chat"),
+            "case-insensitive"
+        );
+        assert_eq!(
+            store.muc_display_name(acc, "plain@muc.example.org").await.unwrap().as_deref(),
+            Some("plain@muc.example.org"),
+            "unnamed room falls back to its JID"
+        );
+        assert_eq!(store.muc_display_name(acc, "bob@example.org").await.unwrap(), None, "1:1 contact");
+        assert_eq!(store.muc_display_name(acc, "eve@example.org").await.unwrap(), None, "unknown");
     }
 
     #[tokio::test]

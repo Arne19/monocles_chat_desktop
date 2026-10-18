@@ -1461,7 +1461,9 @@ ApplicationWindow {
                                 // rejected, we cancelled, or the call failed before connecting.
                                 readonly property bool missed: model.direction === "in" && !model.answered
                                 readonly property bool unanswered: !model.answered
-                                onClicked: window.openContact(model.peer, model.peer.split('@')[0], "", "")
+                                // Group calls (XEP-0272 Muji) are logged under the room.
+                                onClicked: model.group ? window.openMuc(model.peer, model.name)
+                                                       : window.openContact(model.peer, model.peer.split('@')[0], "", "")
                                 contentItem: RowLayout {
                                     spacing: 8
                                     ColorIcon {
@@ -1478,14 +1480,15 @@ ApplicationWindow {
                                         spacing: 0
                                         Label {
                                             textFormat: Text.PlainText
-                                            text: model.peer.split('@')[0]
+                                            text: model.group ? model.name : model.peer.split('@')[0]
                                             elide: Text.ElideRight
                                             Layout.fillWidth: true
                                             color: missed ? "#e53935" : Material.foreground
                                         }
                                         Label {
                                             textFormat: Text.PlainText
-                                            text: (model.video ? qsTr("Video") : qsTr("Audio"))
+                                            text: (model.group ? qsTr("Group call") + " · " : "")
+                                                  + (model.video ? qsTr("Video") : qsTr("Audio"))
                                                   + (missed ? " · " + qsTr("Missed")
                                                             : (unanswered ? " · " + qsTr("Not answered") : ""))
                                                   + " · " + model.timestamp.replace("T", " ").substring(0, 16)
@@ -1497,9 +1500,11 @@ ApplicationWindow {
                                     }
                                     ToolButton {
                                         enabled: backend.connected && !backend.callActive
-                                        ToolTip.text: qsTr("Call back (audio)")
+                                                 && !(model.group && backend.conferenceActive)
+                                        ToolTip.text: model.group ? qsTr("Start group call (audio)") : qsTr("Call back (audio)")
                                         ToolTip.visible: hovered
-                                        onClicked: backend.placeCall(model.peer, false)
+                                        onClicked: model.group ? backend.placeGroupCall(model.peer, false)
+                                                               : backend.placeCall(model.peer, false)
                                         contentItem: ColorIcon {
                                             implicitWidth: 16; implicitHeight: 16
                                             source: window.iconBase + "call.svg"; color: Material.foreground
@@ -1507,9 +1512,11 @@ ApplicationWindow {
                                     }
                                     ToolButton {
                                         enabled: backend.connected && !backend.callActive
-                                        ToolTip.text: qsTr("Call back (video)")
+                                                 && !(model.group && backend.conferenceActive)
+                                        ToolTip.text: model.group ? qsTr("Start group call (video)") : qsTr("Call back (video)")
                                         ToolTip.visible: hovered
-                                        onClicked: backend.placeCall(model.peer, true)
+                                        onClicked: model.group ? backend.placeGroupCall(model.peer, true)
+                                                               : backend.placeCall(model.peer, true)
                                         contentItem: ColorIcon {
                                             implicitWidth: 16; implicitHeight: 16
                                             source: window.iconBase + "videocam.svg"; color: Material.foreground
@@ -6503,15 +6510,35 @@ ApplicationWindow {
                 }
             }
 
-            // Participant grid: avatars + connection state for audio calls; per-participant
-            // video tiles for video calls (each tile's frame is keyed by the participant's sid).
+            // Participant grid: one tile per participant — their video when they send it (also in
+            // an audio call where only some participants turned their camera on), otherwise
+            // avatar + name + connection state. Tiles share the available space: the column count
+            // is the one that makes the cells closest to square (same rule as monocles Android),
+            // with a minimum tile size below which the grid scrolls.
             GridView {
                 id: confGrid
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                cellWidth: backend.conferenceVideo ? 200 : 120
-                cellHeight: backend.conferenceVideo ? 160 : 130
+                readonly property int minCellW: 160
+                readonly property int minCellH: 120
+                readonly property int columns: {
+                    var n = Math.max(1, count), w = Math.max(1, width), h = Math.max(1, height)
+                    var best = 1, bestScore = -1, bestEmpty = 1e9
+                    for (var c = 1; c <= n; c++) {
+                        var r = Math.ceil(n / c)
+                        var cw = w / c, ch = h / r
+                        var sq = Math.min(cw, ch) / Math.max(cw, ch)
+                        var empty = r * c - n
+                        if (sq > bestScore + 1e-9 || (Math.abs(sq - bestScore) <= 1e-9 && empty < bestEmpty)) {
+                            best = c; bestScore = sq; bestEmpty = empty
+                        }
+                    }
+                    // Never narrower than the minimum tile width.
+                    return Math.max(1, Math.min(best, Math.floor(w / minCellW)))
+                }
+                cellWidth: Math.floor(width / columns)
+                cellHeight: Math.max(minCellH, Math.floor(height / Math.max(1, Math.ceil(Math.max(1, count) / columns))))
                 model: conferenceModel
                 ScrollBar.vertical: ThinScrollBar {}
 
@@ -6520,12 +6547,14 @@ ApplicationWindow {
                     height: confGrid.cellHeight
                     // Latest video frame (data: URL) for this participant, set from conferenceFrame.
                     property string frameUrl: ""
+                    // Show a video tile for video calls, or once this participant sends video.
+                    readonly property bool showVideo: backend.conferenceVideo || frameUrl.length > 0
                     // Fetch this occupant's avatar lazily (by occupant JID), like the member list.
                     Component.onCompleted: backend.fetchMucAvatar(model.jid)
-                    // Update this tile when a frame arrives for our participant's session.
+                    // Update this tile when a frame arrives for our participant's session (in an
+                    // audio call too: a participant may have turned their camera on).
                     Connections {
                         target: backend
-                        enabled: backend.conferenceVideo
                         function onConferenceFrame(sid, url) {
                             if (sid === model.sid)
                                 frameUrl = url
@@ -6534,7 +6563,7 @@ ApplicationWindow {
 
                     // Video tile.
                     Rectangle {
-                        visible: backend.conferenceVideo
+                        visible: showVideo
                         anchors.fill: parent
                         anchors.margins: 4
                         radius: 8
@@ -6542,7 +6571,9 @@ ApplicationWindow {
                         clip: true
                         Image {
                             anchors.fill: parent
-                            fillMode: Image.PreserveAspectCrop
+                            // Fit, not crop: a portrait camera in a landscape tile (or vice versa)
+                            // must not lose the face/edges.
+                            fillMode: Image.PreserveAspectFit
                             cache: false
                             asynchronous: true
                             retainWhileLoading: true
@@ -6551,8 +6582,8 @@ ApplicationWindow {
                         }
                         Avatar {
                             anchors.centerIn: parent
-                            implicitWidth: 56
-                            implicitHeight: 56
+                            implicitWidth: Math.min(96, Math.min(parent.width, parent.height) * 0.45)
+                            implicitHeight: implicitWidth
                             visible: frameUrl.length === 0
                             name: model.name
                             avatarPath: model.avatarPath
@@ -6578,7 +6609,7 @@ ApplicationWindow {
 
                     // Audio tile (avatar + name + state).
                     ColumnLayout {
-                        visible: !backend.conferenceVideo
+                        visible: !showVideo
                         anchors.centerIn: parent
                         spacing: 6
                         Avatar {
@@ -6661,6 +6692,22 @@ ApplicationWindow {
                         implicitHeight: 22
                         source: window.iconBase + (confMuteBtn.checked ? "mic-off.svg" : "mic.svg")
                         color: confMuteBtn.checked ? "white" : Material.foreground
+                    }
+                }
+
+                // Audio group call: turn our camera on — upgrades our participation to video on
+                // every leg (the others accept it automatically).
+                RoundButton {
+                    id: confStartCamBtn
+                    visible: !backend.conferenceVideo
+                    ToolTip.text: qsTr("Turn camera on")
+                    ToolTip.visible: hovered
+                    onClicked: backend.upgradeGroupCallToVideo()
+                    contentItem: ColorIcon {
+                        implicitWidth: 22
+                        implicitHeight: 22
+                        source: window.iconBase + "videocam-off.svg"
+                        color: Material.foreground
                     }
                 }
 

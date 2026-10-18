@@ -13,6 +13,8 @@ const ROLE_DIRECTION: i32 = 257;
 const ROLE_VIDEO: i32 = 258;
 const ROLE_ANSWERED: i32 = 259;
 const ROLE_TIMESTAMP: i32 = 260;
+const ROLE_GROUP: i32 = 261;
+const ROLE_NAME: i32 = 262;
 
 /// One call-history row.
 #[derive(Clone, Default)]
@@ -24,6 +26,10 @@ pub struct CallEntry {
     pub answered: bool,
     /// RFC3339 timestamp (formatted for display in QML).
     pub timestamp: String,
+    /// A group call (XEP-0272 Muji): `peer` is the room JID.
+    pub group: bool,
+    /// Display name for a group call (the room's name); empty for 1:1 calls.
+    pub name: String,
 }
 
 impl CallEntry {
@@ -34,6 +40,8 @@ impl CallEntry {
             video: c.video,
             answered: c.answered,
             timestamp: c.timestamp.clone(),
+            group: false,
+            name: String::new(),
         }
     }
 }
@@ -143,6 +151,8 @@ impl qobject::CallLogModel {
             ROLE_VIDEO => QVariant::from(&item.video),
             ROLE_ANSWERED => QVariant::from(&item.answered),
             ROLE_TIMESTAMP => QVariant::from(&QString::from(item.timestamp.as_str())),
+            ROLE_GROUP => QVariant::from(&item.group),
+            ROLE_NAME => QVariant::from(&QString::from(item.name.as_str())),
             _ => QVariant::default(),
         }
     }
@@ -158,6 +168,8 @@ impl qobject::CallLogModel {
         roles.insert(ROLE_VIDEO, QByteArray::from("video"));
         roles.insert(ROLE_ANSWERED, QByteArray::from("answered"));
         roles.insert(ROLE_TIMESTAMP, QByteArray::from("timestamp"));
+        roles.insert(ROLE_GROUP, QByteArray::from("group"));
+        roles.insert(ROLE_NAME, QByteArray::from("name"));
         roles
     }
 }
