@@ -1210,6 +1210,11 @@ pub async fn handle_incoming(
         return Ok(());
     }
 
+    // --- OMEMO2 device-list PEP notifications.
+    if super::omemo::handle_device_list_event(w, store, cfg, events, msg).await {
+        return Ok(());
+    }
+
     // --- Social-feed Stories PEP notifications.
     if super::stories::handle_event(store, cfg, events, msg).await {
         return Ok(());

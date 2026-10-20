@@ -386,7 +386,29 @@ pub async fn ensure_initialized(
 ) -> anyhow::Result<()> {
     register_event_sink(cfg.account_id, events);
     let device_id = maintain_and_republish(w, store, cfg).await?;
-    publish_device_list(w, cfg, device_id).await?;
+    // A device id retired by an identity regeneration whose list update failed is removed now.
+    let retired = retired_device(store, cfg.account_id).await.filter(|old| *old != device_id);
+    publish_device_list_replacing(w, cfg, device_id, retired).await?;
+    if retired.is_some() {
+        set_retired_device(store, cfg.account_id, None).await?;
+    }
+    Ok(())
+}
+
+/// The setting under which a device id retired by [`regenerate_own_identity`] waits to be
+/// removed from our device list (per account; the settings table is app-wide).
+fn retired_device_key(account_id: i64) -> String {
+    format!("omemo2_retired_device_id:{account_id}")
+}
+
+async fn retired_device(store: &Store, account_id: i64) -> Option<u32> {
+    store.setting(&retired_device_key(account_id)).await.ok().flatten().and_then(|v| v.parse().ok())
+}
+
+/// Record (`Some`) or clear (`None`, an empty value) the retired device id.
+async fn set_retired_device(store: &Store, account_id: i64, device: Option<u32>) -> anyhow::Result<()> {
+    let value = device.map(|d| d.to_string()).unwrap_or_default();
+    store.set_setting(&retired_device_key(account_id), &value).await?;
     Ok(())
 }
 
@@ -409,6 +431,12 @@ pub async fn regenerate_own_identity(
         .await?
         .map(|d| d as u32);
     warn!(account = cfg.account_id, old_device, "omemo: REGENERATING own identity (last resort)");
+    // Remember the old id before anything is wiped: if the device-list update at the end fails
+    // (e.g. the read times out), the next bootstrap still removes it (see ensure_initialized),
+    // instead of leaving a device advertised whose bundle is gone.
+    if old_device.is_some() {
+        set_retired_device(store, cfg.account_id, old_device).await?;
+    }
     store.reset_omemo2_own_state(cfg.account_id).await?;
     store.reset_omemo2_peer_state(cfg.account_id).await?;
     // Belt and braces: load_or_create would overwrite these anyway once the own-identity row
@@ -427,6 +455,7 @@ pub async fn regenerate_own_identity(
     // device list (other devices on the account are preserved).
     let device_id = maintain_and_republish(w, store, cfg).await?;
     publish_device_list_replacing(w, cfg, device_id, old_device).await?;
+    set_retired_device(store, cfg.account_id, None).await?;
     Ok(())
 }
 
@@ -479,6 +508,18 @@ async fn publish_bundle_xml(w: &Writer, device_id: u32, xml: &str) -> anyhow::Re
     Ok(())
 }
 
+/// A device list as far as it can be known: the list we read, empty if the node doesn't exist
+/// (`item-not-found` - nothing published, so no devices), or an error for any other failure,
+/// where the real list is unknown. A read-modify-write publish must not go ahead on that error:
+/// it would overwrite the real list with one built from nothing.
+fn existing_device_list(read: anyhow::Result<Vec<u32>>) -> anyhow::Result<Vec<u32>> {
+    match read {
+        Ok(ids) => Ok(ids),
+        Err(e) if e.to_string().contains("item-not-found") => Ok(Vec::new()),
+        Err(e) => Err(anyhow::anyhow!("reading the device list failed: {e}")),
+    }
+}
+
 async fn publish_device_list(w: &Writer, cfg: &AccountConfig, device_id: u32) -> anyhow::Result<()> {
     publish_device_list_replacing(w, cfg, device_id, None).await
 }
@@ -487,13 +528,24 @@ async fn publish_device_list(w: &Writer, cfg: &AccountConfig, device_id: u32) ->
 /// `remove` (our previous device id after an identity regeneration — its bundle is gone, so
 /// leaving it advertised would make peers try, and fail, to encrypt to it). Other devices'
 /// ids are preserved.
+///
+/// The current list is read first and only a node that doesn't exist yet (`item-not-found`)
+/// counts as empty. Any other failure (timeout, server error) aborts without publishing: a list
+/// built from a failed read would hold only our device and drop every other live one, and
+/// peers would stop encrypting to them. Callers treat the error as "retry later" (bootstrap
+/// logs it; our own device-list notification re-announces).
 async fn publish_device_list_replacing(
     w: &Writer,
     cfg: &AccountConfig,
     device_id: u32,
     remove: Option<u32>,
 ) -> anyhow::Result<()> {
-    let mut ids = fetch_device_list(w, cfg.bare()).await.unwrap_or_default();
+    let mut ids = existing_device_list(fetch_device_list(w, cfg.bare()).await)
+        .map_err(|e| anyhow::anyhow!("not publishing our device list: {e}"))?;
+    if at_device_cap(&ids) {
+        // Possibly truncated by the parser: publishing it would drop every device past the cap.
+        anyhow::bail!("not publishing our device list: it is at the {MAX_DEVICES_PER_JID}-device cap");
+    }
     if let Some(old) = remove {
         ids.retain(|id| *id != old);
     }
@@ -537,19 +589,274 @@ async fn fetch_device_list(w: &Writer, jid: &str) -> anyhow::Result<Vec<u32>> {
     let mut out = Vec::new();
     for (_, payload) in pep::extract_items(&reply) {
         if payload.name() == "devices" {
-            for d in payload.children().filter(|c| c.name() == "device") {
-                if out.len() >= MAX_DEVICES_PER_JID {
-                    warn!(%jid, cap = MAX_DEVICES_PER_JID,
-                        "omemo: device list exceeds the cap — ignoring the rest");
-                    break;
-                }
-                if let Some(id) = d.attr("id").and_then(|s| s.parse::<u32>().ok()) {
-                    out.push(id);
-                }
-            }
+            parse_devices(jid, &payload, &mut out);
         }
     }
     Ok(out)
+}
+
+/// Whether a device list we parsed may have been cut off at [`MAX_DEVICES_PER_JID`]. Then a
+/// device "missing" from it may just sit past the cap, and a list rebuilt from it would drop
+/// every device beyond the cap, so it must not drive a re-announce or a publish.
+fn at_device_cap(devices: &[u32]) -> bool {
+    devices.len() >= MAX_DEVICES_PER_JID
+}
+
+/// Append the device ids of a `<devices>` payload to `out`, up to [`MAX_DEVICES_PER_JID`] in
+/// total. Shared by fetches and live notifications, so both obey the same cap.
+fn parse_devices(jid: &str, payload: &Element, out: &mut Vec<u32>) {
+    for d in payload.children().filter(|c| c.name() == "device") {
+        if out.len() >= MAX_DEVICES_PER_JID {
+            warn!(%jid, cap = MAX_DEVICES_PER_JID,
+                "omemo: device list exceeds the cap — ignoring the rest");
+            break;
+        }
+        if let Some(id) = d.attr("id").and_then(|s| s.parse::<u32>().ok()) {
+            out.push(id);
+        }
+    }
+}
+
+// --- live device-list notifications -----------------------------------------
+
+const NS_PUBSUB_EVENT: &str = "http://jabber.org/protocol/pubsub#event";
+
+/// Base cooldown between two re-announcements of our own device triggered by notifications.
+/// It doubles with every re-announce that follows soon after the previous one - another client
+/// keeps removing us, e.g. Android's OMEMO auto-expiry (on by default) pruning a long-idle
+/// device - up to [`OWN_REANNOUNCE_COOLDOWN_MAX`], and drops back to the base after a quiet
+/// period. A fight then costs a few publishes a day instead of one a minute.
+const OWN_REANNOUNCE_COOLDOWN: Duration = Duration::from_secs(60);
+const OWN_REANNOUNCE_COOLDOWN_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+/// The streak at which the fight is reported (once per streak).
+const OWN_REANNOUNCE_WARN_STREAK: u32 = 3;
+
+/// The last re-announce of an account and how many came in quick succession before it.
+#[derive(Debug, Clone, Copy)]
+struct Reannounced {
+    at: Instant,
+    streak: u32,
+}
+
+fn own_reannounced() -> &'static Mutex<HashMap<i64, Reannounced>> {
+    static C: OnceLock<Mutex<HashMap<i64, Reannounced>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cooldown after a re-announce with the given streak: base · 2^streak, capped.
+fn reannounce_cooldown(streak: u32) -> Duration {
+    1u32.checked_shl(streak)
+        .and_then(|factor| OWN_REANNOUNCE_COOLDOWN.checked_mul(factor))
+        .map_or(OWN_REANNOUNCE_COOLDOWN_MAX, |d| d.min(OWN_REANNOUNCE_COOLDOWN_MAX))
+}
+
+/// Whether we may re-announce our own device now (and record the attempt).
+fn may_reannounce_own_device(account_id: i64) -> bool {
+    let mut m = own_reannounced().lock().unwrap();
+    let streak = match m.get(&account_id) {
+        Some(last) => {
+            let cooldown = reannounce_cooldown(last.streak);
+            let elapsed = last.at.elapsed();
+            if elapsed < cooldown {
+                return false;
+            }
+            // Soon after the previous one: someone keeps removing us, so back off further.
+            if elapsed > cooldown.saturating_mul(2) { 0 } else { last.streak.saturating_add(1) }
+        }
+        None => 0,
+    };
+    if streak == OWN_REANNOUNCE_WARN_STREAK {
+        warn!(
+            account_id,
+            next_cooldown_secs = reannounce_cooldown(streak).as_secs(),
+            "omemo: another client keeps removing this device from our OMEMO device list \
+             (OMEMO auto-expiry?); backing off"
+        );
+    }
+    m.insert(account_id, Reannounced { at: Instant::now(), streak });
+    true
+}
+
+/// How long until the account's re-announce cooldown is over (zero if it already is).
+fn reannounce_cooldown_left(account_id: i64) -> Duration {
+    own_reannounced()
+        .lock()
+        .unwrap()
+        .get(&account_id)
+        .map(|last| reannounce_cooldown(last.streak).saturating_sub(last.at.elapsed()))
+        .unwrap_or_default()
+}
+
+/// Accounts with a deferred re-announce waiting for the cooldown to end (at most one each).
+fn reannounce_scheduled() -> &'static Mutex<HashSet<i64>> {
+    static C: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Clears an account's [`reannounce_scheduled`] entry when dropped.
+struct ScheduledGuard(i64);
+
+impl Drop for ScheduledGuard {
+    fn drop(&mut self) {
+        reannounce_scheduled().lock().unwrap().remove(&self.0);
+    }
+}
+
+/// Our device was dropped from our own list while the re-announce cooldown was running: try
+/// again once it is over, instead of staying unannounced until the next notification or login
+/// (peers don't encrypt to a device missing from the list, so messages to it would be lost).
+///
+/// At most one retry is pending per account. When it fires it reads the list afresh - another
+/// client, or an earlier notification, may have put us back meanwhile - and only re-announces
+/// if we are still missing, through the same re-fetching [`publish_device_list`] path. A failed
+/// read changes nothing. The task lives on the connection's runtime, so it ends with it.
+fn schedule_own_reannounce(w: Writer, cfg: AccountConfig, device: u32) {
+    let account_id = cfg.account_id;
+    if !reannounce_scheduled().lock().unwrap().insert(account_id) {
+        return; // a retry is already waiting
+    }
+    // Owned by the task: if its runtime drops it mid-sleep (a reconnect), the entry is still
+    // cleared, so a later removal can schedule a new retry.
+    let scheduled = ScheduledGuard(account_id);
+    let wait = reannounce_cooldown_left(account_id);
+    tokio::task::spawn_local(async move {
+        tokio::time::sleep(wait).await;
+        drop(scheduled);
+        match existing_device_list(fetch_device_list(&w, cfg.bare()).await) {
+            Ok(devices) if devices.contains(&device) => {
+                debug!(device, "omemo: our device is back in our device list; no re-announce needed");
+            }
+            Ok(devices) if at_device_cap(&devices) => {
+                warn!(cap = MAX_DEVICES_PER_JID, "omemo: our device list is at the device cap; not re-announcing from it");
+            }
+            Ok(_) => {
+                if may_reannounce_own_device(account_id) {
+                    info!(device, "omemo: our device is still missing after the cooldown; re-announcing it");
+                    if let Err(e) = publish_device_list(&w, &cfg, device).await {
+                        warn!(error = %e, "omemo: re-announcing our device");
+                    }
+                } else {
+                    // Another re-announce just happened (and its own notification will tell).
+                    debug!(device, "omemo: re-announce already done meanwhile");
+                }
+            }
+            Err(e) => warn!(error = %e, "omemo: could not read our device list for the deferred re-announce"),
+        }
+    });
+}
+
+/// Whether a `pubsub#event` deletes or purges the device-list node. That is definitive (no
+/// devices published any more), unlike an `<items>` notification without payload.
+fn device_list_cleared(event: &Element) -> bool {
+    ["delete", "purge"]
+        .iter()
+        .any(|action| event.get_child(action, NS_PUBSUB_EVENT).is_some_and(|el| el.attr("node") == Some(NODE_DEVICES)))
+}
+
+/// The device ids carried by a device-list notification's `<items>`: `Some` with the ids of
+/// the (last) published `<devices>` payload, `None` if no item carries one (a notification
+/// without payload, or a retraction) - the caller then asks the node itself.
+fn devices_in_notification(jid: &str, items: &Element) -> Option<Vec<u32>> {
+    let payload = items
+        .children()
+        .filter(|c| c.name() == "item")
+        .filter_map(|item| item.get_child("devices", NS_OMEMO2))
+        .last()?;
+    let mut out = Vec::new();
+    parse_devices(jid, payload, &mut out);
+    Some(out)
+}
+
+/// Handle a PEP notification for an OMEMO2 device list (`+notify` on [`NODE_DEVICES`]).
+/// Returns true if it was one (and thus consumed).
+///
+/// What it does - and deliberately doesn't:
+/// * clears the JID's establish-failure back-off when its list changed, so a new device is
+///   tried on the very next send (encryption itself still re-fetches the list every time);
+/// * marks the JID's known devices active/inactive for the key screens and refreshes them;
+/// * for our own account: if our device is missing from the list, re-announces it through
+///   the re-fetching [`publish_device_list`] path (never a locally held list, and never removing
+///   anyone - see the device-list pruning rules), rate-limited by [`OWN_REANNOUNCE_COOLDOWN`];
+///   a removal during the cooldown is retried when it ends ([`schedule_own_reannounce`]).
+///
+/// Nothing is deleted and no trust changes, so a forged or transient list can at worst grey
+/// devices out until the next one. Only bare-JID senders count (see
+/// [`super::origin::pubsub_event_origin`]).
+pub async fn handle_device_list_event(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    events: &Sender<Event>,
+    msg: &Element,
+) -> bool {
+    let Some(event) = msg.get_child("event", NS_PUBSUB_EVENT) else {
+        return false;
+    };
+    let items = event.get_child("items", NS_PUBSUB_EVENT).filter(|i| i.attr("node") == Some(NODE_DEVICES));
+    let cleared = device_list_cleared(event);
+    if items.is_none() && !cleared {
+        return false;
+    }
+    let Some(jid) = super::origin::pubsub_event_origin(msg.attr("from"), cfg.bare()) else {
+        debug!(from = ?msg.attr("from"), "omemo: ignoring device-list event from a non-bare JID");
+        return true;
+    };
+    let own = jid.eq_ignore_ascii_case(cfg.bare());
+    let jid = if own { cfg.bare().to_string() } else { jid };
+
+    let carried = match items {
+        Some(items) => devices_in_notification(&jid, items),
+        // The node was deleted or purged: no devices (for us, re-announced below).
+        None => Some(Vec::new()),
+    };
+    let devices = match carried {
+        Some(devices) => devices,
+        None => match existing_device_list(fetch_device_list(w, &jid).await) {
+            Ok(devices) => devices,
+            Err(e) => {
+                // Can't tell what the list is now: change nothing rather than guess.
+                debug!(%jid, error = %e, "omemo: device-list notification without payload; fetch failed");
+                return true;
+            }
+        },
+    };
+    debug!(%jid, ?devices, "omemo: device-list notification");
+    refresh_device_list(cfg.account_id, &jid, &devices);
+
+    let own_device = if own {
+        store.omemo_own_device_id(cfg.account_id).await.ok().flatten().and_then(|d| u32::try_from(d).ok())
+    } else {
+        None
+    };
+    let changed = store
+        .set_omemo_devices_active(cfg.account_id, &jid, &devices, own_device)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(%jid, error = %e, "omemo: updating device activity");
+            false
+        });
+
+    if own {
+        if at_device_cap(&devices) && own_device.is_some_and(|d| !devices.contains(&d)) {
+            warn!(cap = MAX_DEVICES_PER_JID, "omemo: our device list is at the device cap; not re-announcing from it");
+        } else if let Some(device) = own_device.filter(|d| !devices.contains(d)) {
+            if may_reannounce_own_device(cfg.account_id) {
+                info!(device, "omemo: our device is missing from our device list; re-announcing it");
+                if let Err(e) = publish_device_list(w, cfg, device).await {
+                    warn!(error = %e, "omemo: re-announcing our device");
+                }
+            } else {
+                debug!(device, "omemo: our device is missing from our device list; retrying after the cooldown");
+                schedule_own_reannounce(w.clone(), cfg.clone(), device);
+            }
+        }
+        if changed {
+            let _ = crate::client::send_own_keys(store, events, cfg, cfg.account_id).await;
+        }
+    } else if changed {
+        let _ = crate::client::send_contact_keys(store, events, cfg.account_id, jid).await;
+    }
+    true
 }
 
 async fn fetch_bundle(w: &Writer, jid: &str, device: u32) -> anyhow::Result<Bundle> {
@@ -1280,6 +1587,271 @@ pub async fn decrypt_message(
         key_transport: is_key_transport,
         heartbeat_due,
     })
+}
+
+#[cfg(test)]
+mod device_list_event_tests {
+    use super::{devices_in_notification, may_reannounce_own_device, MAX_DEVICES_PER_JID, NODE_DEVICES, NS_OMEMO2};
+    use minidom::Element;
+
+    fn items(inner: &str) -> Element {
+        format!("<items xmlns='http://jabber.org/protocol/pubsub#event' node='{NODE_DEVICES}'>{inner}</items>")
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn published_list_is_parsed() {
+        let el = items(&format!(
+            "<item id='current'><devices xmlns='{NS_OMEMO2}'><device id='7'/><device id='42'/><device id='x'/></devices></item>"
+        ));
+        assert_eq!(devices_in_notification("a@b", &el), Some(vec![7, 42]));
+        // A published but empty list is a real (empty) list, not "unknown".
+        let empty = items(&format!("<item id='current'><devices xmlns='{NS_OMEMO2}'/></item>"));
+        assert_eq!(devices_in_notification("a@b", &empty), Some(vec![]));
+    }
+
+    #[test]
+    fn no_payload_or_retraction_means_ask_the_node() {
+        assert_eq!(devices_in_notification("a@b", &items("<item id='current'/>")), None);
+        assert_eq!(devices_in_notification("a@b", &items("<retract id='current'/>")), None);
+        // A payload in another namespace (e.g. legacy OMEMO) is not ours to read.
+        let legacy = items("<item id='current'><devices xmlns='urn:xmpp:omemo:2'><device id='1'/></devices></item>");
+        assert_eq!(devices_in_notification("a@b", &legacy), None);
+    }
+
+    #[test]
+    fn deleting_or_purging_the_node_counts_as_cleared() {
+        use super::device_list_cleared;
+        let event = |inner: &str| -> Element {
+            format!("<event xmlns='http://jabber.org/protocol/pubsub#event'>{inner}</event>").parse().unwrap()
+        };
+        assert!(device_list_cleared(&event(&format!("<delete node='{NODE_DEVICES}'/>"))));
+        assert!(device_list_cleared(&event(&format!("<purge node='{NODE_DEVICES}'/>"))));
+        // Another node, or an ordinary items notification, is not.
+        assert!(!device_list_cleared(&event("<delete node='urn:xmpp:bookmarks:1'/>")));
+        assert!(!device_list_cleared(&event(&format!("<items node='{NODE_DEVICES}'/>"))));
+    }
+
+    #[test]
+    fn notification_obeys_the_device_cap() {
+        let many: String = (0..MAX_DEVICES_PER_JID as u32 + 50).map(|i| format!("<device id='{i}'/>")).collect();
+        let el = items(&format!("<item id='current'><devices xmlns='{NS_OMEMO2}'>{many}</devices></item>"));
+        assert_eq!(devices_in_notification("a@b", &el).unwrap().len(), MAX_DEVICES_PER_JID);
+    }
+
+    #[test]
+    fn own_reannounce_is_rate_limited() {
+        let account = -4242; // an id no other test uses
+        assert!(may_reannounce_own_device(account));
+        assert!(!may_reannounce_own_device(account));
+    }
+
+    #[test]
+    fn reannounce_cooldown_doubles_and_is_capped() {
+        use super::{reannounce_cooldown, OWN_REANNOUNCE_COOLDOWN, OWN_REANNOUNCE_COOLDOWN_MAX};
+        assert_eq!(reannounce_cooldown(0), OWN_REANNOUNCE_COOLDOWN);
+        assert_eq!(reannounce_cooldown(1), OWN_REANNOUNCE_COOLDOWN * 2);
+        assert_eq!(reannounce_cooldown(3), OWN_REANNOUNCE_COOLDOWN * 8);
+        assert_eq!(reannounce_cooldown(20), OWN_REANNOUNCE_COOLDOWN_MAX);
+        assert_eq!(reannounce_cooldown(u32::MAX), OWN_REANNOUNCE_COOLDOWN_MAX);
+    }
+
+    /// Removed again soon after re-announcing: back off further. After a quiet period: reset.
+    #[test]
+    fn repeated_removals_back_off_and_quiet_periods_reset() {
+        use super::{own_reannounced, reannounce_cooldown_left, Reannounced, OWN_REANNOUNCE_COOLDOWN};
+        use std::time::{Duration, Instant};
+        let account = -4343;
+        let set = |ago: Duration, streak: u32| {
+            own_reannounced().lock().unwrap().insert(account, Reannounced { at: Instant::now() - ago, streak });
+        };
+        let streak = || own_reannounced().lock().unwrap()[&account].streak;
+
+        // Just past the 60 s cooldown: a fight, so the next cooldown is 120 s.
+        set(OWN_REANNOUNCE_COOLDOWN + Duration::from_secs(1), 0);
+        assert!(may_reannounce_own_device(account));
+        assert_eq!(streak(), 1);
+        assert!(reannounce_cooldown_left(account) > OWN_REANNOUNCE_COOLDOWN);
+        assert!(!may_reannounce_own_device(account), "still cooling down");
+
+        // Long after a streak-3 re-announce (8 min cooldown): calm again, back to the base.
+        set(Duration::from_secs(60 * 60), 3);
+        assert!(may_reannounce_own_device(account));
+        assert_eq!(streak(), 0);
+    }
+
+    /// A deferred retry whose runtime is dropped mid-sleep (reconnect) must not block later ones.
+    #[tokio::test]
+    async fn cancelled_retry_does_not_wedge_scheduling() {
+        use super::{own_reannounced, reannounce_scheduled, schedule_own_reannounce, Reannounced};
+        use crate::client::{AccountConfig, Writer};
+        use std::time::Instant;
+        let account = -7004;
+        own_reannounced().lock().unwrap().insert(account, Reannounced { at: Instant::now(), streak: 0 });
+        let (w, _rx) = Writer::for_tests();
+        let cfg = AccountConfig::new(account, "me@example.org".into(), String::new());
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async { schedule_own_reannounce(w, cfg, 77) }).await;
+        assert!(reannounce_scheduled().lock().unwrap().contains(&account), "retry pending while sleeping");
+        drop(local); // the connection's runtime goes away with the task still sleeping
+        assert!(!reannounce_scheduled().lock().unwrap().contains(&account), "the guard cleared the entry");
+    }
+
+    mod deferred {
+        use super::super::{
+            own_reannounced, schedule_own_reannounce, Reannounced, NODE_DEVICES, NS_OMEMO2,
+            OWN_REANNOUNCE_COOLDOWN,
+        };
+        use crate::client::{AccountConfig, Writer};
+        use crate::xeps::iq;
+        use minidom::Element;
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc::UnboundedReceiver;
+
+        const ME: &str = "me@example.org";
+        const OURS: u32 = 77;
+
+        async fn next(rx: &mut UnboundedReceiver<Element>) -> Element {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a stanza").expect("open")
+        }
+
+        fn devices_reply(get: &Element, ids: &[u32]) -> Element {
+            let devices: String = ids.iter().map(|d| format!("<device id='{d}'/>")).collect();
+            format!(
+                "<iq xmlns='jabber:client' type='result' id='{}' from='{ME}'>\
+                 <pubsub xmlns='http://jabber.org/protocol/pubsub'><items node='{NODE_DEVICES}'>\
+                 <item id='current'><devices xmlns='{NS_OMEMO2}'>{devices}</devices></item>\
+                 </items></pubsub></iq>",
+                get.attr("id").unwrap()
+            )
+            .parse()
+            .unwrap()
+        }
+
+        fn result_for(iq: &Element) -> Element {
+            format!("<iq xmlns='jabber:client' type='result' id='{}' from='{ME}'/>", iq.attr("id").unwrap())
+                .parse()
+                .unwrap()
+        }
+
+        fn error_reply(iq: &Element, condition: &str) -> Element {
+            format!(
+                "<iq xmlns='jabber:client' type='error' id='{}' from='{ME}'><error type='cancel'>\
+                 <{condition} xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
+                iq.attr("id").unwrap()
+            )
+            .parse()
+            .unwrap()
+        }
+
+        #[test]
+        fn only_a_missing_node_counts_as_an_empty_list() {
+            use super::super::existing_device_list;
+            assert_eq!(existing_device_list(Ok(vec![5, 7])).unwrap(), vec![5, 7]);
+            assert!(existing_device_list(Err(anyhow::anyhow!("iq x error: item-not-found"))).unwrap().is_empty());
+            let timeout = existing_device_list(Err(anyhow::anyhow!("iq x timed out"))).unwrap_err();
+            assert!(timeout.to_string().contains("timed out"), "{timeout}");
+            assert!(existing_device_list(Err(anyhow::anyhow!("iq x error: service-unavailable"))).is_err());
+        }
+
+        /// Publishing reads the node first: a failed read publishes nothing; a node that does
+        /// not exist yet is published with just our device.
+        #[tokio::test]
+        async fn publish_never_builds_a_list_from_a_failed_read() {
+            use super::super::publish_device_list;
+            let cfg = AccountConfig::new(-7003, ME.into(), String::new());
+
+            let (w, mut rx) = Writer::for_tests();
+            let publishing = {
+                let (w, cfg) = (w.clone(), cfg.clone());
+                tokio::spawn(async move { publish_device_list(&w, &cfg, OURS).await })
+            };
+            drop(w);
+            let get = next(&mut rx).await;
+            assert!(iq::try_resolve(&error_reply(&get, "service-unavailable"), ME));
+            assert!(publishing.await.unwrap().is_err(), "a failed read must abort");
+            assert!(rx.recv().await.is_none(), "nothing may be published after a failed read");
+
+            let (w, mut rx) = Writer::for_tests();
+            let publishing = {
+                let (w, cfg) = (w.clone(), cfg.clone());
+                tokio::spawn(async move { publish_device_list(&w, &cfg, OURS).await })
+            };
+            drop(w);
+            let get = next(&mut rx).await;
+            assert!(iq::try_resolve(&error_reply(&get, "item-not-found"), ME));
+            let publish = next(&mut rx).await;
+            assert_eq!(publish.attr("type"), Some("set"));
+            let xml = String::from(&publish);
+            assert!(xml.contains(&format!("id=\"{OURS}\"")) || xml.contains(&format!("id='{OURS}'")), "{xml}");
+            assert!(iq::try_resolve(&result_for(&publish), ME));
+            assert!(publishing.await.unwrap().is_ok());
+        }
+
+        /// A list read at the device cap may be truncated: rewriting it would drop every device
+        /// past the cap, so the publish is refused.
+        #[tokio::test]
+        async fn publish_refuses_a_list_at_the_device_cap() {
+            use super::super::{publish_device_list, MAX_DEVICES_PER_JID};
+            let cfg = AccountConfig::new(-7005, ME.into(), String::new());
+            let (w, mut rx) = Writer::for_tests();
+            let publishing = {
+                let (w, cfg) = (w.clone(), cfg.clone());
+                tokio::spawn(async move { publish_device_list(&w, &cfg, OURS).await })
+            };
+            drop(w);
+            let get = next(&mut rx).await;
+            let full: Vec<u32> = (1000..1000 + MAX_DEVICES_PER_JID as u32).collect();
+            assert!(iq::try_resolve(&devices_reply(&get, &full), ME));
+            let err = publishing.await.unwrap().unwrap_err();
+            assert!(err.to_string().contains("cap"), "{err}");
+            assert!(rx.recv().await.is_none(), "nothing may be published");
+        }
+
+        /// Start `account` with only ~50 ms of re-announce cooldown left and schedule twice.
+        fn schedule(account: i64) -> UnboundedReceiver<Element> {
+            let (w, rx) = Writer::for_tests();
+            let cfg = AccountConfig::new(account, ME.into(), String::new());
+            let almost_over = OWN_REANNOUNCE_COOLDOWN - Duration::from_millis(50);
+            own_reannounced().lock().unwrap().insert(account, Reannounced { at: Instant::now() - almost_over, streak: 0 });
+            schedule_own_reannounce(w.clone(), cfg.clone(), OURS);
+            schedule_own_reannounce(w, cfg, OURS); // already pending: must not add a second retry
+            rx
+        }
+
+        #[tokio::test]
+        async fn retry_rechecks_the_list_and_publishes_only_if_still_missing() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    // Back in the list by the time the cooldown ends: read once, publish nothing.
+                    let mut rx = schedule(-7001);
+                    let get = next(&mut rx).await;
+                    assert_eq!(get.attr("type"), Some("get"));
+                    assert!(iq::try_resolve(&devices_reply(&get, &[5, OURS]), ME));
+                    // Nothing else may be sent: either silence, or the channel closing because the
+                    // (single) retry task finished and dropped its writer.
+                    let more = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+                    assert!(!matches!(more, Ok(Some(_))), "no publish and no second (duplicate) retry: {more:?}");
+
+                    // Still missing: re-announce through the re-fetching publish, keeping the
+                    // other device and adding ours.
+                    let mut rx = schedule(-7002);
+                    let get = next(&mut rx).await;
+                    assert!(iq::try_resolve(&devices_reply(&get, &[5]), ME));
+                    let refetch = next(&mut rx).await; // publish_device_list reads the node again
+                    assert_eq!(refetch.attr("type"), Some("get"));
+                    assert!(iq::try_resolve(&devices_reply(&refetch, &[5]), ME));
+                    let publish = next(&mut rx).await;
+                    assert_eq!(publish.attr("type"), Some("set"));
+                    let xml = String::from(&publish);
+                    assert!(xml.contains("id=\"5\"") || xml.contains("id='5'"), "{xml}");
+                    assert!(xml.contains(&format!("id=\"{OURS}\"")) || xml.contains(&format!("id='{OURS}'")), "{xml}");
+                    assert!(iq::try_resolve(&result_for(&publish), ME));
+                })
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]

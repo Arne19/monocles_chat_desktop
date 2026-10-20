@@ -234,8 +234,10 @@ pub async fn handle_event(store: &Store, cfg: &AccountConfig, events: &Sender<Ev
     if items.attr("node") != Some(NS_STORIES) {
         return false;
     }
-    let from = msg.attr("from").unwrap_or_default();
-    let contact = from.split('/').next().unwrap_or(from).to_string();
+    let Some(contact) = super::origin::pubsub_event_origin(msg.attr("from"), cfg.bare()) else {
+        tracing::debug!(from = ?msg.attr("from"), "ignoring stories event from a non-bare JID");
+        return true;
+    };
 
     // Retractions remove the item; published items are parsed + stored.
     for retract in items.children().filter(|c| c.name() == "retract") {

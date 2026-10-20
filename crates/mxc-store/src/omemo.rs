@@ -728,6 +728,38 @@ impl Store {
 
     // ---- device lists ----------------------------------------------------
 
+    /// Mark which of `jid`'s known OMEMO2 devices are in its current published device list:
+    /// listed → active, unlisted → inactive. `keep` (our own device, for our own JID) stays
+    /// active whatever the list says. This is display state for the key screens only: no row is
+    /// deleted, trust is untouched, and nothing is published - a transient or hostile list can
+    /// at worst grey a device out until the next one. Returns whether any row changed.
+    pub async fn set_omemo_devices_active(
+        &self,
+        account_id: i64,
+        jid: &str,
+        listed: &[u32],
+        keep: Option<u32>,
+    ) -> Result<bool> {
+        // The ids travel as one bound JSON array (built from integers only), so the SQL stays
+        // static. -1 is never a device id (they are u32), so "no device to keep" matches none.
+        let ids = listed.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let ids = format!("[{ids}]");
+        let keep = keep.map(i64::from).unwrap_or(-1);
+        let result = sqlx::query(
+            "UPDATE omemo_identities
+             SET active = (device_id IN (SELECT value FROM json_each(?1)) OR device_id = ?2)
+             WHERE account_id = ?3 AND address_jid = ?4 COLLATE NOCASE
+               AND active <> (device_id IN (SELECT value FROM json_each(?1)) OR device_id = ?2)",
+        )
+        .bind(ids)
+        .bind(keep)
+        .bind(account_id)
+        .bind(jid)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn cache_device_list(
         &self,
         account_id: i64,
@@ -750,6 +782,42 @@ impl Store {
 #[cfg(test)]
 mod last_resort_prune_tests {
     use crate::Store;
+
+    /// A published device list only flips the display flag: unlisted devices go inactive,
+    /// re-listed ones active again, our own device never goes inactive, trust is untouched.
+    #[tokio::test]
+    async fn device_list_sets_the_active_flag_only() {
+        let store = Store::open_in_memory().await.expect("open");
+        let acc = store.upsert_account("me@example.org").await.expect("account");
+        let peer = "friend@example.net";
+        for dev in [1, 2, 3] {
+            store.save_omemo_identity(acc, peer, dev, &[dev as u8; 33]).await.unwrap();
+        }
+        let active = |s: Store| async move {
+            let mut a: Vec<(i64, bool)> =
+                s.list_omemo_identities(acc, peer).await.unwrap().into_iter().map(|i| (i.device_id, i.active)).collect();
+            a.sort();
+            a
+        };
+        let trust_before: Vec<i64> =
+            store.list_omemo_identities(acc, peer).await.unwrap().into_iter().map(|i| i.trust).collect();
+
+        assert!(store.set_omemo_devices_active(acc, peer, &[1, 3], None).await.unwrap());
+        assert_eq!(active(store.clone()).await, vec![(1, true), (2, false), (3, true)]);
+        // Same list again: nothing to change.
+        assert!(!store.set_omemo_devices_active(acc, peer, &[1, 3], None).await.unwrap());
+        // Case-insensitive JID match, and re-listing reactivates.
+        assert!(store.set_omemo_devices_active(acc, "Friend@Example.net", &[2], None).await.unwrap());
+        assert_eq!(active(store.clone()).await, vec![(1, false), (2, true), (3, false)]);
+        // An empty list (valid SQL) greys everything out except the kept device.
+        assert!(store.set_omemo_devices_active(acc, peer, &[], Some(3)).await.unwrap());
+        assert_eq!(active(store.clone()).await, vec![(1, false), (2, false), (3, true)]);
+
+        let trust_after: Vec<i64> =
+            store.list_omemo_identities(acc, peer).await.unwrap().into_iter().map(|i| i.trust).collect();
+        assert_eq!(trust_before, trust_after);
+        assert_eq!(store.list_omemo_identities(acc, peer).await.unwrap().len(), 3, "nothing is deleted");
+    }
 
     /// The replay-tracking table is append-only and is the one OMEMO2 write an unauthenticated
     /// peer can trigger, so it has to shed rows once the key they name is gone — but not before,

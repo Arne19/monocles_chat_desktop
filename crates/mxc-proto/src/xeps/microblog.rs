@@ -573,7 +573,11 @@ pub async fn handle_event(w: &Writer, store: &Store, cfg: &AccountConfig, events
     else {
         return false;
     };
-    let Some(service) = msg.attr("from").map(bare).filter(|s| !s.is_empty()) else { return true };
+    let Some(service) = super::origin::pubsub_event_origin(msg.attr("from"), cfg.bare()) else {
+        tracing::debug!(from = ?msg.attr("from"), "ignoring feed event from a non-bare JID");
+        return true;
+    };
+    let service = service.as_str();
     let account_id = cfg.account_id;
 
     if node.starts_with(COMMENTS_NODE_PREFIX) {

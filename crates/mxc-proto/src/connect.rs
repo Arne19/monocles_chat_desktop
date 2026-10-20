@@ -8,6 +8,11 @@
 //!   records are fetched. A DANE-EE match is trusted on its own; a PKIX-EE match still needs
 //!   the CA check; TLSA records that match nothing reject the certificate. Without usable
 //!   records the normal CA check applies - unless "Enforce DANE" is on, then it fails.
+//!   A *bogus* TLSA answer (DNSSEC validation failed, as opposed to an unsigned zone) always
+//!   rejects the certificate (RFC 6698 §4.1), like Android's MiniDNS 1.1.3 does.
+//! * A lookup only counts as validated when the whole answer chain is: the requested records
+//!   *and* any CNAME/DNAME that led to them. Otherwise an unsigned (forged) CNAME could point
+//!   into a zone the attacker signs themselves.
 //! * **TLS 1.3 only** when "Require TLS 1.3" is on (the default), else TLS 1.2 or 1.3.
 //!
 //! tokio-xmpp's own connectors build their rustls configuration internally, so none of this can
@@ -22,6 +27,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use hickory_resolver::proto::rr::rdata::tlsa::{CertUsage, Matching, Selector, TLSA};
+use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::rr::{RData, Record, RecordType};
 use hickory_resolver::TokioResolver;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -136,25 +142,52 @@ impl Resolvers {
     }
 }
 
-/// Records of `rtype` at `name` and whether every one of them is DNSSEC-validated (`Secure`).
-async fn lookup(dns: &Resolvers, name: &str, rtype: RecordType) -> (Vec<Record>, bool) {
+/// The DNSSEC outcome of a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Validation {
+    /// The requested records and every CNAME/DNAME leading to them validated.
+    Secure,
+    /// Unsigned, unvalidated or unavailable: usable, but not DNSSEC-verified.
+    Insecure,
+    /// DNSSEC validation failed: someone tampered with the answer (or a signature broke).
+    Bogus,
+}
+
+/// The validation state of a whole answer chain. RRSIGs are only the evidence and carry no
+/// state of their own; every other answer record (the requested type plus the CNAMEs/DNAMEs that
+/// led there) has to be `Secure`, and a single `Bogus` one makes the whole answer bogus.
+fn chain_validation(answers: &[Record], rtype: RecordType) -> Validation {
+    let chain = || answers.iter().filter(|r| r.record_type() != RecordType::RRSIG);
+    if chain().any(|r| r.proof.is_bogus()) {
+        Validation::Bogus
+    } else if chain().any(|r| r.record_type() == rtype) && chain().all(|r| r.proof.is_secure()) {
+        Validation::Secure
+    } else {
+        Validation::Insecure
+    }
+}
+
+/// Records of `rtype` at `name` and the DNSSEC state of the answer.
+async fn lookup(dns: &Resolvers, name: &str, rtype: RecordType) -> (Vec<Record>, Validation) {
     let pick = |answers: &[Record]| -> Vec<Record> {
         answers.iter().filter(|r| r.record_type() == rtype).cloned().collect()
     };
     match dns.validating.lookup(name, rtype).await {
-        Ok(found) => {
-            let records = pick(found.answers());
-            let secure = !records.is_empty() && records.iter().all(|r| r.proof.is_secure());
-            (records, secure)
+        Ok(found) => (pick(found.answers()), chain_validation(found.answers(), rtype)),
+        Err(e) if e.is_no_records_found() => (Vec::new(), Validation::Insecure),
+        Err(NetError::Dns(DnsError::Nsec { proof, .. })) if proof.is_bogus() => {
+            // A denial of existence that failed validation: the records may well exist and be
+            // suppressed by an attacker. Callers decide what that means (see `tlsa_records`).
+            tracing::debug!(%name, ?rtype, "DNSSEC: bogus denial of existence");
+            (Vec::new(), Validation::Bogus)
         }
-        Err(e) if e.is_no_records_found() => (Vec::new(), false),
         Err(e) => {
             // As on Android: a failed validation (or a resolver that strips DNSSEC data) falls
             // back to plain DNS - the endpoint then just isn't verified.
             tracing::debug!(%name, ?rtype, error = %e, "DNSSEC lookup failed, retrying without validation");
             match dns.plain.lookup(name, rtype).await {
-                Ok(found) => (pick(found.answers()), false),
-                Err(_) => (Vec::new(), false),
+                Ok(found) => (pick(found.answers()), Validation::Insecure),
+                Err(_) => (Vec::new(), Validation::Insecure),
             }
         }
     }
@@ -174,7 +207,8 @@ struct Endpoint {
 async fn endpoints(dns: &Resolvers, domain: &str) -> Vec<Endpoint> {
     let mut out = Vec::new();
     for (service, direct_tls) in [("_xmpps-client", true), ("_xmpp-client", false)] {
-        let (records, secure) = lookup(dns, &format!("{service}._tcp.{domain}."), RecordType::SRV).await;
+        let (records, validation) = lookup(dns, &format!("{service}._tcp.{domain}."), RecordType::SRV).await;
+        let secure = validation == Validation::Secure;
         for r in records {
             if let RData::SRV(srv) = &r.data {
                 let host = srv.target.to_ascii();
@@ -215,8 +249,9 @@ async fn addresses(dns: &Resolvers, host: &str) -> (Vec<IpAddr>, bool) {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return (vec![ip], false);
     }
-    let (v6, v6_secure) = lookup(dns, &format!("{host}."), RecordType::AAAA).await;
-    let (v4, v4_secure) = lookup(dns, &format!("{host}."), RecordType::A).await;
+    let (v6, v6_validation) = lookup(dns, &format!("{host}."), RecordType::AAAA).await;
+    let (v4, v4_validation) = lookup(dns, &format!("{host}."), RecordType::A).await;
+    let (v6_secure, v4_secure) = (v6_validation == Validation::Secure, v4_validation == Validation::Secure);
     let mut ips = Vec::new();
     for r in v6.iter().chain(v4.iter()) {
         match &r.data {
@@ -229,13 +264,70 @@ async fn addresses(dns: &Resolvers, host: &str) -> (Vec<IpAddr>, bool) {
     (ips, secure)
 }
 
-/// DNSSEC-validated TLSA records for `host:port`, `None` unless they validated.
-async fn tlsa_records(dns: &Resolvers, host: &str, port: u16) -> Option<Vec<TLSA>> {
-    let (records, secure) = lookup(dns, &format!("_{port}._tcp.{host}."), RecordType::TLSA).await;
-    if !secure {
-        return None;
+/// The TLSA records of an endpoint, as far as DANE is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tlsa {
+    /// DNSSEC-validated records.
+    Validated(Vec<TLSA>),
+    /// None, or not validated (unsigned zone, no DNSSEC endpoint): DANE does not apply.
+    Unavailable,
+    /// The TLSA answer failed DNSSEC validation: the connection must be aborted.
+    Bogus,
+}
+
+/// How often a bogus TLSA answer is looked up again before the connection is refused.
+const BOGUS_TLSA_RETRIES: usize = 2;
+
+/// The TLSA records for `host:port`.
+async fn tlsa_records(dns: &Resolvers, host: &str, port: u16) -> Tlsa {
+    let name = format!("_{port}._tcp.{host}.");
+    let first = lookup(dns, &name, RecordType::TLSA).await;
+    // Each retry gets a fresh resolver: `clear_cache()` would leave hickory's DNSSEC
+    // validation cache - and so the bogus verdict - in place.
+    let retry = || {
+        let name = &name;
+        async move { lookup(&Resolvers::new(), name, RecordType::TLSA).await }
+    };
+    settle_tlsa(host, port, first, retry).await
+}
+
+/// Decide what a TLSA lookup means for DANE. A bogus answer is retried (`retry`, at most
+/// [`BOGUS_TLSA_RETRIES`] times) because the system resolvers can disagree: on networks where
+/// one of them strips DNSSEC data, the SRV/A lookups may validate while the TLSA answer happens
+/// to come from the stripping one and is bogus, which would refuse a correctly configured
+/// server. Only an **upgrade** counts: a retry that validates (`Secure`) is used; anything else,
+/// including an `Insecure` plain-DNS fallback, keeps the answer bogus. Otherwise an attacker
+/// could turn a forgery into "DANE does not apply" by also making the validating lookup fail.
+/// A real forgery is bogus on every attempt, so it is still refused.
+async fn settle_tlsa<F, Fut>(host: &str, port: u16, first: (Vec<Record>, Validation), mut retry: F) -> Tlsa
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = (Vec<Record>, Validation)>,
+{
+    match first.1 {
+        Validation::Secure => return validated_tlsa(&first.0),
+        Validation::Insecure => return Tlsa::Unavailable,
+        Validation::Bogus => {}
     }
-    Some(
+    for attempt in 1..=BOGUS_TLSA_RETRIES {
+        let (records, validation) = retry().await;
+        if validation == Validation::Secure {
+            tracing::warn!(
+                %host,
+                port,
+                attempt,
+                "DANE: the TLSA answer was bogus on one resolver but validated on retry; a resolver \
+                 on this network may strip DNSSEC data"
+            );
+            return validated_tlsa(&records);
+        }
+    }
+    tracing::warn!(%host, port, "DANE: the TLSA answer failed DNSSEC validation");
+    Tlsa::Bogus
+}
+
+fn validated_tlsa(records: &[Record]) -> Tlsa {
+    Tlsa::Validated(
         records
             .iter()
             .filter_map(|r| match &r.data {
@@ -315,7 +407,7 @@ fn spki(cert_der: &[u8]) -> Option<Vec<u8>> {
 #[derive(Debug)]
 struct DaneVerifier {
     pkix: Arc<WebPkiServerVerifier>,
-    tlsa: Option<Vec<TLSA>>,
+    tlsa: Tlsa,
     enforce: bool,
     verified: Arc<AtomicBool>,
 }
@@ -329,7 +421,17 @@ impl ServerCertVerifier for DaneVerifier {
         ocsp: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match evaluate_dane(end_entity, self.tlsa.as_deref()) {
+        let records = match &self.tlsa {
+            // RFC 6698 §4.1: a bogus TLSA answer aborts the connection, enforced or not.
+            Tlsa::Bogus => {
+                return Err(rustls::Error::General(
+                    "DANE: the server's TLSA records failed DNSSEC validation".into(),
+                ))
+            }
+            Tlsa::Validated(records) => Some(records.as_slice()),
+            Tlsa::Unavailable => None,
+        };
+        match evaluate_dane(end_entity, records) {
             DaneResult::DaneEe => {
                 self.verified.store(true, Ordering::SeqCst);
                 Ok(ServerCertVerified::assertion())
@@ -457,7 +559,7 @@ impl SecureConnector {
         let tlsa = if dnssec && endpoint.host.parse::<IpAddr>().is_err() {
             tlsa_records(self.resolvers(), &endpoint.host, endpoint.port).await
         } else {
-            None
+            Tlsa::Unavailable
         };
         let verified = Arc::new(AtomicBool::new(false));
         let verifier = DaneVerifier { pkix: pkix_verifier()?, tlsa, enforce: policy.enforce_dane, verified: verified.clone() };
@@ -533,6 +635,126 @@ mod tests {
         webpki_root_certs::TLS_SERVER_ROOT_CERTS[0].as_ref().to_vec()
     }
 
+    fn answer(name: &str, data: RData, proof: hickory_resolver::proto::dnssec::Proof) -> Record {
+        let mut r = Record::from_rdata(hickory_resolver::proto::rr::Name::from_ascii(name).unwrap(), 300, data);
+        r.proof = proof;
+        r
+    }
+
+    fn tlsa_answer(proof: hickory_resolver::proto::dnssec::Proof) -> Record {
+        let tlsa = record(CertUsage::DaneEe, Selector::Full, Matching::Sha256, vec![0; 32]);
+        answer("_5223._tcp.target.example.", RData::TLSA(tlsa), proof)
+    }
+
+    fn cname_answer(proof: hickory_resolver::proto::dnssec::Proof) -> Record {
+        let target = hickory_resolver::proto::rr::Name::from_ascii("_5223._tcp.target.example.").unwrap();
+        answer("_5223._tcp.xmpp.example.", RData::CNAME(hickory_resolver::proto::rr::rdata::CNAME(target)), proof)
+    }
+
+    /// Run `settle_tlsa` with a scripted first answer and scripted retries; returns the
+    /// outcome and how many retries were made.
+    async fn settle(first: Validation, retries: &[Validation]) -> (Tlsa, usize) {
+        use hickory_resolver::proto::dnssec::Proof;
+        let answer = |v: Validation| -> (Vec<Record>, Validation) {
+            let proof = match v {
+                Validation::Secure => Proof::Secure,
+                Validation::Insecure => Proof::Insecure,
+                Validation::Bogus => Proof::Bogus,
+            };
+            (vec![tlsa_answer(proof)], v)
+        };
+        let calls = std::cell::Cell::new(0);
+        let script = retries.to_vec();
+        let tlsa = settle_tlsa("xmpp.example", 5223, answer(first), || {
+            let n = calls.get();
+            calls.set(n + 1);
+            let v = *script.get(n).expect("more retries than scripted");
+            async move { answer(v) }
+        })
+        .await;
+        (tlsa, calls.get())
+    }
+
+    #[tokio::test]
+    async fn bogus_tlsa_is_retried_but_only_an_upgrade_counts() {
+        use Validation::*;
+        // Mixed resolvers: bogus first, validated on retry → DANE applies with those records.
+        let (tlsa, retries) = settle(Bogus, &[Secure]).await;
+        assert!(matches!(tlsa, Tlsa::Validated(ref r) if r.len() == 1), "{tlsa:?}");
+        assert_eq!(retries, 1);
+        let (tlsa, retries) = settle(Bogus, &[Bogus, Secure]).await;
+        assert!(matches!(tlsa, Tlsa::Validated(_)));
+        assert_eq!(retries, 2);
+        // An insecure retry must not downgrade a bogus answer to "DANE n/a".
+        let (tlsa, _) = settle(Bogus, &[Insecure, Insecure]).await;
+        assert_eq!(tlsa, Tlsa::Bogus);
+        // A persistent forgery stays bogus, with a bounded number of retries.
+        let (tlsa, retries) = settle(Bogus, &[Bogus, Bogus]).await;
+        assert_eq!(tlsa, Tlsa::Bogus);
+        assert_eq!(retries, BOGUS_TLSA_RETRIES);
+        // Secure or insecure answers are final: no retry.
+        let (tlsa, retries) = settle(Secure, &[]).await;
+        assert!(matches!(tlsa, Tlsa::Validated(_)));
+        assert_eq!(retries, 0);
+        let (tlsa, retries) = settle(Insecure, &[]).await;
+        assert_eq!(tlsa, Tlsa::Unavailable);
+        assert_eq!(retries, 0);
+    }
+
+    #[test]
+    fn chain_validation_requires_the_whole_chain() {
+        use hickory_resolver::proto::dnssec::Proof;
+        let tlsa = RecordType::TLSA;
+        assert_eq!(chain_validation(&[tlsa_answer(Proof::Secure)], tlsa), Validation::Secure);
+        assert_eq!(
+            chain_validation(&[cname_answer(Proof::Secure), tlsa_answer(Proof::Secure)], tlsa),
+            Validation::Secure
+        );
+        // An unsigned (forgeable) CNAME into a validly signed zone is not a validated answer.
+        assert_eq!(
+            chain_validation(&[cname_answer(Proof::Insecure), tlsa_answer(Proof::Secure)], tlsa),
+            Validation::Insecure
+        );
+        // Any bogus link makes the whole answer bogus.
+        assert_eq!(
+            chain_validation(&[cname_answer(Proof::Bogus), tlsa_answer(Proof::Secure)], tlsa),
+            Validation::Bogus
+        );
+        assert_eq!(chain_validation(&[tlsa_answer(Proof::Bogus)], tlsa), Validation::Bogus);
+        assert_eq!(chain_validation(&[tlsa_answer(Proof::Indeterminate)], tlsa), Validation::Insecure);
+        // A validated CNAME alone (the target type is missing) is not a validated TLSA answer.
+        assert_eq!(chain_validation(&[cname_answer(Proof::Secure)], tlsa), Validation::Insecure);
+        assert_eq!(chain_validation(&[], tlsa), Validation::Insecure);
+    }
+
+    #[test]
+    fn bogus_tlsa_rejects_the_certificate_even_when_dane_is_not_enforced() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let verifier = |tlsa, enforce| DaneVerifier {
+            pkix: pkix_verifier().unwrap(),
+            tlsa,
+            enforce,
+            verified: Arc::new(AtomicBool::new(false)),
+        };
+        let cert = CertificateDer::from(cert());
+        let name = ServerName::try_from("example.org").unwrap();
+        let now = UnixTime::now();
+        for enforce in [false, true] {
+            let err = verifier(Tlsa::Bogus, enforce)
+                .verify_server_cert(&cert, &[], &name, &[], now)
+                .expect_err("a bogus TLSA answer must abort");
+            assert!(err.to_string().contains("failed DNSSEC validation"), "{err}");
+        }
+        // Without any TLSA data the CA check decides (a root certificate is not a valid
+        // end-entity certificate for example.org) - but not with the DANE error.
+        let err = verifier(Tlsa::Unavailable, false).verify_server_cert(&cert, &[], &name, &[], now).unwrap_err();
+        assert!(!err.to_string().contains("DANE"), "{err}");
+        // A validated DANE-EE match is still trusted on its own.
+        let digest = sha2::Sha256::digest(cert.as_ref()).to_vec();
+        let matching = Tlsa::Validated(vec![record(CertUsage::DaneEe, Selector::Full, Matching::Sha256, digest)]);
+        assert!(verifier(matching, true).verify_server_cert(&cert, &[], &name, &[], now).is_ok());
+    }
+
     #[test]
     fn no_records_means_not_applicable() {
         assert_eq!(evaluate_dane(&cert(), None), DaneResult::NotApplicable);
@@ -597,7 +819,7 @@ mod tests {
         assert!(both.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_2));
         let verifier = || DaneVerifier {
             pkix: pkix_verifier().unwrap(),
-            tlsa: None,
+            tlsa: Tlsa::Unavailable,
             enforce: false,
             verified: Arc::new(AtomicBool::new(false)),
         };
@@ -679,7 +901,7 @@ mod tests {
         async fn handshake(require_tls13: bool) -> Result<(), String> {
             let verifier = DaneVerifier {
                 pkix: pkix_verifier().unwrap(),
-                tlsa: None,
+                tlsa: Tlsa::Unavailable,
                 enforce: false,
                 verified: Arc::new(AtomicBool::new(false)),
             };

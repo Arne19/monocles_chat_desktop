@@ -101,20 +101,55 @@ pub async fn request(w: &crate::client::Writer, iq: Element) -> anyhow::Result<E
         .await
         .map_err(|_| anyhow::anyhow!("iq {id} timed out"))??;
     if reply.attr("type") == Some("error") {
-        let condition = reply
-            .get_child("error", "jabber:client")
-            .and_then(|e| e.children().next().map(|c| c.name().to_string()))
-            .unwrap_or_else(|| "unknown".into());
-        anyhow::bail!("iq {id} error: {condition}");
+        anyhow::bail!("iq {id} error: {}", error_condition(&reply));
     }
     Ok(reply)
 }
 
+const NS_STANZAS: &str = "urn:ietf:params:xml:ns:xmpp-stanzas";
+
+/// The defined condition of an error reply (RFC 6120 §8.3.3), e.g. `item-not-found`: the
+/// `<error>` child in the stanzas namespace that isn't `<text>`, wherever it sits, so a `<text>`
+/// or an application-specific element placed first can't hide it. Callers match on it (e.g.
+/// "node doesn't exist yet" before publishing a device list), so it must be the real one.
+fn error_condition(reply: &Element) -> String {
+    reply
+        .get_child("error", "jabber:client")
+        .and_then(|e| e.children().find(|c| c.ns() == NS_STANZAS && c.name() != "text"))
+        .map(|c| c.name().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::valid_reply_origin;
+    use super::{error_condition, valid_reply_origin};
 
     const ME: &str = "me@example.org";
+
+    #[test]
+    fn error_condition_is_the_defined_condition_wherever_it_sits() {
+        let reply = |inner: &str| -> minidom::Element {
+            format!("<iq xmlns='jabber:client' type='error' id='1'><error type='cancel'>{inner}</error></iq>")
+                .parse()
+                .unwrap()
+        };
+        const S: &str = "urn:ietf:params:xml:ns:xmpp-stanzas";
+        assert_eq!(error_condition(&reply(&format!("<item-not-found xmlns='{S}'/>"))), "item-not-found");
+        // <text> (or an application-specific element) first must not hide the condition.
+        assert_eq!(
+            error_condition(&reply(&format!("<text xmlns='{S}'>gone</text><item-not-found xmlns='{S}'/>"))),
+            "item-not-found"
+        );
+        assert_eq!(
+            error_condition(&reply(&format!(
+                "<app xmlns='urn:example:app'/><service-unavailable xmlns='{S}'/>"
+            ))),
+            "service-unavailable"
+        );
+        // A look-alike outside the stanzas namespace is no condition.
+        assert_eq!(error_condition(&reply("<item-not-found xmlns='urn:example:app'/>")), "unknown");
+        assert_eq!(error_condition(&reply("")), "unknown");
+    }
 
     #[test]
     fn server_bound_requests_need_server_replies() {

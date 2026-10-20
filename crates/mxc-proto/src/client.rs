@@ -71,6 +71,13 @@ impl Writer {
             .send(stanza)
             .map_err(|_| anyhow::anyhow!("connection writer closed"))
     }
+
+    /// A writer whose queued stanzas the test reads back instead of a connection.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> (Self, mpsc::UnboundedReceiver<Element>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Writer(tx), rx)
+    }
 }
 
 /// Handle the UI keeps: send commands, receive events.
@@ -468,94 +475,14 @@ impl CoreActor {
         Ok(())
     }
 
-    /// Emit `Event::ContactKeys` for a contact's key screen. Shared by `FetchContactKeys` and
-    /// the out-of-band verification path, which has to refresh the same list.
+    /// Emit `Event::ContactKeys` for a contact's key screen (see [`send_contact_keys`]).
     async fn emit_contact_keys(&self, account_id: i64, jid: String) -> anyhow::Result<()> {
-        let mut devices = Vec::new();
-        for id in self.store.list_omemo_identities(account_id, &jid).await?.into_iter() {
-            devices.push(crate::event::DeviceKey {
-                device_id: id.device_id,
-                fingerprint: device_fingerprint(&self.store, account_id, &jid, &id.identity_key).await,
-                trust: id.trust,
-                active: id.active,
-            });
-        }
-        let _ = self.events.send(Event::ContactKeys { account_id, jid, devices }).await;
-        Ok(())
+        send_contact_keys(&self.store, &self.events, account_id, jid).await
     }
 
-    /// Emit `Event::OwnKeys` for the key screen: this device's hybrid fingerprint plus our other
-    /// devices. Shared by `FetchOwnKeys` and `ResetOmemo2Identities`.
+    /// Emit `Event::OwnKeys` for the key screen (see [`send_own_keys`]).
     async fn emit_own_keys(&self, cfg: &AccountConfig, account_id: i64) -> anyhow::Result<()> {
-        let own_device_id = self.store.omemo_own_device_id(account_id).await?.unwrap_or(0);
-        // Our own device shows the hybrid (classical + ML-DSA-87) fingerprint.
-        let own_fingerprint = match (
-            self.store.omemo_own_identity_pub(account_id).await?,
-            self.store.omemo_own_pq_identity_pub(account_id).await?,
-        ) {
-            (Some(ik), Some(pq)) => mxc_omemo::hybrid_fingerprint_display(&ik, &pq),
-            (Some(ik), _) => mxc_omemo::fingerprint(&ik),
-            _ => String::new(),
-        };
-        // The QR/link a contact verifies us by. It carries the CLASSICAL identity key (the
-        // value both sides key trust on), not the hybrid string we display, and uses the
-        // plain `omemo-sid-` parameter: we have no legacy stack, so this is the only key we
-        // have and every client — including monocles Android builds from before the
-        // `omemo-pq-sid-` parameter existed — can read it. See `crate::uri`.
-        // It also carries our hybrid fingerprint (`omemo-pq-hfp-`), so a scan authenticates the
-        // post-quantum half too.
-        let own_pq = self.store.omemo_own_pq_identity_pub(account_id).await?;
-        let verification_uri = match self.store.omemo_own_identity_pub(account_id).await? {
-            Some(ik) if own_device_id != 0 => {
-                let mut fp = crate::uri::UriFingerprint::from_identity_key(
-                    crate::uri::FingerprintKind::Omemo,
-                    own_device_id,
-                    &ik,
-                );
-                fp.hybrid = own_pq.as_ref().map(|pq| mxc_omemo::hybrid_fingerprint(&ik, pq));
-                crate::uri::verification_uri(cfg.bare(), &[fp])
-            }
-            _ => String::new(),
-        };
-        let mut devices = Vec::new();
-        for id in self
-            .store
-            .list_omemo_identities(account_id, cfg.bare())
-            .await?
-            .into_iter()
-            .filter(|id| id.device_id != own_device_id)
-        {
-            devices.push(crate::event::DeviceKey {
-                device_id: id.device_id,
-                fingerprint: device_fingerprint(&self.store, account_id, cfg.bare(), &id.identity_key)
-                    .await,
-                trust: id.trust,
-                active: id.active,
-            });
-        }
-        debug!(
-            own_device_id,
-            own_fingerprint_empty = own_fingerprint.is_empty(),
-            other_devices = devices.len(),
-            "omemo: emit_own_keys"
-        );
-        let auto_trust = self.store.auto_trust_new_keys().await.unwrap_or(true);
-        let (presence_show, presence_status) = self.store.own_presence().await.unwrap_or_default();
-        let _ = self
-            .events
-            .send(Event::OwnKeys {
-                account_id,
-                jid: cfg.bare().to_string(),
-                own_device_id,
-                own_fingerprint,
-                verification_uri,
-                devices,
-                auto_trust,
-                presence_show,
-                presence_status,
-            })
-            .await;
-        Ok(())
+        send_own_keys(&self.store, &self.events, cfg, account_id).await
     }
 
     async fn handle_command(
@@ -1183,6 +1110,103 @@ async fn upload_broadcast_media(w: &Writer, cfg: &AccountConfig, path: &str) -> 
     let name = format!("{}.{ext}", xeps::microblog::uuid_v4());
     let url = xeps::http_upload::upload_plain(w, cfg, &bytes, &name, &mime).await?;
     Ok((url, mime))
+}
+
+/// Emit `Event::ContactKeys` for a contact's key screen. Shared by `FetchContactKeys` and
+/// the out-of-band verification path, which has to refresh the same list.
+pub(crate) async fn send_contact_keys(
+    store: &Store,
+    events: &Sender<Event>,
+    account_id: i64,
+    jid: String,
+) -> anyhow::Result<()> {
+    let mut devices = Vec::new();
+    for id in store.list_omemo_identities(account_id, &jid).await?.into_iter() {
+        devices.push(crate::event::DeviceKey {
+            device_id: id.device_id,
+            fingerprint: device_fingerprint(store, account_id, &jid, &id.identity_key).await,
+            trust: id.trust,
+            active: id.active,
+        });
+    }
+    let _ = events.send(Event::ContactKeys { account_id, jid, devices }).await;
+    Ok(())
+}
+
+/// Emit `Event::OwnKeys` for the key screen: this device's hybrid fingerprint plus our other
+/// devices. Shared by `FetchOwnKeys` and `ResetOmemo2Identities`.
+pub(crate) async fn send_own_keys(
+    store: &Store,
+    events: &Sender<Event>,
+    cfg: &AccountConfig,
+    account_id: i64,
+) -> anyhow::Result<()> {
+    let own_device_id = store.omemo_own_device_id(account_id).await?.unwrap_or(0);
+    // Read once: both the displayed fingerprint and the verification URI below use them.
+    let own_ik = store.omemo_own_identity_pub(account_id).await?;
+    let own_pq = store.omemo_own_pq_identity_pub(account_id).await?;
+    // Our own device shows the hybrid (classical + ML-DSA-87) fingerprint.
+    let own_fingerprint = match (&own_ik, &own_pq) {
+        (Some(ik), Some(pq)) => mxc_omemo::hybrid_fingerprint_display(ik, pq),
+        (Some(ik), _) => mxc_omemo::fingerprint(ik),
+        _ => String::new(),
+    };
+    // The QR/link a contact verifies us by. It carries the CLASSICAL identity key (the
+    // value both sides key trust on), not the hybrid string we display, and uses the
+    // plain `omemo-sid-` parameter: we have no legacy stack, so this is the only key we
+    // have and every client — including monocles Android builds from before the
+    // `omemo-pq-sid-` parameter existed — can read it. See `crate::uri`.
+    // It also carries our hybrid fingerprint (`omemo-pq-hfp-`), so a scan authenticates the
+    // post-quantum half too.
+    let verification_uri = match own_ik {
+        Some(ik) if own_device_id != 0 => {
+            let mut fp = crate::uri::UriFingerprint::from_identity_key(
+                crate::uri::FingerprintKind::Omemo,
+                own_device_id,
+                &ik,
+            );
+            fp.hybrid = own_pq.as_ref().map(|pq| mxc_omemo::hybrid_fingerprint(&ik, pq));
+            crate::uri::verification_uri(cfg.bare(), &[fp])
+        }
+        _ => String::new(),
+    };
+    let mut devices = Vec::new();
+    for id in store
+        .list_omemo_identities(account_id, cfg.bare())
+        .await?
+        .into_iter()
+        .filter(|id| id.device_id != own_device_id)
+    {
+        devices.push(crate::event::DeviceKey {
+            device_id: id.device_id,
+            fingerprint: device_fingerprint(store, account_id, cfg.bare(), &id.identity_key)
+                .await,
+            trust: id.trust,
+            active: id.active,
+        });
+    }
+    debug!(
+        own_device_id,
+        own_fingerprint_empty = own_fingerprint.is_empty(),
+        other_devices = devices.len(),
+        "omemo: emit_own_keys"
+    );
+    let auto_trust = store.auto_trust_new_keys().await.unwrap_or(true);
+    let (presence_show, presence_status) = store.own_presence().await.unwrap_or_default();
+    let _ = events
+        .send(Event::OwnKeys {
+            account_id,
+            jid: cfg.bare().to_string(),
+            own_device_id,
+            own_fingerprint,
+            verification_uri,
+            devices,
+            auto_trust,
+            presence_show,
+            presence_status,
+        })
+        .await;
+    Ok(())
 }
 
 /// The fingerprint to display for one OMEMO2 device: the *hybrid* (classical + ML-DSA-87)

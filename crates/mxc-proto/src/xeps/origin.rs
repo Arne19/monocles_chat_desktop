@@ -48,6 +48,19 @@ pub fn from_account(from: Option<&str>, our_bare: &str) -> bool {
     from.is_some_and(|f| bare(f).eq_ignore_ascii_case(our_bare))
 }
 
+/// The publisher of a PubSub/PEP notification (`<message><event xmlns='…pubsub#event'>`),
+/// or None if the notification must be ignored. Notifications are sent from a bare JID - the
+/// account, a contact, a room or a pubsub service - and a missing `from` is our own account.
+/// A full JID (e.g. a MUC occupant `room@muc/nick`) is refused rather than stripped to its bare
+/// part: stripping would let the occupant publish in the room's name (Conversations 8027b3be2).
+pub fn pubsub_event_origin(from: Option<&str>, our_bare: &str) -> Option<String> {
+    match from {
+        None => Some(our_bare.to_string()),
+        Some(f) if f.is_empty() || f.contains('/') => None,
+        Some(f) => Some(f.to_string()),
+    }
+}
+
 /// The `id` of the only `<name xmlns=ns>` child of `el` - None if there is none, or more than
 /// one (Conversations 539b55d83): a second copy means something slipped in an id we can't tell
 /// apart from the real one, so neither is used. For XEP-0421 occupant ids and similar.
@@ -98,6 +111,18 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(only_child_id(&two, "occupant-id", "urn:xmpp:occupant-id:0"), None);
+    }
+
+    #[test]
+    fn pubsub_events_only_from_bare_jids() {
+        assert_eq!(pubsub_event_origin(None, ME).as_deref(), Some(ME));
+        assert_eq!(pubsub_event_origin(Some("friend@example.net"), ME).as_deref(), Some("friend@example.net"));
+        assert_eq!(pubsub_event_origin(Some("pubsub.example.net"), ME).as_deref(), Some("pubsub.example.net"));
+        assert_eq!(pubsub_event_origin(Some("room@muc.example.net"), ME).as_deref(), Some("room@muc.example.net"));
+        // A MUC occupant must not publish in the room's name, nor a resource in the account's.
+        assert_eq!(pubsub_event_origin(Some("room@muc.example.net/mallory"), ME), None);
+        assert_eq!(pubsub_event_origin(Some("friend@example.net/phone"), ME), None);
+        assert_eq!(pubsub_event_origin(Some(""), ME), None);
     }
 
     #[test]
