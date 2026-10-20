@@ -23,6 +23,26 @@ const NS_RSM: &str = "http://jabber.org/protocol/rsm";
 
 /// Node config matching Android's `defaultStoriesConfiguration`: presence access, items expire
 /// after 24h.
+const NODE_CONFIG: &[(&str, &str)] = &[
+    ("pubsub#node_type", "leaf"),
+    ("pubsub#type", NS_STORIES),
+    ("pubsub#access_model", "presence"),
+    ("pubsub#item_expire", "86400"),
+    ("pubsub#persist_items", "1"),
+    ("pubsub#max_items", "120"),
+    ("pubsub#notify_retract", "1"),
+    ("pubsub#send_last_published_item", "on_sub_and_presence"),
+    ("pubsub#publish_model", "publishers"),
+];
+
+/// Preconditions sent with every publish (matching Android's `PublishOptions.storiesAccess`).
+/// Without max_items a node auto-created with the server's PEP defaults keeps a single item,
+/// so every new story silently replaced the previous one.
+const PUBLISH_OPTIONS: &[(&str, &str)] = &[
+    ("pubsub#access_model", "presence"),
+    ("pubsub#max_items", "120"),
+];
+
 fn node_config() -> Element {
     let field = |var: &str, value: &str| {
         Element::builder("field", NS_XDATA)
@@ -30,19 +50,13 @@ fn node_config() -> Element {
             .append(Element::builder("value", NS_XDATA).append(value).build())
             .build()
     };
-    Element::builder("x", NS_XDATA)
+    let mut x = Element::builder("x", NS_XDATA)
         .attr(crate::ncname("type"), "submit")
-        .append(field("FORM_TYPE", "http://jabber.org/protocol/pubsub#node_config"))
-        .append(field("pubsub#node_type", "leaf"))
-        .append(field("pubsub#type", NS_STORIES))
-        .append(field("pubsub#access_model", "presence"))
-        .append(field("pubsub#item_expire", "86400"))
-        .append(field("pubsub#persist_items", "1"))
-        .append(field("pubsub#max_items", "120"))
-        .append(field("pubsub#notify_retract", "1"))
-        .append(field("pubsub#send_last_published_item", "on_sub_and_presence"))
-        .append(field("pubsub#publish_model", "publishers"))
-        .build()
+        .append(field("FORM_TYPE", "http://jabber.org/protocol/pubsub#node_config"));
+    for (var, value) in NODE_CONFIG {
+        x = x.append(field(var, value));
+    }
+    x.build()
 }
 
 /// Create our stories node with [`node_config`]. An existing node (conflict) is fine.
@@ -65,8 +79,9 @@ async fn ensure_node(w: &Writer, cfg: &AccountConfig) {
 }
 
 /// Publish a story: an Atom `<entry>` linking to `url` (already uploaded). The node is created
-/// with its 24h-expiry config first; the publish itself carries no options (as on Android), so
-/// a node configured differently by another client doesn't make it fail.
+/// with its 24h-expiry config first. The publish carries [`PUBLISH_OPTIONS`]; a node that already
+/// exists with other settings (e.g. auto-created by a plain publish, max_items=1) is
+/// reconfigured, and if that is refused the story still goes out without options.
 pub async fn publish(
     w: &Writer,
     cfg: &AccountConfig,
@@ -103,7 +118,32 @@ pub async fn publish(
         )
         .build();
 
-    pep::publish(w, NS_STORIES, Some(&uuid), entry, None).await?;
+    let options = || Some(pep::publish_options_fields(PUBLISH_OPTIONS));
+    match pep::publish(w, NS_STORIES, Some(&uuid), entry.clone(), options()).await {
+        Ok(_) => return Ok(()),
+        Err(e) if pep::is_precondition_not_met(&e) => {
+            tracing::debug!("stories node config does not match; reconfiguring it");
+        }
+        Err(e) => return Err(e),
+    }
+    // If the server refuses any field of the full config, at least make it keep more than one
+    // item; otherwise the plain-publish fallback below would leave the original bug in place.
+    let configured = match pep::configure_node(w, NS_STORIES, NODE_CONFIG).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::debug!(error = %e, "full stories node config refused; retrying with access model and max items only");
+            pep::configure_node(w, NS_STORIES, PUBLISH_OPTIONS).await
+        }
+    };
+    let republished = match configured {
+        Ok(()) => pep::publish(w, NS_STORIES, Some(&uuid), entry.clone(), options()).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = republished {
+        // Same uuid, so this can't leave a second item behind.
+        tracing::warn!(error = %e, "could not enforce stories node config; publishing without options (node may keep only one story)");
+        pep::publish(w, NS_STORIES, Some(&uuid), entry, None).await?;
+    }
     Ok(())
 }
 
