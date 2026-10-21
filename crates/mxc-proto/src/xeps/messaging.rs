@@ -1273,6 +1273,49 @@ fn sender_filter<'a>(kind: &str, own_side: bool, occupant_id: Option<&'a str>) -
     }
 }
 
+/// Whether an edit may touch our own message whatever its fingerprint: it is ours and was
+/// encrypted by one of our own trusted devices. A message sent on the phone and deleted on
+/// another device carries the phone's fingerprint, not the editor's. Own-side content is
+/// decrypted under our own bare JID, but that alone is no proof (an undecided key decrypts too),
+/// hence [`omemo::is_trusted_own_device_fingerprint`]. A cleartext own-side edit (which our
+/// server could forge) keeps the fingerprint check.
+async fn edit_from_own_device(store: &Store, cfg: &AccountConfig, own_side: bool, fingerprint: Option<&str>) -> bool {
+    match fingerprint {
+        Some(fp) if own_side => omemo::is_trusted_own_device_fingerprint(store, cfg, fp).await,
+        _ => false,
+    }
+}
+
+/// [`Store::find_from_sender`] under [`sender_filter`]'s rules. Our own message in a room may
+/// also have been sent by another of our devices: its reflection came back from our nick and was
+/// stored as incoming under our own occupant id, so an own-side edit in a MUC that matches no
+/// outgoing row falls back to that. See [`edit_from_own_device`] for the fingerprint rule.
+async fn find_own_or_sender(
+    store: &Store,
+    cfg: &AccountConfig,
+    conv: i64,
+    target: &str,
+    kind: &str,
+    own_side: bool,
+    occupant_id: Option<&str>,
+    fingerprint: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    let Some((dir, occ)) = sender_filter(kind, own_side, occupant_id) else {
+        return Ok(None);
+    };
+    let fp_filter =
+        if edit_from_own_device(store, cfg, own_side, fingerprint).await { None } else { Some(fingerprint) };
+    if let Some(mid) = store.find_from_sender(conv, target, dir, occ, fp_filter).await? {
+        return Ok(Some(mid));
+    }
+    if own_side && kind == "muc" {
+        if let Some(occ) = occupant_id {
+            return Ok(store.find_from_sender(conv, target, "in", Some(occ), fp_filter).await?);
+        }
+    }
+    Ok(None)
+}
+
 /// Tolerated skew for the SCE `<time>` binding (proto-XEP §4.6.2): ±7 days, generous
 /// enough to absorb badly wrong sender clocks.
 const SCE_MAX_SKEW_DAYS: i64 = 7;
@@ -1487,6 +1530,12 @@ async fn process_payload(
     // that, the occupant table populated from presence. Falls back to `sender_bare`.
     let mut omemo_sender_bare = sender_bare.clone();
     let mut is_own_muc_echo = false;
+    // Whether an own echo is *proven* ours rather than only under our nick: by our occupant id,
+    // by the archive naming our real JID, or live (the room keeps nicks unique among the
+    // occupants present). In an archive the nick may have been someone else's while we were away,
+    // so a nick alone may skip the self-decrypt but never makes a message ours (shown as ours,
+    // able to edit or retract ours).
+    let mut self_confirmed = false;
     if kind == "muc" {
         let nick = from.split('/').nth(1).unwrap_or("").to_string();
         // A real JID carried on the stanza itself. Only the room's own archive attaches this
@@ -1511,15 +1560,34 @@ async fn process_payload(
             if let Some(real) = resolved {
                 omemo_sender_bare = real;
             }
-            // Our own reflected groupchat message — we never encrypt to our sending device, so
-            // an encrypted echo can't (and needn't) be decrypted; we keep the local plaintext.
-            if store.muc_nick(conv).await.unwrap_or(None).as_deref() == Some(nick.as_str()) {
+            // Our own reflected groupchat message (from this or another of our devices). Like
+            // monocles Android's isSelfInConference: the room-assigned occupant id decides when
+            // we know ours (it is per real user, and the nick may have been someone else's while
+            // we were away); otherwise our nick does - unless the archive names another real JID.
+            let self_occupant = store.muc_self_occupant(conv).await.unwrap_or(None);
+            let is_self = match (&occupant_id, &self_occupant) {
+                (Some(occ), Some(own)) => occ == own,
+                _ => store.muc_nick(conv).await.unwrap_or(None).as_deref() == Some(nick.as_str()),
+            };
+            let archive_names_other = item_jid
+                .as_deref()
+                .is_some_and(|j| !super::origin::bare(j).eq_ignore_ascii_case(cfg.bare()));
+            if is_self && !archive_names_other {
                 is_own_muc_echo = true;
-            }
-        }
-        if let Some(occ) = &occupant_id {
-            if !nick.is_empty() && store.muc_nick(conv).await.unwrap_or(None).as_deref() == Some(nick.as_str()) {
-                let _ = store.set_muc_self_occupant(conv, occ).await;
+                let occupant_proves = matches!((&occupant_id, &self_occupant), (Some(occ), Some(own)) if occ == own);
+                let archive_proves = item_jid
+                    .as_deref()
+                    .is_some_and(|j| super::origin::bare(j).eq_ignore_ascii_case(cfg.bare()));
+                self_confirmed = occupant_proves || archive_proves || live;
+                // Our real JID, whatever the occupant table says: an OMEMO2 echo from one of
+                // our other devices is decrypted - and its SCE <from> bound - under it.
+                omemo_sender_bare = cfg.bare().to_string();
+                // Learn our occupant id from our own message only while presence hasn't told us
+                // (presence stays the authority), and only from one proven ours: an impostor
+                // under our nick must not set it.
+                if let (true, Some(occ), None) = (self_confirmed, &occupant_id, &self_occupant) {
+                    let _ = store.set_muc_self_occupant(conv, occ).await;
+                }
             }
         }
         // XEP-0045 §8.1 room subject/topic. The room sends its current subject (live) right
@@ -1532,13 +1600,44 @@ async fn process_payload(
         }
     }
 
-    // Our own encrypted message reflected by the room: skip the (impossible) self-decrypt and
-    // just backfill the room-assigned stanza-id onto the locally-stored copy, so reactions to
-    // our own messages resolve. (Plaintext echoes still flow through the normal dedup below.)
-    if is_own_muc_echo && msg.get_child("encrypted", omemo::NS_OMEMO2).is_some() {
+    // Our own message reflected by the room - one we sent from another device lands here first -
+    // is stored as outgoing, like a 1:1 sent carbon: shown as ours (Edit / Delete…), never
+    // counted unread or notified.
+    let direction = if self_confirmed { Direction::Out } else { direction };
+
+    // Our own encrypted message reflected by the room. Sent by this device: we never encrypt to
+    // our sending device, so skip the (impossible) self-decrypt and just backfill the
+    // room-assigned stanza-id onto the locally-stored copy, so reactions to our own messages
+    // resolve. Sent by another of our devices (which wraps the key for us, like monocles
+    // Android's findOwnSessions): decrypt it like any room message below, or it would never
+    // show here. (Plaintext echoes still flow through the normal dedup below.)
+    let own_encrypted_echo = match msg.get_child("encrypted", omemo::NS_OMEMO2) {
+        Some(enc) if is_own_muc_echo => !omemo::is_from_our_other_device(store, cfg, enc).await,
+        _ => false,
+    };
+    if own_encrypted_echo {
         if let Some(origin) = msg.get_child("origin-id", NS_SID).and_then(|e| e.attr("id")) {
             if let Some(sid) = &stanza_id {
                 let _ = store.backfill_stanza_id(conv, origin, sid, occupant_id.as_deref()).await;
+            }
+            // A retraction of ours that came first (archive paging) and found our copy without
+            // the room stanza-id it addresses: apply it now. Only a proven own echo, and under
+            // the copy's own fingerprint, as for a live retraction.
+            if self_confirmed {
+                if let Some(row) = store.message_by_marker(conv, origin).await?
+                    .filter(|r| r.direction == "out" && !r.retracted)
+                {
+                    let ids: Vec<&str> = [Some(origin), stanza_id.as_deref()].into_iter().flatten().collect();
+                    if store
+                        .take_pending_retraction(conv, &ids, "out", occupant_id.as_deref(), row.omemo_fingerprint.as_deref())
+                        .await?
+                    {
+                        let old_body = store.retract_message_id(row.id).await?;
+                        let _ = events.send(Event::MessageRetracted {
+                            account_id: cfg.account_id, conversation_id: conv, message_id: row.id, body: old_body,
+                        }).await;
+                    }
+                }
             }
         }
         return Ok(());
@@ -1684,7 +1783,8 @@ async fn process_payload(
 
     // Whether this stanza was sent by us (another of our devices, or our own MUC reflection,
     // which arrives as Direction::In from our nick).
-    let own_side = direction == Direction::Out || is_own_muc_echo;
+    // A proven own room echo already turned into Direction::Out above.
+    let own_side = direction == Direction::Out;
 
     // --- markers (0333) / receipts (0184) / chat-states (0085) from the content ---
     // Only the counterpart (an incoming stanza in this conversation) can confirm delivery/read
@@ -1812,24 +1912,28 @@ async fn process_payload(
             return Ok(());
         }
         if let Some(target) = retract.attr("id") {
-            let mid = match sender_filter(kind, own_side, occupant_id.as_deref()) {
-                // Like corrections: an encrypted message can only be retracted under the
-                // same OMEMO fingerprint, else the peer's server could forge a plaintext
-                // retraction and delete it. (OMEMO2 retractions travel inside the SCE
-                // envelope on both clients, so this costs no legitimate retraction.)
-                Some((dir, occ)) => {
-                    store.find_from_sender(conv, target, dir, occ, Some(fingerprint.as_deref())).await?
-                }
-                None => None,
-            };
-            match mid {
-                Some(mid) => {
+            // Like corrections: an encrypted message can only be retracted under the same
+            // OMEMO fingerprint, else the peer's server could forge a plaintext retraction and
+            // delete it. (OMEMO2 retractions travel inside the SCE envelope on both clients, so
+            // this costs no legitimate retraction.)
+            let mid = find_own_or_sender(
+                store, cfg, conv, target, kind, own_side, occupant_id.as_deref(), fingerprint.as_deref(),
+            ).await?;
+            match (mid, sender_filter(kind, own_side, occupant_id.as_deref())) {
+                (Some(mid), _) => {
                     let old_body = store.retract_message_id(mid).await?;
                     let _ = events.send(Event::MessageRetracted {
                         account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
                     }).await;
                 }
-                None => tracing::debug!(%from, %target, "ignoring retraction: no message from this sender"),
+                // Not here (yet): paging back through an archive brings a retraction before the
+                // message it removes - tombstone that message when it shows up.
+                (None, Some((dir, occ))) => {
+                    tracing::debug!(%from, %target, "retraction for a message we don't have yet");
+                    let any_own = edit_from_own_device(store, cfg, own_side, fingerprint.as_deref()).await;
+                    store.add_pending_retraction(conv, target, dir, occ, fingerprint.as_deref(), any_own).await?;
+                }
+                (None, None) => tracing::debug!(%from, %target, "ignoring retraction: sender can't be attributed"),
             }
         }
         return Ok(());
@@ -1963,12 +2067,9 @@ async fn process_payload(
     // message of theirs falls through and is shown as a new message, like Conversations.
     if let Some(replace) = content.get_child("replace", NS_CORRECT) {
         if let Some(target) = replace.attr("id") {
-            let mid = match sender_filter(kind, own_side, occupant_id.as_deref()) {
-                Some((dir, occ)) => {
-                    store.find_from_sender(conv, target, dir, occ, Some(fingerprint.as_deref())).await?
-                }
-                None => None,
-            };
+            let mid = find_own_or_sender(
+                store, cfg, conv, target, kind, own_side, occupant_id.as_deref(), fingerprint.as_deref(),
+            ).await?;
             if let Some(mid) = mid {
                 store.correct_message(mid, target, &body, encryption, fingerprint.as_deref()).await?;
                 if let Some(row) = fetch_row(store, conv, mid).await {
@@ -1982,6 +2083,13 @@ async fn process_payload(
     }
 
     let origin_id = msg.get_child("origin-id", NS_SID).and_then(|e| e.attr("id").map(str::to_string));
+    // The sender's stanza `id` (1:1 / MUC-PM), when it isn't the origin-id: monocles Android and
+    // Conversations address corrections/retractions to it, and Android sends no origin-id on a
+    // MUC private message. Kept apart from origin_id, which is a dedup key - stanza ids need not
+    // be unique. Not in rooms: there edits address the room stanza-id.
+    let remote_id = if kind == "muc" { None } else { msg.attr("id") }
+        .filter(|id| !id.is_empty() && Some(*id) != origin_id.as_deref())
+        .map(str::to_string);
     let reply_to = content.get_child("reply", NS_REPLY).and_then(|e| e.attr("id").map(str::to_string));
 
     // For MUC notification filtering: is this incoming message a highlight (mentions our
@@ -2030,25 +2138,69 @@ async fn process_payload(
         }
     }
 
-    persist_and_emit(
+    // Retracted before it got here (see the XEP-0424 branch): keep it as a tombstone - so paging
+    // the same archive range again dedups against it - without notifying or counting it unread.
+    let marker_ids: Vec<String> =
+        [origin_id.clone(), stanza_id.clone(), remote_id.clone()].into_iter().flatten().collect();
+    let marker_refs: Vec<&str> = marker_ids.iter().map(String::as_str).collect();
+    let sender_dir = if own_side { "out" } else { direction.as_str() };
+    let pre_retracted = !marker_ids.is_empty()
+        && store
+            .take_pending_retraction(conv, &marker_refs, sender_dir, occupant_id.as_deref(), fingerprint.as_deref())
+            .await?;
+
+    let new_msg = NewMessage {
+        conversation_id: conv,
+        stanza_id,
+        origin_id,
+        counterpart: counterpart_full,
+        direction,
+        body: Some(body),
+        encryption: encryption.into(),
+        reply_to,
+        omemo_fingerprint: fingerprint,
+        attachment,
+        occupant_id,
+        timestamp: ts,
+        thread: content.get_child("thread", NS_CLIENT).map(|t| t.text()).filter(|s| !s.is_empty()),
+        // XEP-0393: from the SCE content for OMEMO2, else from the stanza itself
+        unstyled: content.get_child("unstyled", crate::xeps::styling::NS_STYLING).is_some(),
+    };
+    if pre_retracted {
+        tracing::debug!(?marker_ids, "storing a message that was retracted before it arrived");
+        if let Some(mid) = store.insert_message(&new_msg).await? {
+            if let Some(rid) = &remote_id {
+                store.set_remote_id(mid, rid).await?;
+            }
+            store.retract_message_id(mid).await?;
+            let _ = events.send(Event::MessageRetracted {
+                account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: None,
+            }).await;
+        } else {
+            // Already stored (e.g. our own message, whose room stanza-id the retraction addressed
+            // before this reflection brought it): retract that copy - if it is this sender's,
+            // under the same rules as a live retraction.
+            for id in &marker_refs {
+                let found = find_own_or_sender(
+                    store, cfg, conv, id, kind, own_side,
+                    new_msg.occupant_id.as_deref(), new_msg.omemo_fingerprint.as_deref(),
+                ).await?;
+                if let Some(mid) = found {
+                    let old_body = store.retract_message_id(mid).await?;
+                    let _ = events.send(Event::MessageRetracted {
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                    }).await;
+                    break;
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    persist_and_emit_with_remote_id(
         store, cfg, events, conv,
-        NewMessage {
-            conversation_id: conv,
-            stanza_id,
-            origin_id,
-            counterpart: counterpart_full,
-            direction,
-            body: Some(body),
-            encryption: encryption.into(),
-            reply_to,
-            omemo_fingerprint: fingerprint,
-            attachment,
-            occupant_id,
-            timestamp: ts,
-            thread: content.get_child("thread", NS_CLIENT).map(|t| t.text()).filter(|s| !s.is_empty()),
-            // XEP-0393: from the SCE content for OMEMO2, else from the stanza itself
-            unstyled: content.get_child("unstyled", crate::xeps::styling::NS_STYLING).is_some(),
-        },
+        new_msg,
+        remote_id.as_deref(),
         /*bump_unread=*/ direction == Direction::In && live,
         live,
         mentioned,
@@ -2374,7 +2526,32 @@ async fn persist_and_emit(
     mentioned: bool,
     reply_to_me: bool,
 ) -> anyhow::Result<()> {
+    persist_and_emit_with_remote_id(store, cfg, events, conv, msg, None, bump_unread, live, mentioned, reply_to_me)
+        .await
+}
+
+/// [`persist_and_emit`] for a message that reached us over the wire: also records the sender's
+/// stanza `id` as an edit target (see `Store::set_remote_id`), and marks one of our own (a sent
+/// carbon, our room reflection of another device's message) as sent.
+async fn persist_and_emit_with_remote_id(
+    store: &Store,
+    cfg: &AccountConfig,
+    events: &Sender<Event>,
+    conv: i64,
+    msg: NewMessage,
+    remote_id: Option<&str>,
+    bump_unread: bool,
+    live: bool,
+    mentioned: bool,
+    reply_to_me: bool,
+) -> anyhow::Result<()> {
     if let Some(id) = store.insert_message(&msg).await? {
+        if let Some(rid) = remote_id {
+            store.set_remote_id(id, rid).await.ok();
+        }
+        if msg.direction == Direction::Out {
+            store.mark_received_own_sent(id).await.ok();
+        }
         // File caption metadata isn't part of the INSERT (compile-time-checked) statement;
         // attach it now so the row fetched + emitted below already carries it.
         if let Some(att) = &msg.attachment {
@@ -2767,5 +2944,327 @@ mod sender_filter_tests {
         assert_eq!(sender_filter("chat", false, None), Some(("in", None)));
         assert_eq!(sender_filter("chat", true, None), Some(("out", None)));
         assert_eq!(sender_filter("muc_pm", false, None), Some(("in", None)));
+    }
+}
+
+#[cfg(test)]
+mod retraction_tests {
+    use super::process_payload;
+    use crate::client::{AccountConfig, Writer};
+    use minidom::Element;
+    use mxc_store::messages::Direction;
+    use mxc_store::Store;
+
+    const ME: &str = "me@example.org";
+
+    struct Harness {
+        w: Writer,
+        store: Store,
+        cfg: AccountConfig,
+        events: async_channel::Sender<crate::event::Event>,
+        _rx: async_channel::Receiver<crate::event::Event>,
+    }
+
+    async fn harness() -> Harness {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account(ME).await.unwrap();
+        let (w, _) = Writer::for_tests();
+        let (events, _rx) = async_channel::unbounded();
+        Harness { w, store, cfg: AccountConfig::new(acc, ME.into(), String::new()), events, _rx }
+    }
+
+    impl Harness {
+        async fn feed(&self, xml: &str, dir: Direction, mam_id: Option<&str>) {
+            let msg: Element = xml.parse().unwrap();
+            process_payload(
+                &self.w, &self.store, &self.cfg, &self.events, &msg, dir, None,
+                mam_id.is_none(), mam_id.map(str::to_string),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn retraction_before_its_message_tombstones_it() {
+        let h = harness().await;
+        h.feed(
+            "<message xmlns='jabber:client' from='peer@example.org/phone' to='me@example.org' type='chat' id='r1'>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='m1'/>\
+               <fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:message-retract:1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, Some("arch-2"),
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='peer@example.org/phone' to='me@example.org' type='chat' id='m1'>\
+               <origin-id xmlns='urn:xmpp:sid:0' id='m1'/><body>secret</body></message>",
+            Direction::In, Some("arch-1"),
+        ).await;
+        let conv = h.store.conversation_id(h.cfg.account_id, "peer@example.org", "chat").await.unwrap();
+        let row = h.store.message_by_marker(conv, "m1").await.unwrap().unwrap();
+        assert!(row.retracted);
+        assert_eq!(row.body, None);
+        // The fallback body of the retraction itself is never stored.
+        assert!(h.store.message_by_marker(conv, "r1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_retraction_from_someone_else_is_ignored() {
+        let h = harness().await;
+        // Our own side "retracts" an id the peer will use: must not hit the peer's message.
+        h.feed(
+            "<message xmlns='jabber:client' from='me@example.org/desk' to='peer@example.org' type='chat' id='r1'>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='m1'/></message>",
+            Direction::Out, Some("arch-2"),
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='peer@example.org/phone' to='me@example.org' type='chat' id='m1'>\
+               <body>hello</body></message>",
+            Direction::In, Some("arch-1"),
+        ).await;
+        let conv = h.store.conversation_id(h.cfg.account_id, "peer@example.org", "chat").await.unwrap();
+        let row = h.store.message_by_marker(conv, "arch-1").await.unwrap().unwrap();
+        assert!(!row.retracted);
+        assert_eq!(row.body.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn muc_pm_retraction_by_stanza_id_without_origin_id() {
+        let h = harness().await;
+        h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        // monocles Android sends no <origin-id> on a MUC private message.
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/alice' to='me@example.org/desk' type='chat' id='pm1'>\
+               <x xmlns='http://jabber.org/protocol/muc#user'/><body>psst</body></message>",
+            Direction::In, Some("pa1"),
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/alice' to='me@example.org/desk' type='chat' id='r1'>\
+               <x xmlns='http://jabber.org/protocol/muc#user'/>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='pm1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, None,
+        ).await;
+        let conv = h.store.conversation_id(h.cfg.account_id, "room@muc.example.org/alice", "muc_pm").await.unwrap();
+        // Matched by its stanza `id` (pm1), looked up here by its archive id.
+        let row = h.store.message_by_marker(conv, "pa1").await.unwrap().unwrap();
+        assert!(row.retracted);
+    }
+
+    fn own_room_message(conv: i64, origin: &str) -> mxc_store::messages::NewMessage {
+        mxc_store::messages::NewMessage {
+            conversation_id: conv,
+            stanza_id: Some(format!("sid-{origin}")),
+            origin_id: Some(origin.into()),
+            counterpart: "room@muc.example.org".into(),
+            direction: Direction::Out,
+            body: Some("mine".into()),
+            encryption: "none".into(),
+            reply_to: None,
+            omemo_fingerprint: None,
+            attachment: None,
+            occupant_id: Some("occ-me".into()),
+            timestamp: "2026-10-21T00:00:00Z".into(),
+            thread: None,
+            unstyled: false,
+        }
+    }
+
+    /// Someone who holds our nick while we're away is not us: the room-assigned occupant id
+    /// decides. They can't retract our messages, nor overwrite our occupant id.
+    #[tokio::test]
+    async fn impostor_under_our_nick_cannot_retract_our_message() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        h.store.set_muc_self_occupant(room, "occ-me").await.unwrap();
+        h.store.insert_message(&own_room_message(room, "m1")).await.unwrap();
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='r1'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-evil'/>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='m1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, Some("s9"),
+        ).await;
+        let row = h.store.message_by_marker(room, "m1").await.unwrap().unwrap();
+        assert!(!row.retracted);
+        assert_eq!(h.store.muc_self_occupant(room).await.unwrap().as_deref(), Some("occ-me"));
+
+        // Our own (another device's) retraction under our occupant id still works.
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='r2'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='m1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, Some("s10"),
+        ).await;
+        assert!(h.store.message_by_marker(room, "m1").await.unwrap().unwrap().retracted);
+    }
+
+    /// Only our own messages count as outgoing: a message under our nick with someone else's
+    /// occupant id stays incoming (no Edit / Delete…).
+    #[tokio::test]
+    async fn impostor_message_under_our_nick_stays_incoming() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        h.store.set_muc_self_occupant(room, "occ-me").await.unwrap();
+        for (occ, sid) in [("occ-evil", "s1"), ("occ-me", "s2")] {
+            h.feed(
+                &format!(
+                    "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='{sid}'>\
+                       <occupant-id xmlns='urn:xmpp:occupant-id:0' id='{occ}'/><body>hi</body></message>"
+                ),
+                Direction::In, Some(sid),
+            ).await;
+        }
+        assert_eq!(h.store.message_by_marker(room, "s1").await.unwrap().unwrap().direction, "in");
+        assert_eq!(h.store.message_by_marker(room, "s2").await.unwrap().unwrap().direction, "out");
+    }
+
+    /// An archived message under our nick, without an occupant id or real JID proving it ours
+    /// (a room without XEP-0421, the nick held by someone else while we were away), is not ours:
+    /// it stays incoming and can't retract our messages.
+    #[tokio::test]
+    async fn archived_nick_alone_does_not_make_a_message_ours() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        let mut mine = own_room_message(room, "m1");
+        mine.occupant_id = None;
+        h.store.insert_message(&mine).await.unwrap();
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='x1'>\
+               <body>not me</body></message>",
+            Direction::In, Some("s7"),
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='x2'>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='m1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, Some("s8"),
+        ).await;
+        assert_eq!(h.store.message_by_marker(room, "s7").await.unwrap().unwrap().direction, "in");
+        assert!(!h.store.message_by_marker(room, "m1").await.unwrap().unwrap().retracted);
+
+        // The same, live: the room guarantees the nick is ours right now.
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='x3'>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='m1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, None,
+        ).await;
+        assert!(h.store.message_by_marker(room, "m1").await.unwrap().unwrap().retracted);
+    }
+
+    /// The stanza `id` is an edit target only, never a dedup key: clients may reuse ids.
+    #[tokio::test]
+    async fn reused_stanza_ids_do_not_drop_messages() {
+        let h = harness().await;
+        for (archive, body) in [("a1", "first"), ("a2", "second")] {
+            h.feed(
+                &format!(
+                    "<message xmlns='jabber:client' from='bot@example.org/x' to='me@example.org' type='chat' id='1'>\
+                       <body>{body}</body></message>"
+                ),
+                Direction::In, Some(archive),
+            ).await;
+        }
+        let conv = h.store.conversation_id(h.cfg.account_id, "bot@example.org", "chat").await.unwrap();
+        assert_eq!(h.store.message_by_marker(conv, "a1").await.unwrap().unwrap().body.as_deref(), Some("first"));
+        assert_eq!(h.store.message_by_marker(conv, "a2").await.unwrap().unwrap().body.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn own_muc_message_from_another_device_can_be_retracted() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        // Our occupant id, as our own join presence reports it.
+        h.store.set_muc_self_occupant(room, "occ-me").await.unwrap();
+        // Sent by our phone: the reflection from our nick is stored as ours (outgoing).
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='m1'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/><body>oops</body></message>",
+            Direction::In, Some("s1"),
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='r1'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='s1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, Some("s2"),
+        ).await;
+        let row = h.store.message_by_marker(room, "s1").await.unwrap().unwrap();
+        assert!(row.retracted);
+        assert_eq!(row.direction, "out");
+    }
+
+    /// Our own message from another device arrives already sent - no "waiting" clock.
+    #[tokio::test]
+    async fn own_message_from_another_device_is_marked_sent() {
+        let h = harness().await;
+        h.feed(
+            "<message xmlns='jabber:client' from='me@example.org/phone' to='peer@example.org' type='chat' id='c1'>\
+               <origin-id xmlns='urn:xmpp:sid:0' id='c1'/><body>from my phone</body></message>",
+            Direction::Out, None,
+        ).await;
+        let conv = h.store.conversation_id(h.cfg.account_id, "peer@example.org", "chat").await.unwrap();
+        let row = h.store.message_by_marker(conv, "c1").await.unwrap().unwrap();
+        assert_eq!((row.direction.as_str(), row.state.as_str()), ("out", "sent"));
+    }
+
+    /// Our message whose live reflection we missed has no room stanza-id yet, so a retraction
+    /// addressing it (from our phone) waits - and applies when the reflection brings the id,
+    /// although the reflection itself is a duplicate.
+    #[tokio::test]
+    async fn pending_retraction_applies_to_an_already_stored_own_message() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        h.store.set_muc_self_occupant(room, "occ-me").await.unwrap();
+        let mut mine = own_room_message(room, "m5");
+        mine.stanza_id = None;
+        h.store.insert_message(&mine).await.unwrap();
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='r5'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='s5'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, None,
+        ).await;
+        assert!(!h.store.message_by_marker(room, "m5").await.unwrap().unwrap().retracted);
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='m5'>\
+               <origin-id xmlns='urn:xmpp:sid:0' id='m5'/>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/><body>mine</body></message>",
+            Direction::In, Some("s5"),
+        ).await;
+        assert!(h.store.message_by_marker(room, "m5").await.unwrap().unwrap().retracted);
+    }
+
+    /// The same for our OMEMO2 message, whose reflection this device can't decrypt: applied
+    /// under the stored copy's fingerprint (or by a trusted own device), as live.
+    #[tokio::test]
+    async fn pending_retraction_applies_to_our_encrypted_reflection() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        h.store.set_muc_self_occupant(room, "occ-me").await.unwrap();
+        for (origin, sid, pending_fp, retracted) in [("e1", "s6", "D", true), ("e2", "s7", "E", false)] {
+            let mut mine = own_room_message(room, origin);
+            mine.stanza_id = None;
+            mine.encryption = "omemo2".into();
+            mine.omemo_fingerprint = Some("D".into());
+            h.store.insert_message(&mine).await.unwrap();
+            h.store.add_pending_retraction(room, sid, "out", None, Some(pending_fp), false).await.unwrap();
+            h.feed(
+                &format!(
+                    "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='{origin}'>\
+                       <origin-id xmlns='urn:xmpp:sid:0' id='{origin}'/>\
+                       <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/>\
+                       <encrypted xmlns='urn:monocles:omemo-pq:1'><header sid='99'><keys jid='me@example.org'/></header>\
+                       <payload>AAAA</payload></encrypted></message>"
+                ),
+                Direction::In, Some(sid),
+            ).await;
+            let row = h.store.message_by_marker(room, origin).await.unwrap().unwrap();
+            assert_eq!(row.retracted, retracted, "{origin}");
+            assert_eq!(row.stanza_id.as_deref(), Some(sid), "stanza-id backfilled");
+        }
     }
 }

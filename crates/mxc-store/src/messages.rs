@@ -9,6 +9,9 @@ pub enum Direction {
     Out,
 }
 
+/// Most retractions kept per conversation for messages that haven't arrived (yet).
+const MAX_PENDING_RETRACTIONS: i64 = 500;
+
 impl Direction {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -496,7 +499,7 @@ impl Store {
         };
         let id: Option<i64> = sqlx::query_scalar(
             r#"SELECT id FROM messages
-               WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2)
+               WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2 OR remote_id = ?2)
                      AND direction = ?3 AND (?4 IS NULL OR occupant_id = ?4)
                      AND retracted = 0
                      AND (?5 = 0 OR omemo_fingerprint IS NULL OR omemo_fingerprint = ?6)
@@ -548,6 +551,103 @@ impl Store {
             .execute(self.pool())
             .await?;
         Ok(done.rows_affected() > 0)
+    }
+
+    /// Mark one of our own messages that reached us from elsewhere (a sent carbon, our room's
+    /// reflection of what another of our devices sent) as sent: it was, or we couldn't have it.
+    /// Without this it keeps the `queued` default and shows as still waiting to go out.
+    pub async fn mark_received_own_sent(&self, message_id: i64) -> Result<()> {
+        sqlx::query("UPDATE messages SET state = 'sent' WHERE id = ?1 AND direction = 'out' AND state = 'queued'")
+            .bind(message_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Record the sender's stanza `id` of a stored message (see migration 0020): an edit
+    /// target, never a dedup key.
+    pub async fn set_remote_id(&self, message_id: i64, remote_id: &str) -> Result<()> {
+        sqlx::query("UPDATE messages SET remote_id = ?1 WHERE id = ?2")
+            .bind(remote_id)
+            .bind(message_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Remember a XEP-0424 retraction of `target_id` whose message we don't have (yet), with
+    /// the sender binding [`Self::find_from_sender`] would have applied, so the message is
+    /// tombstoned if it arrives later. `any_own_device`: an encrypted retraction of our own
+    /// message by one of our own devices, which matches whatever own-device fingerprint the
+    /// message carries.
+    pub async fn add_pending_retraction(
+        &self,
+        conversation_id: i64,
+        target_id: &str,
+        direction: &str,
+        occupant_id: Option<&str>,
+        fingerprint: Option<&str>,
+        any_own_device: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO pending_retractions
+               (conversation_id, target_id, direction, occupant_id, omemo_fingerprint, any_own_device)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(conversation_id)
+        .bind(target_id)
+        .bind(direction)
+        .bind(occupant_id)
+        .bind(fingerprint)
+        .bind(any_own_device)
+        .execute(self.pool())
+        .await?;
+        // Bounded: keep the newest MAX_PENDING_RETRACTIONS per conversation.
+        sqlx::query(
+            "DELETE FROM pending_retractions
+             WHERE conversation_id = ?1 AND rowid NOT IN (
+                 SELECT rowid FROM pending_retractions WHERE conversation_id = ?1
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?2)",
+        )
+        .bind(conversation_id)
+        .bind(MAX_PENDING_RETRACTIONS)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Whether a message about to be stored (marker ids `ids`, sent from `direction` /
+    /// `occupant_id` under `fingerprint`) was retracted before it arrived; consumes the record.
+    /// Same rules as [`Self::find_from_sender`]: the occupant must match when the retraction
+    /// named one, and an encrypted message only falls to a retraction made under its own
+    /// fingerprint.
+    pub async fn take_pending_retraction(
+        &self,
+        conversation_id: i64,
+        ids: &[&str],
+        direction: &str,
+        occupant_id: Option<&str>,
+        fingerprint: Option<&str>,
+    ) -> Result<bool> {
+        for id in ids {
+            let done = sqlx::query(
+                "DELETE FROM pending_retractions
+                 WHERE conversation_id = ?1 AND target_id = ?2 AND direction = ?3
+                       AND (occupant_id IS NULL OR occupant_id = ?4)
+                       AND (any_own_device = 1 OR ?5 IS NULL OR omemo_fingerprint = ?5)",
+            )
+            .bind(conversation_id)
+            .bind(id)
+            .bind(direction)
+            .bind(occupant_id)
+            .bind(fingerprint)
+            .execute(self.pool())
+            .await?;
+            if done.rows_affected() > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Room stanza-ids of the newest (at most `limit`) not yet retracted messages one occupant
@@ -1291,6 +1391,7 @@ pub struct MamCursor {
 
 #[cfg(test)]
 mod sender_auth_tests {
+    use super::MAX_PENDING_RETRACTIONS;
     use crate::{Direction, NewMessage, Store};
 
     fn msg(conv: i64, origin: &str, dir: Direction, occ: Option<&str>) -> NewMessage {
@@ -1410,6 +1511,53 @@ mod sender_auth_tests {
         assert!(!store.take_pending_moderation(other, "sid").await.unwrap());
         assert!(store.take_pending_moderation(room, "sid").await.unwrap());
         assert!(!store.take_pending_moderation(room, "sid").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn pending_retractions_keep_the_sender_binding() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let chat = store.conversation_id(acc, "peer@example.org", "chat").await.unwrap();
+        let other = store.conversation_id(acc, "other@example.org", "chat").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+
+        // Plaintext retraction: only an unencrypted message from the same side.
+        store.add_pending_retraction(chat, "m1", "in", None, None, false).await.unwrap();
+        assert!(!store.take_pending_retraction(other, &["m1"], "in", None, None).await.unwrap());
+        assert!(!store.take_pending_retraction(chat, &["m1"], "out", None, None).await.unwrap());
+        assert!(!store.take_pending_retraction(chat, &["m1"], "in", None, Some("fp")).await.unwrap());
+        assert!(store.take_pending_retraction(chat, &["sid", "m1"], "in", None, None).await.unwrap());
+        assert!(!store.take_pending_retraction(chat, &["m1"], "in", None, None).await.unwrap());
+
+        // Encrypted retraction: the message must carry the same fingerprint (or none).
+        store.add_pending_retraction(chat, "m2", "in", None, Some("fp"), false).await.unwrap();
+        assert!(!store.take_pending_retraction(chat, &["m2"], "in", None, Some("other")).await.unwrap());
+        assert!(store.take_pending_retraction(chat, &["m2"], "in", None, Some("fp")).await.unwrap());
+
+        // Bounded per conversation: the oldest pending retractions go first.
+        for i in 0..(MAX_PENDING_RETRACTIONS + 5) {
+            store.add_pending_retraction(other, &format!("x{i}"), "in", None, None, false).await.unwrap();
+        }
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_retractions WHERE conversation_id = ?1")
+            .bind(other)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(kept, MAX_PENDING_RETRACTIONS);
+        assert!(!store.take_pending_retraction(other, &["x0"], "in", None, None).await.unwrap());
+        let newest = format!("x{}", MAX_PENDING_RETRACTIONS + 4);
+        assert!(store.take_pending_retraction(other, &[newest.as_str()], "in", None, None).await.unwrap());
+
+        // Our own message, retracted (encrypted) from another of our devices: any fingerprint.
+        store.add_pending_retraction(chat, "m3", "out", None, Some("desktop"), true).await.unwrap();
+        assert!(!store.take_pending_retraction(chat, &["m3"], "in", None, Some("phone")).await.unwrap());
+        assert!(store.take_pending_retraction(chat, &["m3"], "out", None, Some("phone")).await.unwrap());
+
+        // MUC: the occupant id must match.
+        store.add_pending_retraction(room, "s1", "in", Some("occ-a"), None, false).await.unwrap();
+        assert!(!store.take_pending_retraction(room, &["s1"], "in", Some("occ-b"), None).await.unwrap());
+        assert!(!store.take_pending_retraction(room, &["s1"], "in", None, None).await.unwrap());
+        assert!(store.take_pending_retraction(room, &["s1"], "in", Some("occ-a"), None).await.unwrap());
     }
 
     #[tokio::test]

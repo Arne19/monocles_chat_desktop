@@ -17,6 +17,43 @@ use sqlx::SqlitePool;
 /// Secret-service key (not account-specific) for the local SQLCipher database.
 pub(crate) const DB_KEY_ACCOUNT: &str = "@local";
 
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Migration 0020 was reworked during development after early builds had already applied a
+/// draft of it, which only created `pending_retractions`. sqlx refuses to open a database whose
+/// applied migration changed, so drop that draft (its table only holds retractions of messages
+/// that never arrived) and let the final 0020 apply. Recognised by the checksum mismatch together
+/// with the final version's `messages.remote_id` being absent; anything else is left for sqlx to
+/// report. A no-op once 0020 matches - removable after the next release.
+async fn repair_draft_migration_0020(pool: &SqlitePool) -> Result<()> {
+    let Some(current) = MIGRATOR.iter().find(|m| m.version == 20) else { return Ok(()) };
+    // A fresh database has no `_sqlx_migrations` table yet: nothing to repair.
+    let Ok(applied) =
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT checksum FROM _sqlx_migrations WHERE version = 20")
+            .fetch_optional(pool)
+            .await
+    else {
+        return Ok(());
+    };
+    let Some(applied) = applied else { return Ok(()) };
+    if applied.as_slice() == &*current.checksum {
+        return Ok(());
+    }
+    let has_remote_id: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('messages') WHERE name = 'remote_id')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_remote_id {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("DROP TABLE IF EXISTS pending_retractions").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 20").execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 pub mod accounts;
 pub mod cache;
 pub mod calls;
@@ -89,7 +126,8 @@ impl Store {
             .connect_with(opts)
             .await?;
 
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        repair_draft_migration_0020(&pool).await?;
+        MIGRATOR.run(&pool).await?;
 
         // Restrict the file to the owner (defence-in-depth on top of the encryption).
         restrict_permissions(path);
@@ -103,7 +141,8 @@ impl Store {
             .max_connections(1)
             .connect("sqlite::memory:")
             .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        repair_draft_migration_0020(&pool).await?;
+        MIGRATOR.run(&pool).await?;
         Ok(Self { pool, insert_lock: Default::default() })
     }
 
@@ -147,6 +186,52 @@ fn restrict_permissions(path: &Path) {
 
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) {}
+
+#[cfg(test)]
+mod migration_repair_tests {
+    use super::{repair_draft_migration_0020, Store, MIGRATOR};
+
+    /// A database that applied an early draft of 0020 (just the old `pending_retractions`)
+    /// still opens, and ends up with the final schema.
+    #[tokio::test]
+    async fn draft_0020_is_replaced_by_the_final_one() {
+        let store = Store::open_in_memory().await.unwrap();
+        let pool = store.pool();
+        // Roll the database back to "draft 0020 applied".
+        sqlx::query("DROP TABLE pending_retractions").execute(pool).await.unwrap();
+        sqlx::query("ALTER TABLE messages DROP COLUMN remote_id").execute(pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE pending_retractions (conversation_id INTEGER NOT NULL, target_id TEXT NOT NULL,
+               direction TEXT NOT NULL, occupant_id TEXT, omemo_fingerprint TEXT,
+               PRIMARY KEY (conversation_id, target_id, direction))",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 20")
+            .execute(pool)
+            .await
+            .unwrap();
+        assert!(MIGRATOR.run(pool).await.is_err(), "sqlx refuses the changed migration");
+
+        repair_draft_migration_0020(pool).await.unwrap();
+        MIGRATOR.run(pool).await.unwrap();
+        for (table, column) in [("messages", "remote_id"), ("pending_retractions", "any_own_device")] {
+            let found: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(found, "{table}.{column}");
+        }
+        // Up to date: the repair does nothing more.
+        repair_draft_migration_0020(pool).await.unwrap();
+        MIGRATOR.run(pool).await.unwrap();
+    }
+}
 
 #[cfg(test)]
 mod tests {

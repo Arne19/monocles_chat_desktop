@@ -1351,6 +1351,53 @@ pub async fn send_heartbeat(
     Ok(())
 }
 
+/// Whether an OMEMO2 `<encrypted>` element was sent by another of our own devices and carries a
+/// key for this one - i.e. our own message, reflected by a room, that this device can (and must)
+/// decrypt itself because it never had the plaintext. False for what this device sent (we never
+/// encrypt to our sending device), for one not wrapped for us, and for a sender device that
+/// isn't ours (in our published device list or a stored identity of our JID): a room nick that
+/// looks like ours may be someone else's in the archive, and their message must not be tried -
+/// or "healed" - under our JID.
+pub async fn is_from_our_other_device(store: &Store, cfg: &AccountConfig, encrypted: &Element) -> bool {
+    let Some(header) = encrypted.get_child("header", NS_OMEMO2) else { return false };
+    let Ok(our_device) = own_device_id(store, cfg).await else { return false };
+    let Some(sid) = sent_by_other_device_for_us(header, cfg.bare(), our_device) else { return false };
+    let listed = device_list_seen()
+        .lock()
+        .unwrap()
+        .get(&(cfg.account_id, cfg.bare().to_string()))
+        .is_some_and(|devices| devices.contains(&sid));
+    listed
+        || store
+            .list_omemo_identities(cfg.account_id, cfg.bare())
+            .await
+            .is_ok_and(|ids| ids.iter().any(|i| i.device_id == i64::from(sid)))
+}
+
+/// Whether `fingerprint` (as [`Decrypted::fingerprint`] reports it) is one of our own account's
+/// devices that we would encrypt to: trust 1 (BTBV) or 3 (verified), still active, and - when we
+/// have seen our published device list this run - listed in it. Decrypting under our own JID
+/// alone proves nothing: a replaced or never-seen identity still decrypts (filed undecided, see
+/// `mxc_omemo::store`), so this is what lets an own-side edit skip the fingerprint check.
+pub async fn is_trusted_own_device_fingerprint(store: &Store, cfg: &AccountConfig, fingerprint: &str) -> bool {
+    let Ok(identities) = store.list_omemo_identities(cfg.account_id, cfg.bare()).await else {
+        return false;
+    };
+    let listed = device_list_seen().lock().unwrap().get(&(cfg.account_id, cfg.bare().to_string())).cloned();
+    identities.iter().any(|id| {
+        (id.trust == 1 || id.trust == 3)
+            && id.active
+            && listed.as_ref().is_none_or(|l| u32::try_from(id.device_id).is_ok_and(|d| l.contains(&d)))
+            && mxc_omemo::fingerprint(&id.identity_key) == fingerprint
+    })
+}
+
+/// The sending device of `header` when it isn't `our_device` and the header wraps a key for us.
+fn sent_by_other_device_for_us(header: &Element, our_bare: &str, our_device: u32) -> Option<u32> {
+    let sid = header.attr("sid").and_then(|s| s.parse::<u32>().ok())?;
+    (sid != our_device && !select_key_candidates(header, our_bare, our_device).0.is_empty()).then_some(sid)
+}
+
 /// Does a `<keys jid='…'>` block address us?
 ///
 /// A plain `==` against our bare JID was too strict: XMPP localparts and domains are both
@@ -1881,7 +1928,7 @@ mod keys_block_tests {
 
 #[cfg(test)]
 mod key_candidate_tests {
-    use super::{select_key_candidates, MAX_KEY_CANDIDATES, NS_OMEMO2};
+    use super::{select_key_candidates, sent_by_other_device_for_us, MAX_KEY_CANDIDATES, NS_OMEMO2};
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
     use minidom::Element;
@@ -1922,6 +1969,18 @@ mod key_candidate_tests {
                     .build(),
             )
             .build()
+    }
+
+    /// An own-nick room echo is decrypted only when another device sent it with a key for us.
+    #[test]
+    fn own_echo_from_another_device_needs_a_key_for_us() {
+        // header_with's sender is device 7.
+        assert_eq!(sent_by_other_device_for_us(&header_with(US, 1), US, OUR_RID), Some(7));
+        // Sent by this very device: never wrapped for ourselves.
+        assert_eq!(sent_by_other_device_for_us(&header_with(US, 1), US, 7), None);
+        // No wrap for our device under our own JID's block.
+        assert_eq!(sent_by_other_device_for_us(&header_with(US, 0), US, OUR_RID), None);
+        assert_eq!(sent_by_other_device_for_us(&header_with("eve@example.com", 1), US, OUR_RID), None);
     }
 
     /// The ordinary cases are untouched: one wrap, or the benign two a sender that rebuilt the
@@ -1983,5 +2042,45 @@ mod key_candidate_tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0], (vec![0xABu8; 16], true), "the kex flag survives");
         assert!(!truncated);
+    }
+}
+
+#[cfg(test)]
+mod own_device_trust_tests {
+    use super::{is_trusted_own_device_fingerprint, refresh_device_list};
+    use crate::client::AccountConfig;
+    use mxc_store::Store;
+
+    /// Only a trusted (BTBV or verified), active device of our own JID - and, once our device
+    /// list is known, a listed one - may edit our messages whatever their fingerprint.
+    #[tokio::test]
+    async fn only_trusted_listed_own_devices_count() {
+        const ME: &str = "own-device-trust@example.org";
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account(ME).await.unwrap();
+        let cfg = AccountConfig::new(acc, ME.into(), String::new());
+        let key = |b: u8| [b; 33];
+        let fp = |b: u8| mxc_omemo::fingerprint(&key(b));
+        store.save_omemo_identity(acc, ME, 11, &key(1)).await.unwrap();
+        store.save_omemo_identity(acc, ME, 12, &key(2)).await.unwrap();
+        store.save_omemo_identity(acc, "peer@example.org", 13, &key(3)).await.unwrap();
+        store.set_omemo_trust(acc, ME, 11, 1).await.unwrap();
+        store.set_omemo_trust(acc, ME, 12, 0).await.unwrap(); // undecided (e.g. a replaced key)
+        store.set_omemo_trust(acc, "peer@example.org", 13, 3).await.unwrap();
+
+        assert!(is_trusted_own_device_fingerprint(&store, &cfg, &fp(1)).await);
+        assert!(!is_trusted_own_device_fingerprint(&store, &cfg, &fp(2)).await, "undecided");
+        assert!(!is_trusted_own_device_fingerprint(&store, &cfg, &fp(3)).await, "someone else's");
+        assert!(!is_trusted_own_device_fingerprint(&store, &cfg, &fp(9)).await, "unknown");
+
+        store.set_omemo_trust(acc, ME, 12, 3).await.unwrap();
+        assert!(is_trusted_own_device_fingerprint(&store, &cfg, &fp(2)).await, "verified");
+        // Our published list no longer has device 12.
+        refresh_device_list(acc, ME, &[11]);
+        assert!(!is_trusted_own_device_fingerprint(&store, &cfg, &fp(2)).await, "unlisted");
+        assert!(is_trusted_own_device_fingerprint(&store, &cfg, &fp(1)).await);
+        // Inactive (dropped from the list as recorded in the store).
+        store.set_omemo_devices_active(acc, ME, &[], None).await.unwrap();
+        assert!(!is_trusted_own_device_fingerprint(&store, &cfg, &fp(1)).await, "inactive");
     }
 }
