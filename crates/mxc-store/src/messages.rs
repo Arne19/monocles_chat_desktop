@@ -1558,6 +1558,16 @@ mod sender_auth_tests {
         assert!(!store.take_pending_retraction(room, &["s1"], "in", Some("occ-b"), None).await.unwrap());
         assert!(!store.take_pending_retraction(room, &["s1"], "in", None, None).await.unwrap());
         assert!(store.take_pending_retraction(room, &["s1"], "in", Some("occ-a"), None).await.unwrap());
+
+        // Someone else retracting the same id doesn't displace the author's retraction, in
+        // either order; the same sender's repeat merges.
+        store.add_pending_retraction(room, "s2", "in", Some("occ-evil"), None, false).await.unwrap();
+        store.add_pending_retraction(room, "s2", "in", Some("occ-a"), None, false).await.unwrap();
+        store.add_pending_retraction(room, "s2", "in", Some("occ-a"), None, false).await.unwrap();
+        store.add_pending_retraction(room, "s2", "in", Some("occ-evil"), None, false).await.unwrap();
+        assert!(store.take_pending_retraction(room, &["s2"], "in", Some("occ-a"), None).await.unwrap());
+        assert!(!store.take_pending_retraction(room, &["s2"], "in", Some("occ-a"), None).await.unwrap());
+        assert!(store.take_pending_retraction(room, &["s2"], "in", Some("occ-evil"), None).await.unwrap());
     }
 
     #[tokio::test]
