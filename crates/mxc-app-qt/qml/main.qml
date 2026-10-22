@@ -604,6 +604,28 @@ ApplicationWindow {
     }
 
     // Open a group chat (MUC) by room JID — used by the default support-room entry.
+    // Whether the call running right now belongs to this chat: the group call of a group, or the
+    // 1:1 call with a contact. Drives the "ongoing call" icon in the chat list + chat header.
+    function chatHasOngoingCall(jid, isMuc) {
+        var j = (jid || "").toLowerCase()
+        if (j.length === 0)
+            return false
+        if (isMuc)
+            return backend.conferenceActive && backend.conferenceRoom.toLowerCase() === j
+        return backend.callActive && backend.callPeer.split('/')[0].toLowerCase() === j
+    }
+
+    // Bring the running call's window to the front (it may be behind, or minimized).
+    function showCallWindow(group) {
+        var d = group ? conferenceDialog : callDialog
+        if (d.visibility === Window.Minimized)
+            d.showNormal()
+        else
+            d.show()
+        d.raise()
+        d.requestActivate()
+    }
+
     function openMuc(room, name) {
         window.clearReply()
         window.clearEdit()
@@ -1125,6 +1147,14 @@ ApplicationWindow {
                                             Layout.fillWidth: true
                                         }
                                     }
+                                    // a call is running in this chat (group call / 1:1 call)
+                                    ColorIcon {
+                                        visible: window.chatHasOngoingCall(model.jid, model.kind === "muc")
+                                        implicitWidth: 16
+                                        implicitHeight: 16
+                                        source: window.iconBase + "call.svg"
+                                        color: "#43a047"
+                                    }
                                     Label {
                                         textFormat: Text.PlainText
                                         visible: model.encrypted
@@ -1461,9 +1491,16 @@ ApplicationWindow {
                                 // rejected, we cancelled, or the call failed before connecting.
                                 readonly property bool missed: model.direction === "in" && !model.answered
                                 readonly property bool unanswered: !model.answered
-                                // Group calls (XEP-0272 Muji) are logged under the room.
-                                onClicked: model.group ? window.openMuc(model.peer, model.name)
-                                                       : window.openContact(model.peer, model.peer.split('@')[0], "", "")
+                                // Group calls (XEP-0272 Muji) are logged under the room. A group we
+                                // left has nothing to open (and is no 1:1 chat with the room).
+                                onClicked: {
+                                    if (model.groupGone)
+                                        return
+                                    if (model.group)
+                                        window.openMuc(model.peer, model.name)
+                                    else
+                                        window.openContact(model.peer, model.peer.split('@')[0], "", "")
+                                }
                                 contentItem: RowLayout {
                                     spacing: 8
                                     ColorIcon {
@@ -1501,7 +1538,7 @@ ApplicationWindow {
                                     ToolButton {
                                         // one call at a time: no call-back during any call
                                         enabled: backend.connected && !backend.callActive
-                                                 && !backend.conferenceActive
+                                                 && !backend.conferenceActive && !model.groupGone
                                         ToolTip.text: model.group ? qsTr("Start group call (audio)") : qsTr("Call back (audio)")
                                         ToolTip.visible: hovered
                                         onClicked: model.group ? backend.placeGroupCall(model.peer, false)
@@ -1514,7 +1551,7 @@ ApplicationWindow {
                                     ToolButton {
                                         // one call at a time: no call-back during any call
                                         enabled: backend.connected && !backend.callActive
-                                                 && !backend.conferenceActive
+                                                 && !backend.conferenceActive && !model.groupGone
                                         ToolTip.text: model.group ? qsTr("Start group call (video)") : qsTr("Call back (video)")
                                         ToolTip.visible: hovered
                                         onClicked: model.group ? backend.placeGroupCall(model.peer, true)
@@ -1961,6 +1998,21 @@ ApplicationWindow {
                                 }
 
                                 // Audio + video call buttons (1:1 only).
+                                // The call running in this chat (1:1 or group): bring its window back.
+                                ToolButton {
+                                    implicitWidth: 32
+                                    implicitHeight: 32
+                                    visible: window.chatHasOngoingCall(window.currentPeerJid, window.currentPeerIsMuc)
+                                    ToolTip.text: qsTr("Return to call")
+                                    ToolTip.visible: hovered
+                                    onClicked: window.showCallWindow(window.currentPeerIsMuc)
+                                    contentItem: ColorIcon {
+                                        implicitWidth: 17
+                                        implicitHeight: 17
+                                        source: window.iconBase + "call.svg"
+                                        color: "#43a047"
+                                    }
+                                }
                                 ToolButton {
                                     implicitWidth: 32
                                     implicitHeight: 32
@@ -4666,7 +4718,9 @@ ApplicationWindow {
             Button {
                 text: qsTr("Dismiss")
                 flat: true
-                onClicked: { backend.dismissGroupCallInvite(); groupCallInviteDialog.close() }
+                // the dialog follows conferenceInviteRoom: it closes, or shows the next
+                // group's pending invite
+                onClicked: backend.dismissGroupCallInvite()
             }
             Button {
                 text: qsTr("Join (video)")
@@ -6577,6 +6631,18 @@ ApplicationWindow {
                     height: confGrid.cellHeight
                     // Latest video frame (data: URL) for this participant, set from conferenceFrame.
                     property string frameUrl: ""
+                    // When the last frame arrived: a participant who turns their camera off simply
+                    // stops sending, so without this the tile would freeze on their last frame.
+                    property double lastFrameAt: 0
+                    Timer {
+                        interval: 1000
+                        repeat: true
+                        running: frameUrl.length > 0
+                        onTriggered: {
+                            if (Date.now() - lastFrameAt > 3000)
+                                frameUrl = ""   // back to the avatar
+                        }
+                    }
                     // Show a video tile for video calls, or once this participant sends video.
                     readonly property bool showVideo: backend.conferenceVideo || frameUrl.length > 0
                     // Fetch this occupant's avatar lazily (by occupant JID), like the member list.
@@ -6586,8 +6652,10 @@ ApplicationWindow {
                     Connections {
                         target: backend
                         function onConferenceFrame(sid, url) {
-                            if (sid === model.sid)
+                            if (sid === model.sid) {
+                                lastFrameAt = Date.now()
                                 frameUrl = url
+                            }
                         }
                     }
 
@@ -6698,7 +6766,9 @@ ApplicationWindow {
 
                 // Our own camera self-preview (video calls), bottom-right corner.
                 Rectangle {
-                    visible: backend.conferenceVideo && backend.localFrame.length > 0
+                    // hidden while our camera is off (it would freeze on the last frame)
+                    visible: backend.conferenceVideo && backend.conferenceCameraOn
+                             && backend.localFrame.length > 0
                     width: 120
                     height: 90
                     anchors.right: parent.right
@@ -6783,7 +6853,12 @@ ApplicationWindow {
                     Material.background: checked ? "#2e7d32" : undefined
                     ToolTip.text: checked ? qsTr("Stop sharing screen") : qsTr("Share screen")
                     ToolTip.visible: hovered
-                    onToggled: backend.setConferenceScreenShare(checked)
+                    onToggled: {
+                        backend.setConferenceScreenShare(checked)
+                        // The click broke the binding; follow the real state again, so a cancelled
+                        // screen picker doesn't leave the button green.
+                        checked = Qt.binding(function() { return backend.conferenceScreenSharing })
+                    }
                     contentItem: ColorIcon {
                         implicitWidth: 22
                         implicitHeight: 22

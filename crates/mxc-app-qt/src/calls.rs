@@ -15,6 +15,7 @@ const ROLE_ANSWERED: i32 = 259;
 const ROLE_TIMESTAMP: i32 = 260;
 const ROLE_GROUP: i32 = 261;
 const ROLE_NAME: i32 = 262;
+const ROLE_GROUP_GONE: i32 = 263;
 
 /// One call-history row.
 #[derive(Clone, Default)]
@@ -30,6 +31,8 @@ pub struct CallEntry {
     pub group: bool,
     /// Display name for a group call (the room's name); empty for 1:1 calls.
     pub name: String,
+    /// A group call whose group we're no longer in: nothing to open or call back.
+    pub group_gone: bool,
 }
 
 impl CallEntry {
@@ -40,8 +43,9 @@ impl CallEntry {
             video: c.video,
             answered: c.answered,
             timestamp: c.timestamp.clone(),
-            group: false,
+            group: c.is_group,
             name: String::new(),
+            group_gone: false,
         }
     }
 }
@@ -153,6 +157,7 @@ impl qobject::CallLogModel {
             ROLE_TIMESTAMP => QVariant::from(&QString::from(item.timestamp.as_str())),
             ROLE_GROUP => QVariant::from(&item.group),
             ROLE_NAME => QVariant::from(&QString::from(item.name.as_str())),
+            ROLE_GROUP_GONE => QVariant::from(&item.group_gone),
             _ => QVariant::default(),
         }
     }
@@ -170,6 +175,7 @@ impl qobject::CallLogModel {
         roles.insert(ROLE_TIMESTAMP, QByteArray::from("timestamp"));
         roles.insert(ROLE_GROUP, QByteArray::from("group"));
         roles.insert(ROLE_NAME, QByteArray::from("name"));
+        roles.insert(ROLE_GROUP_GONE, QByteArray::from("groupGone"));
         roles
     }
 }

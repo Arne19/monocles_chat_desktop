@@ -278,6 +278,8 @@ impl CoreActor {
                                     security: link.lock().unwrap().clone(),
                                 })).await;
                             if !resumed {
+                                // A new session: we're in no room until bootstrap re-joins them.
+                                xeps::muji::forget_all_rooms(cfg.account_id);
                                 // Spawn bootstrap so it can await iq replies without
                                 // blocking the reader loop.
                                 let w = writer.clone();
@@ -699,7 +701,17 @@ impl CoreActor {
             }
             Command::SetPresence { show, status, .. } => {
                 self.store.set_own_presence(&show, &status).await?;
-                xeps::presence::send_presence(w, &show, &status)
+                xeps::muji::set_own_presence(cfg.account_id, &show, &status);
+                xeps::presence::send_presence(w, &show, &status)?;
+                // Groups don't get our broadcast presence: send it to each joined room, at our
+                // current nick there, still carrying `<muji>` if we're in that room's call (a
+                // presence without it would tell the others we left).
+                for room in xeps::muji::joined_rooms(cfg.account_id) {
+                    let Some(nick) = xeps::muji::room_nick(cfg.account_id, &room) else { continue };
+                    let payload = xeps::muji::active_payload(cfg.account_id, &room);
+                    let _ = xeps::muji::send_muji_presence(w, cfg.account_id, &room, &nick, payload);
+                }
+                Ok(())
             }
             Command::PublishAvatar { account_id, data, mime, width, height } => {
                 xeps::avatar::publish(w, &data, &mime, width, height).await?;

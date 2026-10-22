@@ -294,7 +294,7 @@ fn log_call_end(calls: &CallRegistry, sid: &str) {
         let store = store.clone();
         let (peer, dir, video, answered, ts) = (m.peer, dir.to_string(), m.video, m.answered, m.ts);
         tokio::task::spawn_local(async move {
-            let _ = store.insert_call_log(account, &peer, &dir, video, answered, &ts).await;
+            let _ = store.insert_call_log(account, &peer, &dir, video, answered, &ts, false).await;
         });
     }
 }
@@ -313,7 +313,7 @@ fn log_conference_end(store: &mxc_store::Store, account_id: i64, conf: &Conferen
         conf.started_at.clone(),
     );
     tokio::task::spawn_local(async move {
-        let _ = store.insert_call_log(account_id, &room, &dir, video, answered, &ts).await;
+        let _ = store.insert_call_log(account_id, &room, &dir, video, answered, &ts, true).await;
     });
 }
 
@@ -2642,8 +2642,8 @@ pub async fn upgrade_group_call_to_video(
         }
         let ready = muji::muji_payload(true, true, device);
         muji::set_active_payload(cfg.account_id, room, Some(ready.clone()));
-        let _ = muji::send_muji_presence(w, room, &nick, Some(muji::muji_payload(false, true, device)));
-        let _ = muji::send_muji_presence(w, room, &nick, Some(ready));
+        let _ = muji::send_muji_presence(w, cfg.account_id, room, &nick, Some(muji::muji_payload(false, true, device)));
+        let _ = muji::send_muji_presence(w, cfg.account_id, room, &nick, Some(ready));
         tracing::info!(%room, "muji: upgraded our participation to video");
     }
     ensure_video_on_legs(calls, room);
@@ -2739,6 +2739,9 @@ pub async fn place_group_call(
             return;
         }
     };
+    // The nick the room actually gave us, if it reflected one (a presence to a stale nick is a
+    // rename request).
+    let nick = muji::room_nick(cfg.account_id, room).unwrap_or(nick);
     let our_occupant = format!("{room}/{nick}");
     if calls.borrow().conferences.contains_key(room) {
         // Already in this call (e.g. a second "join"): replacing the conference would orphan its
@@ -2822,8 +2825,8 @@ pub async fn place_group_call(
     // can advertise readiness immediately.
     // Every later presence to the room (e.g. the re-join after a reconnect) keeps carrying it.
     muji::set_active_payload(cfg.account_id, room, Some(muji::muji_payload(true, video, device)));
-    let _ = muji::send_muji_presence(w, room, &nick, Some(muji::muji_payload(false, video, device)));
-    let _ = muji::send_muji_presence(w, room, &nick, Some(muji::muji_payload(true, video, device)));
+    let _ = muji::send_muji_presence(w, cfg.account_id, room, &nick, Some(muji::muji_payload(false, video, device)));
+    let _ = muji::send_muji_presence(w, cfg.account_id, room, &nick, Some(muji::muji_payload(true, video, device)));
     // XEP-0272: mesh only once the room has rebroadcast our `<muji>` (see `mark_announced`,
     // driven by our reflected self-presence). This timer is the safety net if it never arrives.
     emit_conference(calls, events, cfg.account_id, room).await;
@@ -2929,7 +2932,7 @@ async fn leave_conference(
     };
     muji::set_active_payload(account_id, room, None);
     if let Some(nick) = nick {
-        let _ = muji::send_muji_presence(w, room, &nick, None);
+        let _ = muji::send_muji_presence(w, account_id, room, &nick, None);
     }
     for (sid, addr) in sessions {
         if let Some(call) = remove_active(&calls, &sid) {
@@ -3049,12 +3052,24 @@ pub async fn observe_muji_presence(
     let nick_change = unavailable && has_status("303");
     let parsed = if unavailable { None } else { muji::parse_muji(pres) };
 
+    // The room reflected our own presence: remember the nick it gave us (it may differ from the
+    // one we asked for) — status updates are sent to our CURRENT occupant JID.
+    if !unavailable && has_status("110") && muji::is_room_joined(cfg.account_id, &room) {
+        muji::set_room_nick(cfg.account_id, &room, nick);
+    }
+
     // Cheap filter first: only a presence carrying `<muji>`, or one for a room whose call we track,
     // matters here (this runs for EVERY presence).
     let tracked = {
         let c = calls.borrow();
         c.conferences.contains_key(&room) || c.muji_seen.contains_key(&room)
     };
+    // We left / were removed from a room with no call state (with call state, `on_room_left`
+    // below handles it): forget it, or a later status update would be sent to it — and a presence
+    // to a room we're not in re-joins it (after a kick, even against the moderator's will).
+    if unavailable && !nick_change && has_status("110") && !tracked {
+        muji::forget_room(cfg.account_id, &room);
+    }
     if parsed.is_none() && !tracked {
         return;
     }
@@ -3110,7 +3125,7 @@ pub async fn observe_muji_presence(
         if let Some(nick) = reannounce {
             if let Some(payload) = muji::active_payload(cfg.account_id, &room) {
                 tracing::info!(%room, "muji: reflected self-presence lost <muji> — re-announcing");
-                let _ = muji::send_muji_presence(w, &room, &nick, Some(payload));
+                let _ = muji::send_muji_presence(w, cfg.account_id, &room, &nick, Some(payload));
             }
         }
         return;

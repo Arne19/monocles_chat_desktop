@@ -66,6 +66,7 @@ pub async fn run(w: &Writer, store: &Store, cfg: &AccountConfig, events: &Sender
 
     // Initial presence (with caps) — restore our last chosen availability + status message.
     let (show, status) = store.own_presence().await.unwrap_or_default();
+    super::muji::set_own_presence(cfg.account_id, &show, &status);
     if let Err(e) = presence::send_presence(w, &show, &status) {
         let _ = events.send(Event::Toast { text: format!("presence failed: {e}"), important: false }).await;
     }

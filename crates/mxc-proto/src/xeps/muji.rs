@@ -84,16 +84,19 @@ pub fn muji_payload(prepared: bool, video: bool, device: Option<u32>) -> Element
 }
 
 /// Send a directed MUC presence to `room/nick` carrying an optional `<muji>` payload (plus our
-/// caps). `muji = None` re-sends a plain presence with no `<muji>` — i.e. we have left the
-/// conference (XEP-0272: drop `<muji>` first, *then* terminate the Jingle sessions).
+/// caps and our current show/status, like every presence to a room). `muji = None` re-sends a
+/// presence with no `<muji>` — i.e. we have left the conference (XEP-0272: drop `<muji>` first,
+/// *then* terminate the Jingle sessions).
 pub fn send_muji_presence(
     w: &Writer,
+    account_id: i64,
     room: &str,
     nick: &str,
     muji: Option<Element>,
 ) -> anyhow::Result<()> {
     let mut pres = Element::builder("presence", "jabber:client")
         .attr(crate::ncname("to"), format!("{room}/{nick}"))
+        .append_all(own_presence_elements(account_id))
         .append(caps::caps_element());
     if let Some(m) = muji {
         pres = pres.append(m);
@@ -140,6 +143,14 @@ fn parse_state(muji: &Element) -> MujiState {
 thread_local! {
     static ACTIVE: std::cell::RefCell<std::collections::HashMap<(i64, String), Element>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Our nick in each joined room, as the room reflected it (it may differ from the one we
+    /// asked for): directed presence updates must go to our CURRENT occupant JID — one to a
+    /// stale nick is a rename request.
+    static ROOM_NICK: std::cell::RefCell<std::collections::HashMap<(i64, String), String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Our current availability (`show`, empty = online) and status message, per account.
+    static OWN_PRESENCE: std::cell::RefCell<std::collections::HashMap<i64, (String, String)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
     static JOINING: std::cell::RefCell<std::collections::HashSet<(i64, String)>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
     static JOINED: std::cell::RefCell<std::collections::HashSet<(i64, String)>> =
@@ -158,6 +169,54 @@ pub fn forget_room(account_id: i64, room: &str) {
     JOINED.with(|j| {
         j.borrow_mut().remove(&(account_id, super::jingle::room_key(room)));
     });
+    ROOM_NICK.with(|n| {
+        n.borrow_mut().remove(&(account_id, super::jingle::room_key(room)));
+    });
+}
+
+/// A fresh (non-resumed) session: the server dropped every room occupancy we had. Forget them
+/// all; the rooms we re-join are marked again by `muc::join`. Otherwise a status update would be
+/// sent to a room we didn't re-join — and a presence to a room we're not in joins it.
+pub fn forget_all_rooms(account_id: i64) {
+    JOINED.with(|j| j.borrow_mut().retain(|(a, _)| *a != account_id));
+    ROOM_NICK.with(|n| n.borrow_mut().retain(|(a, _), _| *a != account_id));
+}
+
+/// The rooms we're currently joined to (normalized room keys).
+pub fn joined_rooms(account_id: i64) -> Vec<String> {
+    JOINED.with(|j| j.borrow().iter().filter(|(a, _)| *a == account_id).map(|(_, r)| r.clone()).collect())
+}
+
+/// The room reflected our own presence under `nick`: remember it as our current nick there.
+pub fn set_room_nick(account_id: i64, room: &str, nick: &str) {
+    ROOM_NICK.with(|n| {
+        n.borrow_mut().insert((account_id, super::jingle::room_key(room)), nick.to_string());
+    });
+}
+
+/// Our current nick in `room`, as last reflected by the room.
+pub fn room_nick(account_id: i64, room: &str) -> Option<String> {
+    ROOM_NICK.with(|n| n.borrow().get(&(account_id, super::jingle::room_key(room))).cloned())
+}
+
+/// Remember our current availability + status message (sent with every room presence).
+pub fn set_own_presence(account_id: i64, show: &str, status: &str) {
+    OWN_PRESENCE.with(|p| {
+        p.borrow_mut().insert(account_id, (show.to_string(), status.to_string()));
+    });
+}
+
+/// `<show>` / `<status>` children for a presence to a room (none for plain "online").
+pub fn own_presence_elements(account_id: i64) -> Vec<Element> {
+    let (show, status) = OWN_PRESENCE.with(|p| p.borrow().get(&account_id).cloned()).unwrap_or_default();
+    let mut out = Vec::new();
+    if !show.is_empty() {
+        out.push(Element::builder("show", "jabber:client").append(show).build());
+    }
+    if !status.is_empty() {
+        out.push(Element::builder("status", "jabber:client").append(status).build());
+    }
+    out
 }
 
 /// Whether `room` is a MUC we joined — synchronous on purpose: the presence handler must not
@@ -271,5 +330,19 @@ mod tests {
         assert!(!is_room_joined(2, "r@muc"));
         forget_room(1, "r@MUC");
         assert!(!is_room_joined(1, "r@muc"));
+    }
+
+    #[test]
+    fn forget_all_rooms_clears_only_that_account() {
+        mark_room_joined(7, "a@muc");
+        mark_room_joined(7, "b@muc");
+        mark_room_joined(8, "a@muc");
+        set_room_nick(7, "a@muc", "me");
+        forget_all_rooms(7);
+        assert!(!is_room_joined(7, "a@muc"));
+        assert!(!is_room_joined(7, "b@muc"));
+        assert!(room_nick(7, "a@muc").is_none());
+        assert!(joined_rooms(7).is_empty());
+        assert!(is_room_joined(8, "a@muc"));
     }
 }

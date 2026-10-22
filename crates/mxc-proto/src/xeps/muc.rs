@@ -119,9 +119,14 @@ pub async fn join(
     // still in its group call (a reconnect), the join presence keeps announcing it.
     super::muji::mark_room_joining(cfg.account_id, room);
     super::muji::mark_room_joined(cfg.account_id, room);
+    // Our availability + status message: the room shows it to the other occupants (and every
+    // later presence we send to the room carries it too).
+    let (show, status) = store.own_presence().await.unwrap_or_default();
+    super::muji::set_own_presence(cfg.account_id, &show, &status);
     let mut presence = Element::builder("presence", "jabber:client")
         .attr(crate::ncname("to"), format!("{room}/{nick}"))
         .append(x.build())
+        .append_all(super::muji::own_presence_elements(cfg.account_id))
         .append(caps::caps_element());
     if let Some(muji) = super::muji::active_payload(cfg.account_id, room) {
         presence = presence.append(muji);

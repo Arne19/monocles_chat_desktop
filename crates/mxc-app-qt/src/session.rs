@@ -133,6 +133,19 @@ pub fn muc_omemo_capable(room: &str) -> bool {
 /// don't need QML to track the ids. Set from `Event::CallUpdate`, cleared when the call ends.
 static CURRENT_CALL: LazyLock<Mutex<Option<CallCtx>>> = LazyLock::new(|| Mutex::new(None));
 
+/// Pending group-call invites as (room, who), oldest first. The dialog shows the first one; an
+/// invite for another room waits instead of replacing it, and a cancellation only removes its
+/// own room's invite.
+static PENDING_INVITES: LazyLock<Mutex<Vec<(String, String)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Remove `room`'s pending invite (shown one handled / cancelled) and return the invite to show
+/// next, if any.
+pub fn next_group_call_invite(room: &str) -> Option<(String, String)> {
+    let mut pending = PENDING_INVITES.lock().unwrap();
+    pending.retain(|(r, _)| !r.eq_ignore_ascii_case(room));
+    pending.first().cloned()
+}
+
 #[derive(Clone)]
 struct CallCtx {
     sid: String,
@@ -367,10 +380,19 @@ pub fn load_calls(jid: String, qt: CxxQtThread<CallLogModel>) {
         let mut items: Vec<CallEntry> = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut item = CallEntry::from_row(row);
-            // A group call's history row names the room (XEP-0272 Muji).
-            if let Ok(Some(name)) = store.muc_display_name(account_id, &row.peer).await {
-                item.group = true;
-                item.name = name;
+            // A group call's history row names the room (XEP-0272 Muji). Rows logged before the
+            // `is_group` column are recognised by the group still being in our list.
+            match store.muc_display_name(account_id, &row.peer).await {
+                Ok(Some(name)) => {
+                    item.group = true;
+                    item.name = name;
+                }
+                _ if item.group => {
+                    // We left that group: still a group call, but nothing to open or call back.
+                    item.group_gone = true;
+                    item.name = row.peer.split('@').next().unwrap_or(&row.peer).to_string();
+                }
+                _ => {}
             }
             items.push(item);
         }
@@ -1961,16 +1983,28 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                 }
                 // XEP-0272 Muji: another member started a group call → show a "Join" prompt.
                 Event::ConferenceInvite { room, from, .. } => {
-                    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
-                        backend.as_mut().set_conference_invite_room(QString::from(&room));
-                        backend.as_mut().set_conference_invite_from(QString::from(&from));
-                    });
+                    let shown = {
+                        let mut pending = PENDING_INVITES.lock().unwrap();
+                        match pending.iter_mut().find(|(r, _)| r.eq_ignore_ascii_case(&room)) {
+                            Some(entry) => entry.1 = from.clone(),
+                            None => pending.push((room.clone(), from.clone())),
+                        }
+                        pending.first().cloned()
+                    };
+                    if let Some((room, from)) = shown {
+                        let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                            backend.as_mut().set_conference_invite_room(QString::from(&room));
+                            backend.as_mut().set_conference_invite_from(QString::from(&from));
+                        });
+                    }
                 }
                 // The invited call ended → dismiss the prompt.
-                Event::ConferenceInviteCancelled { .. } => {
+                Event::ConferenceInviteCancelled { room, .. } => {
+                    let next = next_group_call_invite(&room);
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
-                        backend.as_mut().set_conference_invite_room(QString::default());
-                        backend.as_mut().set_conference_invite_from(QString::default());
+                        let (room, from) = next.unwrap_or_default();
+                        backend.as_mut().set_conference_invite_room(QString::from(&room));
+                        backend.as_mut().set_conference_invite_from(QString::from(&from));
                     });
                 }
                 // XEP-0272 Muji group-call state → drive the conference panel + participant model.
@@ -2007,6 +2041,10 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                     if other_room_ended {
                         continue;
                     }
+                    // Our call ended: offer the invites that waited meanwhile (their calls are
+                    // still running — a finished one was cancelled and dropped from the queue).
+                    let waiting_invite =
+                        if active { None } else { PENDING_INVITES.lock().unwrap().first().cloned() };
                     *CURRENT_CONFERENCE.lock().unwrap() = active.then(|| ConferenceView {
                         room: room.clone(),
                         participants: entries,
@@ -2023,6 +2061,10 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                             backend.as_mut().set_local_frame(QString::default());
                             // The core logged the group call → refresh the Calls list.
                             backend.as_mut().calls_changed();
+                            if let Some((room, from)) = waiting_invite {
+                                backend.as_mut().set_conference_invite_room(QString::from(&room));
+                                backend.as_mut().set_conference_invite_from(QString::from(&from));
+                            }
                         }
                         backend.as_mut().conference_changed();
                     });

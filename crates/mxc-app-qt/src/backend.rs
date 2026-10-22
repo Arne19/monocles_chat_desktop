@@ -1440,6 +1440,9 @@ impl qobject::Backend {
 
     pub fn join_group_call(mut self: Pin<&mut Self>, video: bool) {
         let room = self.conference_invite_room.to_string();
+        // Joining makes the other pending invites moot for now (one call at a time); they stay
+        // queued and show again after this call, if those calls are still running.
+        let _ = crate::session::next_group_call_invite(&room);
         self.as_mut().set_conference_invite_room(QString::default());
         self.as_mut().set_conference_invite_from(QString::default());
         self.as_mut().set_conference_camera_on(true);
@@ -1450,8 +1453,11 @@ impl qobject::Backend {
     }
 
     pub fn dismiss_group_call_invite(mut self: Pin<&mut Self>) {
-        self.as_mut().set_conference_invite_room(QString::default());
-        self.as_mut().set_conference_invite_from(QString::default());
+        let room = self.conference_invite_room.to_string();
+        // Show the next group's pending invite, if any.
+        let (next_room, next_from) = crate::session::next_group_call_invite(&room).unwrap_or_default();
+        self.as_mut().set_conference_invite_room(QString::from(&next_room));
+        self.as_mut().set_conference_invite_from(QString::from(&next_from));
         crate::session::dismiss_group_call_invite();
     }
 
