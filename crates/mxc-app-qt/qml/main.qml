@@ -6508,6 +6508,29 @@ ApplicationWindow {
                              ? qsTr("1 participant")
                              : qsTr("%1 participants").arg(confGrid.count))
                 }
+                // Group-call trust: the LOWEST trust over all connected legs, so it only shows
+                // when every participant's DTLS fingerprint was authenticated via PQ OMEMO2 from a
+                // trusted key (per-participant locks are on the tiles).
+                RowLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    spacing: 6
+                    visible: backend.conferenceTrust > 0
+                    readonly property bool confVerified: backend.conferenceTrust >= 2
+                    readonly property color trustColor: confVerified ? "#2e9d4f" : "#3a7bd5"
+                    ColorIcon {
+                        implicitWidth: 16
+                        implicitHeight: 16
+                        source: window.iconBase + (parent.confVerified ? "verified.svg" : "lock-omemo2.svg")
+                        color: parent.trustColor
+                    }
+                    Label {
+                        textFormat: Text.PlainText
+                        text: parent.confVerified ? qsTr("All verified · PQ OMEMO2")
+                                                  : qsTr("All encrypted · PQ OMEMO2")
+                        color: parent.trustColor
+                        font.pixelSize: 12
+                    }
+                }
             }
 
             // Participant grid: one tile per participant — their video when they send it (also in
@@ -6559,6 +6582,20 @@ ApplicationWindow {
                             if (sid === model.sid)
                                 frameUrl = url
                         }
+                    }
+
+                    // This participant's leg is PQ OMEMO2-authenticated (lock) / manually verified
+                    // (shield); absent for an unauthenticated leg, so that participant stands out.
+                    ColorIcon {
+                        z: 1
+                        anchors.top: parent.top
+                        anchors.right: parent.right
+                        anchors.margins: 10
+                        implicitWidth: 16
+                        implicitHeight: 16
+                        visible: model.state === "active" && model.trust > 0
+                        source: window.iconBase + (model.trust >= 2 ? "verified.svg" : "lock-omemo2.svg")
+                        color: model.trust >= 2 ? "#2e9d4f" : "#3a7bd5"
                     }
 
                     // Video tile.

@@ -98,6 +98,9 @@ pub mod qobject {
         #[qproperty(bool, conference_camera_on, cxx_name = "conferenceCameraOn")]
         /// Whether we are sharing our screen to the group video call.
         #[qproperty(bool, conference_screen_sharing, cxx_name = "conferenceScreenSharing")]
+        /// The group call's trust level: the LOWEST call trust over all connected legs (0 as soon
+        /// as one participant's DTLS fingerprint isn't OMEMO-authenticated → no icon).
+        #[qproperty(i32, conference_trust, cxx_name = "conferenceTrust")]
         /// A pending group-call invite: the room another member started a call in (empty = none)
         /// and the nick who started it. Drives the "Join group call" prompt.
         #[qproperty(QString, conference_invite_room, cxx_name = "conferenceInviteRoom")]
@@ -814,6 +817,7 @@ pub struct BackendRust {
     conference_muted: bool,
     conference_camera_on: bool,
     conference_screen_sharing: bool,
+    conference_trust: i32,
     conference_invite_room: QString,
     conference_invite_from: QString,
     audio_path: QString,
@@ -867,6 +871,7 @@ impl Default for BackendRust {
             conference_muted: false,
             conference_camera_on: true,
             conference_screen_sharing: false,
+            conference_trust: 0,
             conference_invite_room: QString::default(),
             conference_invite_from: QString::default(),
             audio_path: QString::default(),

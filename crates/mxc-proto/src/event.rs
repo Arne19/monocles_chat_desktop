@@ -79,6 +79,9 @@ pub struct ConfParticipant {
     /// The per-pair Jingle session id (empty if no session yet). Lets the UI match this
     /// participant's decoded video frames (which are tagged by sid) to their tile.
     pub sid: String,
+    /// Call-trust level of this participant's leg: 0 = DTLS fingerprint not OMEMO-authenticated
+    /// (or the identity isn't trusted), 1 = trusted (lock), 2 = manually verified (shield).
+    pub trust: i64,
 }
 
 /// Connection lifecycle, mirrored into the libadwaita header/status.

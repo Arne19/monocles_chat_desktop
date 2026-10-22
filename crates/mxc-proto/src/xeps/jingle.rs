@@ -81,6 +81,10 @@ struct ActiveCall {
     /// come from this same identity — otherwise a renegotiation could quietly drop the call's
     /// verification (cleartext) or switch identity. Mirrors Android's `OmemoVerification`.
     verified_identity: Option<(String, i64)>,
+    /// Call-trust level of this leg's DTLS fingerprint (0 = not OMEMO-authenticated or the
+    /// identity isn't trusted, 1 = trusted, 2 = manually verified). Muji legs report it per
+    /// participant in `ConferenceUpdate` instead of the 1:1 `CallVerified` indicator.
+    trust: i64,
 }
 
 /// At most this many video contents per group-call leg: the peer's camera, plus a second m-line
@@ -856,6 +860,7 @@ fn start_call(
             peer_device: None,
             peer_setup: None,
             verified_identity: None,
+            trust: 0,
         },
     );
 
@@ -1415,9 +1420,15 @@ pub async fn handle_iq(
                     call.peer_used_omemo = verified.is_some();
                     call.verified_identity =
                         verified.as_ref().map(|(fp, device, _)| (fp.clone(), *device));
+                    call.trust = verified.as_ref().map(|(_, _, t)| *t).unwrap_or(0);
                 }
             }
-            if let Some((fingerprint, device_id, trust)) = verified {
+            if let Some(room) = leg_room.as_deref() {
+                // Group call: the per-leg trust goes into the conference's participant list. The
+                // 1:1 indicator (`CallVerified`) is global and Muji legs never reset it, so feeding
+                // it here made it over-claim — and leak into the next, possibly cleartext, 1:1 call.
+                emit_conference(calls, events, cfg.account_id, room).await;
+            } else if let Some((fingerprint, device_id, trust)) = verified {
                 tracing::info!(%sid, trust, device_id, "call OMEMO2-authenticated");
                 let _ = events
                     .send(Event::CallVerified {
@@ -2174,6 +2185,12 @@ async fn emit_conference(calls: &CallRegistry, events: &Sender<Event>, account_i
                         name: m.occupant_jid.rsplit('/').next().unwrap_or(&m.occupant_jid).to_string(),
                         state: m.state.as_str().to_string(),
                         sid: m.sid.clone().unwrap_or_default(),
+                        trust: m
+                            .sid
+                            .as_ref()
+                            .and_then(|sid| c.active.get(sid))
+                            .map(|a| a.trust)
+                            .unwrap_or(0),
                     })
                     .collect::<Vec<_>>(),
             ),

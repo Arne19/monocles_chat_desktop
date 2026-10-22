@@ -1958,6 +1958,14 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                 }
                 // XEP-0272 Muji group-call state → drive the conference panel + participant model.
                 Event::ConferenceUpdate { room, active, video, participants, .. } => {
+                    // Lowest trust over the connected legs: one unauthenticated leg means the
+                    // call as a whole isn't protected, whatever the other legs say.
+                    let trust = participants
+                        .iter()
+                        .filter(|p| p.state == "active")
+                        .map(|p| p.trust)
+                        .min()
+                        .unwrap_or(0) as i32;
                     let entries: Vec<ConfPartEntry> = participants
                         .into_iter()
                         .map(|p: ConfParticipant| ConfPartEntry {
@@ -1966,6 +1974,7 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                             jid: p.jid,
                             state: p.state,
                             sid: p.sid,
+                            trust: p.trust,
                         })
                         .collect();
                     // Avatars are fetched lazily by the panel delegates (fetchMucAvatar), like
@@ -1978,6 +1987,7 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                         backend.as_mut().set_conference_active(active);
                         backend.as_mut().set_conference_room(QString::from(&room));
                         backend.as_mut().set_conference_video(video);
+                        backend.as_mut().set_conference_trust(if active { trust } else { 0 });
                         if !active {
                             backend.as_mut().set_conference_muted(false);
                             backend.as_mut().set_conference_camera_on(true);

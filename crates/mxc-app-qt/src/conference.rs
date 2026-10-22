@@ -12,6 +12,7 @@ const ROLE_JID: i32 = 257;
 const ROLE_STATE: i32 = 258;
 const ROLE_AVATAR: i32 = 259;
 const ROLE_SID: i32 = 260;
+const ROLE_TRUST: i32 = 261;
 
 /// One remote participant of the active group call.
 #[derive(Clone, Default)]
@@ -25,6 +26,9 @@ pub struct ConfPartEntry {
     pub avatar_path: String,
     /// Per-pair Jingle session id — matches this participant's video frames (tagged by sid).
     pub sid: String,
+    /// Call trust of this participant's leg: 0 = not OMEMO-authenticated/untrusted, 1 = lock,
+    /// 2 = manually verified.
+    pub trust: i64,
 }
 
 #[cxx_qt::bridge]
@@ -107,6 +111,7 @@ impl qobject::ConferenceModel {
             ROLE_STATE => QVariant::from(&QString::from(item.state.as_str())),
             ROLE_AVATAR => QVariant::from(&QString::from(item.avatar_path.as_str())),
             ROLE_SID => QVariant::from(&QString::from(item.sid.as_str())),
+            ROLE_TRUST => QVariant::from(&(item.trust as i32)),
             _ => QVariant::default(),
         }
     }
@@ -122,6 +127,7 @@ impl qobject::ConferenceModel {
         roles.insert(ROLE_STATE, QByteArray::from("state"));
         roles.insert(ROLE_AVATAR, QByteArray::from("avatarPath"));
         roles.insert(ROLE_SID, QByteArray::from("sid"));
+        roles.insert(ROLE_TRUST, QByteArray::from("trust"));
         roles
     }
 }
