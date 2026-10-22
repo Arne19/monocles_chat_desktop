@@ -1895,6 +1895,23 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                         CallState::Ended { .. } => "ended",
                     };
                     let active = !matches!(state, CallState::Ended { .. });
+                    // Another call than the one on screen ENDED (e.g. one refused as busy, or an
+                    // unrelated session): don't close the call window — just refresh the Calls
+                    // list. A new call's other states still take the window over (the core
+                    // refuses a second call while one runs, so that only happens if the one we
+                    // show is stale — and it must never hide the new call).
+                    let other_call_ended = !active
+                        && CURRENT_CALL
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|current| current.sid != sid);
+                    if other_call_ended {
+                        let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+                            backend.as_mut().calls_changed();
+                        });
+                        continue;
+                    }
                     *CURRENT_CALL.lock().unwrap() = active.then(|| CallCtx {
                         sid: sid.clone(),
                         peer: peer.clone(),
@@ -1979,6 +1996,17 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                         .collect();
                     // Avatars are fetched lazily by the panel delegates (fetchMucAvatar), like
                     // the occupant list — no event-time fetch storm here.
+                    // A call ending in ANOTHER room (e.g. one we only observed, whose room we
+                    // left) must not close the window of the call we're in.
+                    let other_room_ended = !active
+                        && CURRENT_CONFERENCE
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|current| current.room != room);
+                    if other_room_ended {
+                        continue;
+                    }
                     *CURRENT_CONFERENCE.lock().unwrap() = active.then(|| ConferenceView {
                         room: room.clone(),
                         participants: entries,
@@ -1993,6 +2021,8 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                             backend.as_mut().set_conference_camera_on(true);
                             backend.as_mut().set_conference_screen_sharing(false);
                             backend.as_mut().set_local_frame(QString::default());
+                            // The core logged the group call → refresh the Calls list.
+                            backend.as_mut().calls_changed();
                         }
                         backend.as_mut().conference_changed();
                     });

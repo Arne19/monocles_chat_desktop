@@ -94,6 +94,8 @@ const MAX_MUJI_VIDEO_CONTENTS: usize = 2;
 
 /// How long a Muji leg waits before offering our camera again after the peer refused it.
 const MUJI_VIDEO_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long an incoming 1:1 call rings before it is treated as missed.
+const INCOMING_RING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 // ============================ Muji conference (group calls) ================
 
@@ -303,7 +305,9 @@ fn log_conference_end(store: &mxc_store::Store, account_id: i64, conf: &Conferen
     let store = store.clone();
     let (room, dir, video, answered, ts) = (
         conf.stored_room.clone(),
-        if conf.outgoing { "out" } else { "in" }.to_string(),
+        // "in" only if we joined a running call AND a leg connected: the Calls list shows
+        // in + unanswered as a missed call, which a group call never is (retried/failed legs).
+        if !conf.outgoing && conf.answered { "in" } else { "out" }.to_string(),
         conf.video,
         conf.answered,
         conf.started_at.clone(),
@@ -311,6 +315,22 @@ fn log_conference_end(store: &mxc_store::Store, account_id: i64, conf: &Conferen
     tokio::task::spawn_local(async move {
         let _ = store.insert_call_log(account_id, &room, &dir, video, answered, &ts).await;
     });
+}
+
+/// Whether we're already in a call other than `sid`: a group call (also while waiting alone, with
+/// no leg yet) or a ringing / placed / live 1:1 call. Only one call at a time (monocles Muji
+/// profile, "Concurrent Calls"). Group-call legs are not checked through this: they belong to the
+/// conference we're in.
+fn is_busy_except(c: &Calls, sid: &str) -> bool {
+    !c.conferences.is_empty()
+        || c.incoming.keys().any(|s| s != sid)
+        || c.proposed.keys().any(|s| s != sid)
+        || c.active.keys().any(|s| s != sid)
+}
+
+/// Whether we're in any call (for refusing to place a new 1:1 call).
+pub fn is_busy(calls: &CallRegistry) -> bool {
+    is_busy_except(&calls.borrow(), "")
 }
 
 // ============================ JMI (ringing) ================================
@@ -708,7 +728,10 @@ async fn fail_verified_leg(
     log_call_end(calls, sid);
     set_member_state(calls, sid, MemberCallState::Ended);
     match room {
-        Some(r) => emit_conference(calls, events, account_id, r).await,
+        Some(r) => {
+            emit_conference(calls, events, account_id, r).await;
+            end_conference_if_empty(w, calls, events, account_id, r).await;
+        }
         None => {
             emit(events, account_id, sid, bare(peer_full), false, CallState::Ended {
                 reason: "Call verification failed".into(),
@@ -1121,6 +1144,7 @@ fn start_call(
                         if let Some(r) = room.as_deref() {
                             let conf_video = calls.borrow().conferences.get(r).map(|c| c.video).unwrap_or(video);
                             initiate_next_pending(&w, &calls, &events, &cfg, r, conf_video).await;
+                            end_conference_if_empty(&w, &calls, &events, account_id, r).await;
                         }
                     } else {
                         emit(&events, account_id, &sid, &peer_bare, video, CallState::Ended { reason }).await;
@@ -1211,6 +1235,26 @@ pub async fn handle_message(
 
     match action.as_str() {
         "propose" => {
+            // Only one call at a time: while in a group call (also waiting alone) or another 1:1
+            // call, don't ring — record a missed call. No `reject`: another of our devices may
+            // still answer it (Android only rejects when it has no other device).
+            let busy = is_busy_except(&calls.borrow(), &sid);
+            if busy {
+                tracing::info!(%sid, %from, "busy — not ringing for the incoming call");
+                calls.borrow_mut().meta.insert(sid.clone(), CallMeta {
+                    peer: peer_bare.clone(),
+                    outgoing: false,
+                    video,
+                    answered: false,
+                    ts: now(),
+                });
+                log_call_end(calls, &sid);
+                emit(events, cfg.account_id, &sid, &peer_bare, video, CallState::Ended {
+                    reason: "Missed: already in a call".into(),
+                })
+                .await;
+                return true;
+            }
             calls.borrow_mut().incoming.insert(sid.clone(), (from.clone(), video));
             calls.borrow_mut().meta.insert(sid.clone(), CallMeta {
                 peer: peer_bare.clone(),
@@ -1220,6 +1264,25 @@ pub async fn handle_message(
                 ts: now(),
             });
             emit(events, cfg.account_id, &sid, &peer_bare, video, CallState::Incoming).await;
+            // Stop ringing after a while if nobody answered and the caller's `retract` never
+            // came: a lingering ringing call would otherwise count as "in a call" (busy) forever.
+            {
+                let calls = calls.clone();
+                let events = events.clone();
+                let (account_id, sid, peer_bare) = (cfg.account_id, sid.clone(), peer_bare.clone());
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(INCOMING_RING_TIMEOUT).await;
+                    let still_ringing = calls.borrow_mut().incoming.remove(&sid).is_some();
+                    if still_ringing {
+                        tracing::info!(%sid, "incoming call not answered in time — missed");
+                        log_call_end(&calls, &sid);
+                        emit(&events, account_id, &sid, &peer_bare, video, CallState::Ended {
+                            reason: "Missed call".into(),
+                        })
+                        .await;
+                    }
+                });
+            }
             // Tell the caller we're ringing (XEP-0353 `ringing`, to its full JID). Android shows
             // "Discovering devices" until a callee device rings and, for contacts it shares
             // presence with, gives up after ~6 s without one. Like Android, only answer callers
@@ -1264,12 +1327,15 @@ pub async fn handle_message(
         }
         "reject" => {
             terminate_local(calls, &sid);
+            // our outgoing call was declined: it no longer counts as a call in progress (busy)
+            calls.borrow_mut().proposed.remove(&sid);
             log_call_end(calls, &sid);
             emit(events, cfg.account_id, &sid, &peer_bare, video, CallState::Ended { reason: "Call declined".into() }).await;
         }
         "retract" | "finish" => {
             terminate_local(calls, &sid);
             calls.borrow_mut().incoming.remove(&sid);
+            calls.borrow_mut().proposed.remove(&sid);
             log_call_end(calls, &sid);
             emit(events, cfg.account_id, &sid, &peer_bare, video, CallState::Ended { reason: "Caller cancelled".into() }).await;
         }
@@ -1606,6 +1672,7 @@ pub async fn handle_iq(
             if let Some(room) = muji_room {
                 set_member_state(calls, &sid, MemberCallState::Ended);
                 emit_conference(calls, events, cfg.account_id, &room).await;
+                end_conference_if_empty(w, calls, events, cfg.account_id, &room).await;
             } else {
                 emit(events, cfg.account_id, &sid, bare(&from), false, CallState::Ended {
                     reason: "Call ended".into(),
@@ -2421,13 +2488,17 @@ async fn remesh(w: &Writer, calls: &CallRegistry, events: &Sender<Event>, cfg: &
             Some(conf) => conf
                 .members
                 .iter()
-                .filter(|(_, m)| {
+                .filter(|(occ, m)| {
                     m.state == MemberCallState::Ended
                         // a leg that never came up; a participant we're only WAITING for (no
                         // session yet — the peer initiates) is kept, dropping it just churned the UI
                         || (m.state == MemberCallState::Connecting
                             && m.sid.is_some()
                             && m.connecting_since.elapsed() > STUCK_AFTER)
+                        // ...unless they no longer advertise `<muji>` at all (e.g. they left while
+                        // we were reconnecting, which forgets the room's presences): a ghost
+                        || (m.sid.is_none()
+                            && !c.muji_seen.get(room).is_some_and(|seen| seen.contains_key(*occ)))
                 })
                 .map(|(occ, m)| (occ.clone(), m.sid.clone(), m.real_jid.clone()))
                 .collect(),
@@ -2478,6 +2549,8 @@ async fn remesh(w: &Writer, calls: &CallRegistry, events: &Sender<Event>, cfg: &
     }
     // 3. Self-heal: every connected leg carries our camera if we send video.
     ensure_video_on_legs(calls, room);
+    // 4. Nobody left (missed by the event paths, e.g. after a reconnect): end the call.
+    end_conference_if_empty(w, calls, events, cfg.account_id, room).await;
 }
 
 /// [`ensure_leg_video`] for every leg of `room`'s conference.
@@ -2562,6 +2635,11 @@ pub async fn upgrade_group_call_to_video(
             let store = calls.borrow().store.clone();
             crate::xeps::omemo::own_device_id(&store, cfg).await.ok()
         };
+        // We may have left the call while looking up the device id: don't advertise `<muji>`
+        // for a call we're no longer in.
+        if !calls.borrow().conferences.get(room).is_some_and(|c| c.video) {
+            return;
+        }
         let ready = muji::muji_payload(true, true, device);
         muji::set_active_payload(cfg.account_id, room, Some(ready.clone()));
         let _ = muji::send_muji_presence(w, room, &nick, Some(muji::muji_payload(false, true, device)));
@@ -2668,6 +2746,18 @@ pub async fn place_group_call(
         emit_conference(calls, events, cfg.account_id, room).await;
         return;
     }
+    // Only one call at a time: not during a 1:1 call or another room's group call.
+    let busy = {
+        let c = calls.borrow();
+        c.conferences.keys().any(|r| r != room)
+            || !c.incoming.is_empty()
+            || !c.proposed.is_empty()
+            || c.active.values().any(|a| a.room.is_none())
+    };
+    if busy {
+        tracing::warn!(%room, "place_group_call: refusing — already in another call");
+        return;
+    }
     // The group call is PQ OMEMO2-verified only when placed with the room's encryption set to
     // OMEMO2 (same rule as Android's conversation lock); otherwise legs verify opportunistically.
     let verified = store
@@ -2676,6 +2766,12 @@ pub async fn place_group_call(
         .ok()
         .flatten()
         .is_some_and(|e| e == "omemo2");
+    // A second "join" may have created the conference while we awaited the lookup above.
+    if calls.borrow().conferences.contains_key(room) {
+        emit_conference(calls, events, cfg.account_id, room).await;
+        return;
+    }
+    let started_at = now();
     let had_invite = {
         let mut c = calls.borrow_mut();
         // We started the call unless someone was already in it.
@@ -2691,7 +2787,7 @@ pub async fn place_group_call(
                 video,
                 verified,
                 stored_room: stored_room.to_string(),
-                started_at: now(),
+                started_at: started_at.clone(),
                 outgoing,
                 answered: false,
                 announced: false,
@@ -2716,6 +2812,12 @@ pub async fn place_group_call(
         let store = calls.borrow().store.clone();
         crate::xeps::omemo::own_device_id(&store, cfg).await.ok()
     };
+    // We may have left again while looking up the device id: then don't advertise `<muji>` (it
+    // would stay stored and be re-sent on every re-join, for a call we're not in).
+    if !calls.borrow().conferences.get(room).is_some_and(|c| c.started_at == started_at) {
+        tracing::info!(%room, "place_group_call: left while joining — not announcing");
+        return;
+    }
     // XEP-0272: announce `<preparing/>` then the ready content. Our codec set is fixed, so we
     // can advertise readiness immediately.
     // Every later presence to the room (e.g. the re-join after a reconnect) keeps carrying it.
@@ -2766,12 +2868,55 @@ pub async fn leave_group_call(
     cfg: &AccountConfig,
     room: &str,
 ) {
+    leave_conference(w, calls, events, cfg.account_id, room).await;
+}
+
+/// End the call in `room` if we're alone in it: no live leg and nobody else advertising `<muji>`
+/// — but only once a leg had connected (a call nobody has joined yet keeps waiting). Run both when
+/// a leg ends and when a participant's `<muji>` goes away: the peer's `session-terminate` (direct)
+/// and presence (via the MUC) arrive in either order, and checking only one of them left us alone
+/// in an empty call, still advertising `<muji>`.
+async fn end_conference_if_empty(
+    w: &Writer,
+    calls: &CallRegistry,
+    events: &Sender<Event>,
+    account_id: i64,
+    room: &str,
+) {
+    let room = &room_key(room);
+    let empty = {
+        let c = calls.borrow();
+        c.conferences.get(room).is_some_and(|conf| {
+            conf.answered
+                && conf.members.values().all(|m| m.state == MemberCallState::Ended)
+                && c.muji_seen.get(room).map_or(true, |seen| seen.is_empty())
+        })
+    };
+    if empty {
+        tracing::info!(%room, "muji: everyone else left — ending the call");
+        leave_conference(w, calls, events, account_id, room).await;
+    }
+}
+
+async fn leave_conference(
+    w: &Writer,
+    calls: &CallRegistry,
+    events: &Sender<Event>,
+    account_id: i64,
+    room: &str,
+) {
     let room = &room_key(room);
     let (nick, sessions) = {
         let mut c = calls.borrow_mut();
         match c.conferences.remove(room) {
             Some(conf) => {
                 log_conference_end(&c.store, c.account_id, &conf);
+                // Others stay in the call: treat its invite as already shown, so their next
+                // presence (status, avatar, …) doesn't offer us the call we just left. Cleared
+                // when the last of them drops `<muji>` (see `observe_muji_presence`).
+                if c.muji_seen.get(room).is_some_and(|seen| !seen.is_empty()) {
+                    c.invited.insert(room.to_string());
+                }
                 let sessions: Vec<(String, String)> = conf
                     .members
                     .values()
@@ -2782,7 +2927,7 @@ pub async fn leave_group_call(
             None => (None, Vec::new()),
         }
     };
-    muji::set_active_payload(cfg.account_id, room, None);
+    muji::set_active_payload(account_id, room, None);
     if let Some(nick) = nick {
         let _ = muji::send_muji_presence(w, room, &nick, None);
     }
@@ -2801,7 +2946,7 @@ pub async fn leave_group_call(
     // are removed when a peer actually drops `<muji>`), so preserving it is what lets us re-mesh
     // with the still-running call when we rejoin via the call button. Clearing it made rejoin
     // initiate to nobody (only the legs peers started came up) → a half-broken call.
-    emit_conference(calls, events, cfg.account_id, room).await;
+    emit_conference(calls, events, account_id, room).await;
 }
 
 /// Mute / unmute our microphone across every per-pair session of a group call.
@@ -3038,7 +3183,19 @@ pub async fn observe_muji_presence(
             if mode.as_deref() == Some("none") {
                 return;
             }
-            let nick = occupant.rsplit('/').next().unwrap_or(&occupant).to_string();
+            // Name someone who is actually in the call (prefer a READY participant), not whoever
+            // sent the presence that happened to trigger this.
+            let participant = {
+                let c = calls.borrow();
+                c.muji_seen.get(&room).and_then(|seen| {
+                    seen.iter()
+                        .find(|(_, p)| p.state == MujiState::Ready)
+                        .or_else(|| seen.iter().next())
+                        .map(|(occ, _)| occ.clone())
+                })
+            }
+            .unwrap_or_else(|| occupant.clone());
+            let nick = participant.rsplit('/').next().unwrap_or(&participant).to_string();
             tracing::info!(%room, %nick, "muji: group-call invite");
             let _ = events
                 .send(Event::ConferenceInvite { account_id: cfg.account_id, room: room.clone(), from: nick })
@@ -3070,6 +3227,7 @@ pub async fn observe_muji_presence(
         _ => {
             remove_member(w, calls, &room, &occupant);
             emit_conference(calls, events, cfg.account_id, &room).await;
+            end_conference_if_empty(w, calls, events, cfg.account_id, &room).await;
         }
     }
 }

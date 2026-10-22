@@ -1499,8 +1499,9 @@ ApplicationWindow {
                                         }
                                     }
                                     ToolButton {
+                                        // one call at a time: no call-back during any call
                                         enabled: backend.connected && !backend.callActive
-                                                 && !(model.group && backend.conferenceActive)
+                                                 && !backend.conferenceActive
                                         ToolTip.text: model.group ? qsTr("Start group call (audio)") : qsTr("Call back (audio)")
                                         ToolTip.visible: hovered
                                         onClicked: model.group ? backend.placeGroupCall(model.peer, false)
@@ -1511,8 +1512,9 @@ ApplicationWindow {
                                         }
                                     }
                                     ToolButton {
+                                        // one call at a time: no call-back during any call
                                         enabled: backend.connected && !backend.callActive
-                                                 && !(model.group && backend.conferenceActive)
+                                                 && !backend.conferenceActive
                                         ToolTip.text: model.group ? qsTr("Start group call (video)") : qsTr("Call back (video)")
                                         ToolTip.visible: hovered
                                         onClicked: model.group ? backend.placeGroupCall(model.peer, true)
@@ -1963,7 +1965,8 @@ ApplicationWindow {
                                     implicitWidth: 32
                                     implicitHeight: 32
                                     visible: !window.currentPeerIsMuc
-                                    enabled: backend.connected && !backend.callActive
+                                    // one call at a time: not during a group call either
+                                    enabled: backend.connected && !backend.callActive && !backend.conferenceActive
                                     opacity: enabled ? 1.0 : 0.4
                                     ToolTip.text: qsTr("Audio call")
                                     ToolTip.visible: hovered
@@ -1979,7 +1982,8 @@ ApplicationWindow {
                                     implicitWidth: 32
                                     implicitHeight: 32
                                     visible: !window.currentPeerIsMuc
-                                    enabled: backend.connected && !backend.callActive
+                                    // one call at a time: not during a group call either
+                                    enabled: backend.connected && !backend.callActive && !backend.conferenceActive
                                     opacity: enabled ? 1.0 : 0.4
                                     ToolTip.text: qsTr("Video call")
                                     ToolTip.visible: hovered
@@ -4653,7 +4657,7 @@ ApplicationWindow {
                 var room = backend.conferenceInviteRoom.split('@')[0]
                 var who = backend.conferenceInviteFrom
                 return who.length > 0
-                    ? qsTr("%1 started a group call in %2.").arg(who).arg(room)
+                    ? qsTr("%1 is in a group call in %2.").arg(who).arg(room)
                     : qsTr("A group call is in progress in %1.").arg(room)
             }
             wrapMode: Text.Wrap
@@ -4667,12 +4671,15 @@ ApplicationWindow {
             Button {
                 text: qsTr("Join (video)")
                 flat: true
+                // one call at a time: not during a 1:1 call or another group call
+                enabled: !backend.callActive && !backend.conferenceActive
                 onClicked: { backend.joinGroupCall(true); groupCallInviteDialog.close() }
             }
             Button {
                 text: qsTr("Join")
                 flat: true
                 highlighted: true
+                enabled: !backend.callActive && !backend.conferenceActive
                 onClicked: { backend.joinGroupCall(false); groupCallInviteDialog.close() }
             }
         }

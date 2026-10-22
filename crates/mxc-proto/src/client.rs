@@ -896,6 +896,24 @@ impl CoreActor {
             }
             Command::PlaceCall { account_id, to, video } => {
                 let sid = xeps::roster::new_id("call");
+                // Only one call at a time (also not during a group call, even while waiting
+                // alone in it) — the UI disables the call buttons, this is the backstop.
+                if xeps::jingle::is_busy(calls) {
+                    tracing::info!(%to, "PlaceCall: refused — already in a call");
+                    let _ = self
+                        .events
+                        .send(Event::CallUpdate {
+                            account_id,
+                            sid,
+                            peer: to,
+                            video,
+                            state: crate::event::CallState::Ended {
+                                reason: "Only one call at a time".into(),
+                            },
+                        })
+                        .await;
+                    return Ok(());
+                }
                 tracing::info!(%to, video, %sid, "PlaceCall: sending JMI propose");
                 xeps::jingle::propose(w, calls, &to, &sid, video)?;
                 let _ = self

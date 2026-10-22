@@ -1365,6 +1365,16 @@ impl qobject::Backend {
         self.as_mut().set_call_muted(false);
         self.as_mut().set_remote_frame(QString::default());
         self.as_mut().set_local_frame(QString::default());
+        // Reset everything the remote-`Ended` path resets: the trust state in particular must not
+        // carry over — "Verify" on the next call would otherwise mark the PREVIOUS call's device
+        // as verified for the new peer.
+        self.as_mut().set_call_screen_sharing(false);
+        self.as_mut().set_call_video_request(false);
+        self.as_mut().set_call_trust(0);
+        self.as_mut().set_call_verified_fp(QString::default());
+        self.as_mut().set_call_verified_device(0);
+        // The core logged the call → refresh the Calls list.
+        self.as_mut().calls_changed();
     }
 
     pub fn set_call_mute(self: Pin<&mut Self>, muted: bool) {
