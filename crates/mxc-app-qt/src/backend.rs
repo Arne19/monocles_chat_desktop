@@ -470,6 +470,11 @@ pub mod qobject {
         #[cxx_name = "mucCanModerate"]
         fn muc_can_moderate(self: &Backend, room: &QString) -> bool;
 
+        /// Whether our messages in `room` may be edited (the room stamps occupant ids).
+        #[qinvokable]
+        #[cxx_name = "mucCanCorrect"]
+        fn muc_can_correct(self: &Backend, room: &QString) -> bool;
+
         /// Whether we may kick occupant `nick` (moderator; they're not an admin/owner).
         #[qinvokable]
         #[cxx_name = "mucCanKick"]
@@ -1156,6 +1161,11 @@ impl qobject::Backend {
     /// QML entry point — whether we may moderate messages in a room.
     pub fn muc_can_moderate(&self, room: &QString) -> bool {
         crate::muc_admin::can_moderate(&room.to_string())
+    }
+
+    /// QML entry point — whether our messages in a room may be edited.
+    pub fn muc_can_correct(&self, room: &QString) -> bool {
+        crate::muc_admin::can_correct(&room.to_string())
     }
 
     /// QML entry point — whether we may kick occupant `nick` from `room`.

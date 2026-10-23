@@ -92,7 +92,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
 # reqwest 0.13 renamed the TLS features: the old `rustls-tls` is now `rustls` (rustls over
-# aws-lc-rs, matching our crypto-provider pin) plus `webpki-roots` for the Mozilla trust bundle.
+# aws-lc-rs, matching our crypto-provider pin). Note: reqwest 0.13 verifies with the platform
+# verifier by default and ignores `webpki-roots`; our HTTP client passes its own filtered roots
+# (mxc-proto src/tls_roots.rs).
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "stream"] }
 
 [profile.dev]

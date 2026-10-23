@@ -32,7 +32,14 @@ pub const MANUAL_DOWNLOAD_LIMIT: u64 = 256 * 1024 * 1024;
 fn http_client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| {
-        reqwest::Client::builder()
+        let builder = reqwest::Client::builder();
+        // The system's roots minus the refused ones (tls_roots). If they can't be read, keep
+        // reqwest's default platform verifier as before.
+        let builder = match crate::tls_roots::http_roots() {
+            Some(roots) => builder.tls_certs_only(roots),
+            None => builder,
+        };
+        builder
             // A sender-chosen server must not be able to hang a download forever.
             .connect_timeout(std::time::Duration::from_secs(20))
             .read_timeout(std::time::Duration::from_secs(60))
@@ -206,6 +213,15 @@ async fn request_slot(
     let get = slot.get_child("get", NS_UPLOAD).ok_or_else(|| anyhow::anyhow!("no <get>"))?;
     let put_url = put.attr("url").ok_or_else(|| anyhow::anyhow!("no put url"))?.to_string();
     let get_url = get.attr("url").ok_or_else(|| anyhow::anyhow!("no get url"))?.to_string();
+    // Both URLs must be https: the file (or its ciphertext) and the link we hand out must not go
+    // over plain HTTP. No local-address check here: the slot comes from our own server's upload
+    // service, and self-hosted servers on a LAN legitimately hand out LAN addresses.
+    for u in [&put_url, &get_url] {
+        let parsed = url::Url::parse(u).map_err(|e| anyhow::anyhow!("bad upload slot url: {e}"))?;
+        if parsed.scheme() != "https" {
+            anyhow::bail!("refusing non-https upload slot url");
+        }
+    }
     let headers = allowed_headers(put);
     Ok(Slot { put_url, get_url, headers })
 }

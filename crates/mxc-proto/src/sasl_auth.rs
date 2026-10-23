@@ -340,6 +340,10 @@ pub async fn login<C: ServerConnector>(
         .await
         .map_err(tokio_xmpp::Error::Io)?;
 
+    // PLAIN has no challenges at all; SCRAM has the server-first-message and, with some servers,
+    // the server-final one. Anything beyond that is not a login we take part in.
+    const MAX_SCRAM_CHALLENGES: u32 = 3;
+    let mut challenges = 0u32;
     let mut first_challenge = true;
     loop {
         let element = match stream.next().await {
@@ -356,6 +360,13 @@ pub async fn login<C: ServerConnector>(
         };
         match element {
             XmppStreamElement::Sasl(Nonza::Challenge(challenge)) => {
+                challenges += 1;
+                if !plan.mech.is_scram() {
+                    return Err(LoginError::Failed("unexpected SASL challenge for PLAIN".into()));
+                }
+                if challenges > MAX_SCRAM_CHALLENGES {
+                    return Err(LoginError::Failed("too many SASL challenges".into()));
+                }
                 if first_challenge && plan.mech.is_scram() {
                     check_server_first(&challenge.data, plan.mech, &ssdp_input, plan.require_ssdp)?;
                 }
@@ -688,6 +699,50 @@ mod tests {
         let (result, seen) = run(&["SCRAM-SHA-256"], Some("AAAA".into()), -1, false).await;
         assert!(result.unwrap_err().contains("downgrade"));
         assert!(seen.client_final.is_none());
+    }
+
+    /// A server answering PLAIN with a challenge (PLAIN has none) gets no response: the login
+    /// is aborted instead of looping on whatever the server sends.
+    #[tokio::test]
+    async fn e2e_challenge_for_plain_aborts() {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let connector = FakeConnector(Arc::new(Mutex::new(Some(BufStream::new(client_io)))));
+        let jid: Jid = "alice@example.org".parse().unwrap();
+        let client = async move {
+            login(connector, jid, "password", Timeouts::default(), -1)
+                .await
+                .map(|(_, _, mech)| mech)
+                .map_err(|e| e.to_string())
+        };
+        let server = async move {
+            let accepted = accept_stream(BufStream::new(server_io), xmpp_parsers::ns::JABBER_CLIENT, Timeouts::default())
+                .await
+                .unwrap();
+            let pending = accepted
+                .send_header(StreamHeader { to: None, from: Some(Cow::Borrowed("example.org")), id: Some(Cow::Borrowed("s1")) })
+                .await
+                .unwrap();
+            let features = StreamFeatures { sasl_mechanisms: mechs(&["PLAIN"]), ..Default::default() };
+            let mut stream = pending.send_features::<XmppStreamElement>(&features).await.unwrap();
+            let mut responses = 0;
+            while let Some(Ok(element)) = stream.next().await {
+                match element {
+                    XmppStreamElement::Sasl(Nonza::Auth(_)) => {
+                        let challenge = xmpp_parsers::sasl::Challenge { data: b"more?".to_vec() };
+                        stream.send(&XmppStreamElement::Sasl(Nonza::Challenge(challenge))).await.unwrap();
+                    }
+                    XmppStreamElement::Sasl(Nonza::Response(_)) => responses += 1,
+                    _ => {}
+                }
+            }
+            responses
+        };
+        let (result, responses) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async { tokio::join!(client, server) })
+                .await
+                .expect("login finished");
+        assert!(result.unwrap_err().contains("unexpected SASL challenge"));
+        assert_eq!(responses, 0);
     }
 
     /// After SCRAM was used, a server offering only PLAIN never sees the password.

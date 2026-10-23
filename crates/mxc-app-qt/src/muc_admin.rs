@@ -21,6 +21,8 @@ pub struct Occupant {
 #[derive(Default)]
 struct Room {
     moderation: bool,
+    /// The room stamps XEP-0421 occupant ids (needed for corrections, see [`can_correct`]).
+    occupant_id: bool,
     self_nick: Option<String>,
     me: Occupant,
     occupants: HashMap<String, Occupant>,
@@ -61,6 +63,17 @@ pub fn reset_room(room: &str) {
 
 pub fn set_moderation(room: &str, supported: bool) {
     ROOMS.lock().unwrap().entry(key(room)).or_default().moderation = supported;
+}
+
+pub fn set_occupant_id(room: &str, supported: bool) {
+    ROOMS.lock().unwrap().entry(key(room)).or_default().occupant_id = supported;
+}
+
+/// Whether our messages in `room` may be corrected (XEP-0308): only where the room stamps
+/// occupant ids, else other clients show the correction as a new message (Conversations
+/// 9b77fa682). Unknown rooms (disco not done yet) count as no.
+pub fn can_correct(room: &str) -> bool {
+    ROOMS.lock().unwrap().get(&key(room)).is_some_and(|r| r.occupant_id)
 }
 
 /// Record an occupant's presence. `nick_change` marks an unavailable presence that only

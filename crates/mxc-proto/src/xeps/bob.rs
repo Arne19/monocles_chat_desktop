@@ -78,7 +78,9 @@ fn cid_hex(cid: &str) -> Option<String> {
         return None;
     }
     let hex = rest.split('@').next()?;
-    if hex.is_empty() {
+    // Exactly a SHA-256 in hex: the value becomes a file name under the cache dir, so anything
+    // else (e.g. "../../x" from a sender-supplied cid) must never get that far.
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     Some(hex.to_ascii_lowercase())
@@ -165,10 +167,20 @@ pub fn is_cached(cid: &str) -> bool {
 }
 
 /// Persist sticker `bytes` into the (encrypted) cache under `cid` (no-op if already present).
+///
+/// The cid is the sender's claim; the bytes must actually hash to it. Otherwise a sender could
+/// store arbitrary bytes under another sticker's cid, and since the first file written wins,
+/// replace that sticker everywhere for good.
 pub fn save(cid: &str, bytes: &[u8]) -> std::io::Result<()> {
     let Some(path) = cache_path(cid) else {
         return Ok(());
     };
+    if cid_hex(cid).as_deref() != cid_hex(&cid_ssp(bytes)).as_deref() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "BoB data does not match its cid",
+        ));
+    }
     if path.exists() {
         return Ok(());
     }
@@ -218,6 +230,20 @@ mod tests {
         let (cid, decoded) = parse_data(data).expect("parse data");
         assert_eq!(cid, ssp);
         assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn cid_must_be_a_sha256_hex() {
+        assert!(cache_path("cid:sha-256+../../etc/passwd@bob.xmpp.org").is_none());
+        assert!(cache_path("cid:sha-256+abcdef@bob.xmpp.org").is_none());
+        assert!(cache_path(&format!("cid:sha-256+{}@bob.xmpp.org", "A".repeat(64))).is_some());
+    }
+
+    #[test]
+    fn save_refuses_bytes_that_do_not_match_the_cid() {
+        let ssp = cid_ssp(b"the real sticker");
+        let err = save(&ssp, b"something else").expect_err("mismatch must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -80,8 +80,35 @@ async fn handle_iq(
         }
     }
 
+    // XEP-0199: answer pings, so a server (or peer) checking whether we are still there gets
+    // a proper result instead of the error below.
+    if iq_type == "get" && iq.get_child("ping", "urn:xmpp:ping").is_some() {
+        w.send(result_iq(iq))?;
+        return Ok(());
+    }
+
+    // RFC 6120 §8.4: a get/set nobody handles gets <service-unavailable/>, never silence.
+    // Results and errors are never answered (that could loop between two entities).
+    if iq_type == "get" || iq_type == "set" {
+        tracing::trace!(iq_type, "unhandled iq: service-unavailable");
+        w.send(error_iq(iq, "cancel", "service-unavailable"))?;
+        return Ok(());
+    }
+
     tracing::trace!(iq_type, "unhandled iq");
     Ok(())
+}
+
+/// An empty `<iq type='result'>` answering `req`.
+fn result_iq(req: &Element) -> Element {
+    let mut b = Element::builder("iq", "jabber:client").attr(crate::ncname("type"), "result");
+    if let Some(id) = req.attr("id") {
+        b = b.attr(crate::ncname("id"), id);
+    }
+    if let Some(from) = req.attr("from") {
+        b = b.attr(crate::ncname("to"), from);
+    }
+    b.build()
 }
 
 /// An `<iq type='error'>` answering `req` with a stanza error condition.

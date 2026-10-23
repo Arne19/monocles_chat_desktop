@@ -525,7 +525,10 @@ impl CoreActor {
                 .await
             }
             Command::Moderate { room, stanza_id, reason, .. } => {
-                xeps::moderation::moderate(w, cfg.account_id, &room, &stanza_id, reason.as_deref()).await
+                xeps::moderation::moderate_with_versions(
+                    w, &self.store, cfg.account_id, &room, &stanza_id, reason.as_deref(),
+                )
+                .await
             }
             Command::ModerateRecent { room, nick, occupant_id, reason, .. } => {
                 xeps::moderation::moderate_recent(

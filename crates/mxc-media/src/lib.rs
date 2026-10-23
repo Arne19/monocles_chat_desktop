@@ -960,12 +960,38 @@ fn pct_encode(s: &str) -> String {
     out
 }
 
-/// Bracket an IPv6 literal host for use in a URI authority.
-fn wrap_host(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
+/// The host as it goes into a `stun://` / `turn://` URI authority: an IP literal (IPv6
+/// bracketed) or a plain LDH host name. `None` for anything else. The host comes from the
+/// server's XEP-0215 reply and is pasted into a URI webrtcbin parses, so characters like `@`,
+/// `?`, `/` or a half-bracketed `[::1` must never get through.
+fn uri_host(host: &str) -> Option<String> {
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => return Some(format!("[{v6}]")),
+        Ok(std::net::IpAddr::V4(v4)) => return Some(v4.to_string()),
+        Err(_) => {}
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let valid = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    valid.then(|| name.to_string())
+}
+
+/// The `transport` URI parameter: only `udp` or `tcp` (lowercased), empty meaning `udp`.
+fn uri_transport(transport: &str) -> Option<&'static str> {
+    if transport.is_empty() || transport.eq_ignore_ascii_case("udp") {
+        Some("udp")
+    } else if transport.eq_ignore_ascii_case("tcp") {
+        Some("tcp")
     } else {
-        host.to_string()
+        None
     }
 }
 
@@ -976,8 +1002,8 @@ fn configure_ice(webrtc: &gst::Element, muji: bool) {
     // webrtcbin takes a single stun-server; prefer a discovered one, else public Google STUN.
     let stun = servers
         .iter()
-        .find(|s| s.kind == "stun" || s.kind == "stuns")
-        .map(|s| format!("stun://{}:{}", wrap_host(&s.host), s.port));
+        .filter(|s| s.kind == "stun" || s.kind == "stuns")
+        .find_map(|s| uri_host(&s.host).map(|h| format!("stun://{}:{}", h, s.port)));
     webrtc.set_property_from_str(
         "stun-server",
         stun.as_deref().unwrap_or("stun://stun.l.google.com:19302"),
@@ -1012,13 +1038,16 @@ fn configure_ice(webrtc: &gst::Element, muji: bool) {
             tracing::warn!(host = %s.host, "skipping TURN server without credentials");
             continue;
         };
-        let transport = if s.transport.is_empty() { "udp" } else { &s.transport };
+        let (Some(host), Some(transport)) = (uri_host(&s.host), uri_transport(&s.transport)) else {
+            tracing::warn!(host = %s.host, transport = %s.transport, "skipping TURN server with an invalid host or transport");
+            continue;
+        };
         let uri = format!(
             "{}://{}:{}@{}:{}?transport={}",
             s.kind,
             pct_encode(user),
             pct_encode(pass),
-            wrap_host(&s.host),
+            host,
             s.port,
             transport,
         );
@@ -1512,6 +1541,21 @@ fn link_incoming_video(pipeline: &gst::Pipeline, pad: &gst::Pad, vtx: VideoTx) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ice_uri_host_accepts_only_ip_literals_and_ldh_names() {
+        assert_eq!(uri_host("turn.example.org").as_deref(), Some("turn.example.org"));
+        assert_eq!(uri_host("turn.example.org.").as_deref(), Some("turn.example.org"));
+        assert_eq!(uri_host("192.0.2.1").as_deref(), Some("192.0.2.1"));
+        assert_eq!(uri_host("2001:db8::1").as_deref(), Some("[2001:db8::1]"));
+        assert_eq!(uri_host("[2001:db8::1]").as_deref(), Some("[2001:db8::1]"));
+        for bad in ["", "a@b", "x?transport=tcp", "[::1", "host/path", "-bad.org", "a..b", "h st"] {
+            assert_eq!(uri_host(bad), None, "{bad}");
+        }
+        assert_eq!(uri_transport(""), Some("udp"));
+        assert_eq!(uri_transport("TCP"), Some("tcp"));
+        assert_eq!(uri_transport("tcp&x=y"), None);
+    }
 
     /// The pipeline strings must parse (all element factories present + valid syntax) for both
     /// audio-only and audio+video. This catches a bad description before any call is placed.

@@ -13,6 +13,7 @@ pub mod event;
 pub mod media_strip;
 pub mod sasl_auth;
 pub mod session;
+pub mod tls_roots;
 pub mod uri;
 pub mod xeps;
 

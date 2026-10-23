@@ -1751,10 +1751,23 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                     });
                 }
                 // XEP-0424 retraction: the core tombstoned the row (content + metadata +
-                // reactions); also drop the media file the old body may have cached.
-                Event::MessageRetracted { conversation_id, body, .. } => {
-                    if let Some(url) = body.as_deref().and_then(crate::messages::media_url) {
-                        mxc_store::cache::remove(&image_cache_path(&url));
+                // reactions); also drop the media files cached for its old body and attachment.
+                // Cache files are named by URL, so the same file can belong to messages in other
+                // chats too: keep it while any of them still names that URL (Conversations
+                // b12fc68c8), or a sender could post a URL from elsewhere and retract it to
+                // delete everyone's copy.
+                Event::MessageRetracted { conversation_id, body, attachment, .. } => {
+                    let mut urls: Vec<String> =
+                        body.as_deref().and_then(crate::messages::media_url).into_iter().collect();
+                    for f in attachment.as_deref().map(crate::messages::attachment_files_json).unwrap_or_default() {
+                        if !urls.contains(&f.url) {
+                            urls.push(f.url);
+                        }
+                    }
+                    for url in urls {
+                        if !store.media_url_in_use(&url).await.unwrap_or(true) {
+                            mxc_store::cache::remove(&image_cache_path(&url));
+                        }
                     }
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                         backend.as_mut().message_stored(conversation_id);
@@ -1830,8 +1843,9 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                     });
                 }
                 // Room OMEMO capability discovered (join/disco) → re-gate the lock toggle.
-                Event::MucPrivacy { room, omemo_capable, moderation, .. } => {
+                Event::MucPrivacy { room, omemo_capable, moderation, occupant_id, .. } => {
                     crate::muc_admin::set_moderation(&room, moderation);
+                    crate::muc_admin::set_occupant_id(&room, occupant_id);
                     MUC_OMEMO.lock().unwrap().insert(room, omemo_capable);
                     let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                         backend.as_mut().muc_privacy_changed();

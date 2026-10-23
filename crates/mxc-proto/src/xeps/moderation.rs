@@ -116,6 +116,37 @@ pub async fn moderate(
     Ok(())
 }
 
+/// Moderate the message with room stanza-id `stanza_id` and every correction it received:
+/// each correction is its own message in the room archive (Conversations 13063fbf4), and
+/// leaving them would keep the edited text visible to everyone else. The requested id is
+/// moderated first and decides the result; the corrections are best effort.
+pub async fn moderate_with_versions(
+    w: &Writer,
+    store: &mxc_store::Store,
+    account_id: i64,
+    room: &str,
+    stanza_id: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut ids = vec![stanza_id.to_string()];
+    if let Ok(conv) = store.conversation_id(account_id, room, "muc").await {
+        if let Ok(Some(mid)) = store.find_by_stanza_id(conv, stanza_id).await {
+            for id in store.message_stanza_ids(mid).await.unwrap_or_default() {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    moderate(w, account_id, room, &ids[0], reason).await?;
+    for id in &ids[1..] {
+        if let Err(e) = moderate(w, account_id, room, id, reason).await {
+            tracing::warn!(error = %e, stanza_id = %id, "moderating a correction failed");
+        }
+    }
+    Ok(())
+}
+
 /// How many of a banned occupant's newest messages "moderate recent" removes at most.
 pub const RECENT_LIMIT: i64 = 50;
 

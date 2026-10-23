@@ -460,6 +460,13 @@ pub async fn send_correction(
     new_body: &str,
     conversation_id: i64,
 ) -> anyhow::Result<()> {
+    // In a group chat, others can only match a correction to its author by occupant id; in a
+    // room without them it would show up as a new message (Conversations 9b77fa682).
+    if store.conversation_kind(cfg.account_id, to).await.ok().flatten().as_deref() == Some("muc")
+        && !super::muc::occupant_id_supported(cfg.account_id, to)
+    {
+        anyhow::bail!("This group doesn't support editing messages (no occupant ids)");
+    }
     let replace = Element::builder("replace", NS_CORRECT).attr(crate::ncname("id"), target_id).build();
     let body = Element::builder("body", NS_CLIENT).append(new_body).build();
     send_meta(w, store, cfg, to, vec![replace, body], true).await?;
@@ -489,9 +496,9 @@ pub async fn send_retraction(
     let body = Element::builder("body", NS_CLIENT).append("[This message was retracted]").build();
     send_meta(w, store, cfg, to, vec![retract, fallback, body], true).await?;
 
-    if let Some((mid, old_body)) = store.retract_message(conversation_id, target_id).await? {
+    if let Some((mid, old)) = store.retract_message(conversation_id, target_id).await? {
         let _ = events.send(Event::MessageRetracted {
-            account_id: cfg.account_id, conversation_id, message_id: mid, body: old_body,
+            account_id: cfg.account_id, conversation_id, message_id: mid, body: old.body, attachment: old.attachment,
         }).await;
     }
     Ok(())
@@ -1490,19 +1497,44 @@ async fn process_payload(
     // A MUC private message (XEP-0045 §7.5): a non-groupchat message to/from a room occupant
     // (`room@host/nick`). It gets its OWN conversation keyed by the full occupant JID and kind
     // 'muc_pm', so it shows as a separate "private message" chat rather than inline in the room.
-    let is_muc_pm = msg.attr("type") != Some("groupchat")
-        && counterpart_full.contains('/')
-        && (msg.get_child("x", NS_MUC_USER).is_some()
-            || store.conversation_kind(cfg.account_id, &bare).await.ok().flatten().as_deref()
-                == Some("muc"));
+    // Both only for a room we have (Conversations ignores group traffic from rooms it hasn't
+    // joined; presence.rs applies the same rule). Otherwise any sender could spawn a fake room,
+    // or - with an `<x muc#user>` on a normal message - have their own 1:1 chat treated as a
+    // MUC-PM, which skips the SCE `<to>` binding.
+    let is_our_room =
+        store.conversation_kind(cfg.account_id, &bare).await.ok().flatten().as_deref() == Some("muc");
+    let is_groupchat = msg.attr("type") == Some("groupchat");
+    if is_groupchat && !is_our_room {
+        tracing::debug!(from = %counterpart_full, "dropping groupchat message from a room we don't have");
+        return Ok(());
+    }
+    // An existing private chat with an occupant keeps working after we left its room (leaving
+    // deletes only the room's row); only such an existing row qualifies, so a stranger still
+    // can't create one.
+    let has_resource = counterpart_full.contains('/');
+    let is_known_pm = !is_our_room
+        && has_resource
+        && store.conversation_kind(cfg.account_id, &counterpart_full).await.ok().flatten().as_deref()
+            == Some("muc_pm");
+    // Our own PM sent from another device (sent carbon / our archive: only our server can hand
+    // us those) may start the private chat even here, where we aren't in that room.
+    let own_pm = direction == Direction::Out && msg.get_child("x", NS_MUC_USER).is_some();
+    let is_muc_pm = !is_groupchat && has_resource && (is_our_room || is_known_pm || own_pm);
+    // Marked as a room private message but from no room or private chat we have: don't file it
+    // under the bare JID, which for a room we left would mix its occupants into one chat.
+    if !is_groupchat && !is_muc_pm && has_resource && msg.get_child("x", NS_MUC_USER).is_some() {
+        tracing::debug!(from = %counterpart_full, "dropping room private message from a room we don't have");
+        return Ok(());
+    }
     let (conv_key, kind): (&str, &str) = if is_muc_pm {
         (counterpart_full.as_str(), "muc_pm")
-    } else if msg.attr("type") == Some("groupchat") {
+    } else if is_groupchat {
         (bare.as_str(), "muc")
     } else {
         (bare.as_str(), "chat")
     };
-    let conv = store.conversation_id(cfg.account_id, conv_key, kind).await?;
+    // Hidden until a message is stored in it (receipts, chat states, ... can come from anyone).
+    let conv = store.conversation_id_incoming(cfg.account_id, conv_key, kind).await?;
     // The canonical id for reactions/retractions/dedup is the `<stanza-id>` stamped by the
     // *relevant* archive — the room for a MUC, our account otherwise — and only if that archive
     // advertises XEP-0359 (else the sender could have forged it; see stanza_id.rs). Failing
@@ -1632,9 +1664,9 @@ async fn process_payload(
                         .take_pending_retraction(conv, &ids, "out", occupant_id.as_deref(), row.omemo_fingerprint.as_deref())
                         .await?
                     {
-                        let old_body = store.retract_message_id(row.id).await?;
+                        let old = store.retract_message_id(row.id).await?;
                         let _ = events.send(Event::MessageRetracted {
-                            account_id: cfg.account_id, conversation_id: conv, message_id: row.id, body: old_body,
+                            account_id: cfg.account_id, conversation_id: conv, message_id: row.id, body: old.body, attachment: old.attachment,
                         }).await;
                     }
                 }
@@ -1863,9 +1895,9 @@ async fn process_payload(
         if let Some((target, reason)) = super::moderation::moderation_target(msg) {
             match store.find_by_stanza_id(conv, &target).await? {
                 Some(mid) => {
-                    let old_body = store.moderate_message_id(mid, reason.as_deref()).await?;
+                    let old = store.moderate_message_id(mid, reason.as_deref()).await?;
                     let _ = events.send(Event::MessageRetracted {
-                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old.body, attachment: old.attachment,
                     }).await;
                 }
                 // Not here (yet): paging back through an archive that keeps originals can bring
@@ -1883,9 +1915,9 @@ async fn process_payload(
         if let Some(reason) = super::moderation::tombstone(msg) {
             if let Some(sid) = stanza_id.as_deref() {
                 if let Some(mid) = store.find_by_stanza_id(conv, sid).await? {
-                    let old_body = store.moderate_message_id(mid, reason.as_deref()).await?;
+                    let old = store.moderate_message_id(mid, reason.as_deref()).await?;
                     let _ = events.send(Event::MessageRetracted {
-                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old.body, attachment: old.attachment,
                     }).await;
                 }
             }
@@ -1921,9 +1953,9 @@ async fn process_payload(
             ).await?;
             match (mid, sender_filter(kind, own_side, occupant_id.as_deref())) {
                 (Some(mid), _) => {
-                    let old_body = store.retract_message_id(mid).await?;
+                    let old = store.retract_message_id(mid).await?;
                     let _ = events.send(Event::MessageRetracted {
-                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old.body, attachment: old.attachment,
                     }).await;
                 }
                 // Not here (yet): paging back through an archive brings a retraction before the
@@ -2072,6 +2104,15 @@ async fn process_payload(
             ).await?;
             if let Some(mid) = mid {
                 store.correct_message(mid, target, &body, encryption, fingerprint.as_deref()).await?;
+                // In the room archive the correction is its own message: remember its stanza-id
+                // (room-stamped only), so moderating this message removes it as well.
+                // For a room, `stanza_id` is the room-stamped id or the room archive's result
+                // id (mam::screen_result drops groupchat from the account archive).
+                if kind == "muc" {
+                    if let Some(sid) = stanza_id.as_deref() {
+                        let _ = store.add_message_version(mid, sid).await;
+                    }
+                }
                 if let Some(row) = fetch_row(store, conv, mid).await {
                     let _ = events.send(Event::MessageEdited {
                         account_id: cfg.account_id, conversation_id: conv, message: row,
@@ -2172,9 +2213,9 @@ async fn process_payload(
             if let Some(rid) = &remote_id {
                 store.set_remote_id(mid, rid).await?;
             }
-            store.retract_message_id(mid).await?;
+            let old = store.retract_message_id(mid).await?;
             let _ = events.send(Event::MessageRetracted {
-                account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: None,
+                account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old.body, attachment: old.attachment,
             }).await;
         } else {
             // Already stored (e.g. our own message, whose room stanza-id the retraction addressed
@@ -2186,9 +2227,9 @@ async fn process_payload(
                     new_msg.occupant_id.as_deref(), new_msg.omemo_fingerprint.as_deref(),
                 ).await?;
                 if let Some(mid) = found {
-                    let old_body = store.retract_message_id(mid).await?;
+                    let old = store.retract_message_id(mid).await?;
                     let _ = events.send(Event::MessageRetracted {
-                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old_body,
+                        account_id: cfg.account_id, conversation_id: conv, message_id: mid, body: old.body, attachment: old.attachment,
                     }).await;
                     break;
                 }
@@ -2983,6 +3024,67 @@ mod retraction_tests {
             .await
             .unwrap();
         }
+    }
+
+    /// A groupchat message from a room we don't have creates nothing; a bodyless stanza from a
+    /// stranger leaves no visible conversation; a muc#user marker doesn't make a stranger's 1:1
+    /// chat a MUC-PM.
+    #[tokio::test]
+    async fn incoming_stanzas_dont_create_fake_or_empty_conversations() {
+        let h = harness().await;
+        let acc = h.cfg.account_id;
+        h.feed(
+            "<message xmlns='jabber:client' from='stranger@evil.example/res' to='me@example.org' type='groupchat' id='g1'>\
+               <body>hi</body></message>",
+            Direction::In, None,
+        ).await;
+        assert_eq!(h.store.conversation_kind(acc, "stranger@evil.example").await.unwrap(), None);
+        h.feed(
+            "<message xmlns='jabber:client' from='nobody@example.net/x' to='me@example.org' type='chat'>\
+               <active xmlns='http://jabber.org/protocol/chatstates'/></message>",
+            Direction::In, None,
+        ).await;
+        assert!(h.store.conversations(acc).await.unwrap().is_empty());
+        h.feed(
+            "<message xmlns='jabber:client' from='eve@example.net/res' to='me@example.org' type='chat' id='p1'>\
+               <x xmlns='http://jabber.org/protocol/muc#user'/><body>psst</body></message>",
+            Direction::In, None,
+        ).await;
+        // marked as a room PM but from no room/PM we have: dropped, filed nowhere
+        assert_eq!(h.store.conversation_kind(acc, "eve@example.net").await.unwrap(), None);
+        assert_eq!(h.store.conversation_kind(acc, "eve@example.net/res").await.unwrap(), None);
+    }
+
+    /// After leaving a room (its row is gone), an existing private chat with an occupant still
+    /// gets that occupant's messages; another occupant gets nothing filed under the room JID.
+    #[tokio::test]
+    async fn private_chat_survives_leaving_the_room() {
+        let h = harness().await;
+        let acc = h.cfg.account_id;
+        let pm = h.store.conversation_id(acc, "room@muc.example.org/alice", "muc_pm").await.unwrap();
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/alice' to='me@example.org' type='chat' id='pm1'>\
+               <x xmlns='http://jabber.org/protocol/muc#user'/><origin-id xmlns='urn:xmpp:sid:0' id='pm1'/><body>still here</body></message>",
+            Direction::In, None,
+        ).await;
+        assert_eq!(h.store.message_by_marker(pm, "pm1").await.unwrap().unwrap().body.as_deref(), Some("still here"));
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/bob' to='me@example.org' type='chat' id='pm2'>\
+               <x xmlns='http://jabber.org/protocol/muc#user'/><body>hi</body></message>",
+            Direction::In, None,
+        ).await;
+        assert_eq!(h.store.conversation_kind(acc, "room@muc.example.org").await.unwrap(), None);
+        assert_eq!(h.store.conversation_kind(acc, "room@muc.example.org/bob").await.unwrap(), None);
+        // our own PM from another device (a sent carbon) still opens the private chat
+        h.feed(
+            "<message xmlns='jabber:client' from='me@example.org/phone' to='room@muc.example.org/carol' type='chat' id='pm3'>\
+               <x xmlns='http://jabber.org/protocol/muc#user'/><origin-id xmlns='urn:xmpp:sid:0' id='pm3'/><body>hey</body></message>",
+            Direction::Out, None,
+        ).await;
+        assert_eq!(
+            h.store.conversation_kind(acc, "room@muc.example.org/carol").await.unwrap().as_deref(),
+            Some("muc_pm")
+        );
     }
 
     #[tokio::test]

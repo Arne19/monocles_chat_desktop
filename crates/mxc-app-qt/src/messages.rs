@@ -257,7 +257,11 @@ impl AttachmentFile {
 /// Every file in a message's `attachment` column: the `files` array when the sender described
 /// several, else the single `{url, mime}` shape.
 pub fn attachment_files(m: &MessageRow) -> Vec<AttachmentFile> {
-    let Some(json) = m.attachment.as_deref() else { return Vec::new() };
+    m.attachment.as_deref().map(attachment_files_json).unwrap_or_default()
+}
+
+/// [`attachment_files`] from the raw `attachment` JSON (e.g. what a retraction removed).
+pub fn attachment_files_json(json: &str) -> Vec<AttachmentFile> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
     let entries: Vec<&serde_json::Value> = match value.get("files").and_then(|f| f.as_array()) {
         Some(list) => list.iter().collect(),

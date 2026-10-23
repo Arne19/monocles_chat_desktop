@@ -50,6 +50,10 @@ ApplicationWindow {
     property int mucModerationRev: 0
     property bool currentRoomCanModerate: currentPeerIsMuc && mucModerationRev >= 0
                                           && backend.mucCanModerate(currentPeerJid)
+    // XEP-0308 in a group chat only where the room stamps occupant ids (others couldn't tie
+    // the correction to us). 1:1 chats and private messages can always be edited.
+    property bool currentChatCanCorrect: !currentPeerIsMuc
+                                         || (mucModerationRev >= 0 && backend.mucCanCorrect(currentPeerJid))
     // XEP-0045: we're an admin/owner of the open room (member and ban lists).
     property bool currentRoomCanManageMembers: currentPeerIsMuc && mucModerationRev >= 0
                                                && backend.mucCanManageMembers(currentPeerJid)
@@ -2539,7 +2543,8 @@ ApplicationWindow {
                                         // Own plain-text messages can be corrected (XEP-0308).
                                         MenuItem {
                                             text: qsTr("Edit")
-                                            visible: model.outgoing && !model.retracted
+                                            visible: window.currentChatCanCorrect
+                                                     && model.outgoing && !model.retracted
                                                      && model.body.length > 0
                                                      && model.imagePath.length === 0
                                                      && model.audioPath.length === 0

@@ -17,6 +17,28 @@ use crate::xeps::{caps, iq, vcard};
 
 pub const NS_MUC: &str = "http://jabber.org/protocol/muc";
 const NS_DISCO_INFO: &str = "http://jabber.org/protocol/disco#info";
+const NS_OCCUPANT_ID: &str = "urn:xmpp:occupant-id:0";
+
+/// Rooms (account, lowercased bare JID) whose disco#info advertises XEP-0421 occupant ids.
+static OCCUPANT_ID_ROOMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i64, String)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `room` stamps occupant ids. Without them other clients can't tie a correction to
+/// its author (they show it as a new message), so we don't send corrections there
+/// (Conversations 9b77fa682).
+pub fn occupant_id_supported(account_id: i64, room: &str) -> bool {
+    OCCUPANT_ID_ROOMS.lock().unwrap().contains(&(account_id, room.to_ascii_lowercase()))
+}
+
+fn set_occupant_id_supported(account_id: i64, room: &str, supported: bool) {
+    let key = (account_id, room.to_ascii_lowercase());
+    let mut rooms = OCCUPANT_ID_ROOMS.lock().unwrap();
+    if supported {
+        rooms.insert(key);
+    } else {
+        rooms.remove(&key);
+    }
+}
 const NS_MUC_ADMIN: &str = "http://jabber.org/protocol/muc#admin";
 const NS_XDATA: &str = "jabber:x:data";
 
@@ -160,6 +182,7 @@ pub async fn configure_room(
     let mut members_only = false;
     let mut non_anonymous = false;
     let mut moderation = None;
+    let mut occupant_id = false;
     let req = Element::builder("iq", "jabber:client")
         .attr(crate::ncname("type"), "get")
         .attr(crate::ncname("to"), room)
@@ -174,12 +197,14 @@ pub async fn configure_room(
                 match f.attr("var") {
                     Some("muc_membersonly") => members_only = true,
                     Some("muc_nonanonymous") => non_anonymous = true,
+                    Some(NS_OCCUPANT_ID) => occupant_id = true,
                     _ => {}
                 }
             }
         }
     }
     super::moderation::set_supported(cfg.account_id, room, moderation);
+    set_occupant_id_supported(cfg.account_id, room, occupant_id);
     store.set_muc_features(conv, members_only, non_anonymous).await?;
     let omemo_capable = members_only && non_anonymous;
     let _ = events
@@ -188,6 +213,7 @@ pub async fn configure_room(
             room: room.to_string(),
             omemo_capable,
             moderation: moderation.is_some(),
+            occupant_id,
         })
         .await;
 
@@ -199,14 +225,15 @@ pub async fn configure_room(
             for item in query.children().filter(|c| c.name() == "item") {
                 let Some(jid) = item.attr("jid") else { continue };
                 let real_bare = jid.split('/').next().unwrap_or(jid);
-                // Offline members have no nick; key them by their real JID so they still count
-                // as crypto targets (online occupants are also keyed by nick via presence —
-                // muc_member_jids de-dups on real_jid). Don't overwrite ourselves.
+                // Offline members have no nick; they get a row keyed by a placeholder no nick
+                // can take over (mxc_store::member_placeholder), so they still count as crypto
+                // targets (online occupants are keyed by nick via presence — muc_member_jids
+                // de-dups on real_jid). Don't overwrite ourselves.
                 if real_bare.eq_ignore_ascii_case(cfg.bare()) {
                     continue;
                 }
                 let aff = item.attr("affiliation").or(Some(affiliation));
-                let _ = store.upsert_muc_occupant(conv, real_bare, Some(real_bare), aff).await;
+                let _ = store.upsert_muc_offline_member(conv, real_bare, aff).await;
             }
         }
     }

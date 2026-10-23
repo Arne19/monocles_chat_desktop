@@ -104,6 +104,26 @@ pub struct NewMessage {
     pub unstyled: bool,
 }
 
+/// The `muc_occupants.nick` key of an offline member's row. A control character can't occur in
+/// an XMPP resourcepart, so no occupant nick can collide with it (they used to be keyed by the
+/// bare JID, which an occupant could simply pick as their nick). Migration 0023 has the same
+/// format.
+pub fn member_placeholder(real_bare: &str) -> String {
+    format!("\u{1}member:{real_bare}")
+}
+
+fn is_member_placeholder(nick: &str) -> bool {
+    nick.starts_with('\u{1}')
+}
+
+/// What a retraction/moderation removed from a message: the old `body` and `attachment`, so
+/// the caller can drop media files cached for them (if nothing else still uses them).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Tombstone {
+    pub body: Option<String>,
+    pub attachment: Option<String>,
+}
+
 impl Store {
     /// Find or create a conversation row for (account, jid).
     pub async fn conversation_id(
@@ -122,7 +142,7 @@ impl Store {
         let rec = sqlx::query!(
             r#"
             INSERT INTO conversations (account_id, jid, kind, encryption, notify) VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(account_id, jid) DO UPDATE SET jid = jid
+            ON CONFLICT(account_id, jid) DO UPDATE SET pending = 0
             RETURNING id as "id!: i64"
             "#,
             account_id,
@@ -136,6 +156,130 @@ impl Store {
         Ok(rec.id)
     }
 
+    /// Like [`Self::conversation_id`], for a stanza that just arrived: a conversation created
+    /// here stays hidden from [`Self::conversations`] (`pending`) until a message is stored in
+    /// it, so a bodyless stanza (receipt, chat state, ...) from anyone can't add an empty chat.
+    /// An existing row is returned unchanged.
+    pub async fn conversation_id_incoming(
+        &self,
+        account_id: i64,
+        jid: &str,
+        kind: &str,
+    ) -> Result<i64> {
+        let default_encryption = if kind == "chat" { "omemo2" } else { "none" };
+        let default_notify = if kind == "muc" { "mentioned" } else { "all" };
+        let id: i64 = sqlx::query_scalar(
+            r#"INSERT INTO conversations (account_id, jid, kind, encryption, notify, pending)
+               VALUES (?1, ?2, ?3, ?4, ?5, 1)
+               ON CONFLICT(account_id, jid) DO UPDATE SET jid = jid
+               RETURNING id"#,
+        )
+        .bind(account_id)
+        .bind(jid)
+        .bind(kind)
+        .bind(default_encryption)
+        .bind(default_notify)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(id)
+    }
+
+    /// Whether any message that isn't retracted still names `url` in its body or attachment, in
+    /// any conversation or account. Cached media is keyed by URL, so the same file can belong to
+    /// messages in several chats; a retraction must not delete it from under the others.
+    pub async fn media_url_in_use(&self, url: &str) -> Result<bool> {
+        let hit: Option<i64> = sqlx::query_scalar(
+            r#"SELECT 1 FROM messages
+               WHERE retracted = 0 AND (instr(body, ?1) > 0 OR instr(attachment, ?1) > 0)
+               LIMIT 1"#,
+        )
+        .bind(url)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(hit.is_some())
+    }
+
+    /// The stored row `msg` duplicates, if any. A matching `stanza_id` is always a duplicate
+    /// (the archive assigns it; callers only pass trusted ones). A matching `origin_id` is chosen
+    /// by the sender, so it only counts for the same direction and the same sender: in a group
+    /// chat the same occupant id when both are known, else the same occupant address.
+    /// Otherwise another occupant could store a message under someone's origin-id first and
+    /// have the real one dropped as a "duplicate". Our own messages (`out`) and a 1:1 chat
+    /// (only the peer writes in it) need no sender check.
+    async fn duplicate_of(&self, msg: &NewMessage) -> Result<Option<i64>> {
+        if let Some(sid) = msg.stanza_id.as_deref() {
+            let hit: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM messages WHERE conversation_id = ?1 AND stanza_id = ?2 LIMIT 1",
+            )
+            .bind(msg.conversation_id)
+            .bind(sid)
+            .fetch_optional(self.pool())
+            .await?;
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        let Some(oid) = msg.origin_id.as_deref() else {
+            return Ok(None);
+        };
+        let candidates: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            r#"SELECT id, direction, counterpart, occupant_id FROM messages
+               WHERE conversation_id = ?1 AND origin_id = ?2
+               ORDER BY id DESC"#,
+        )
+        .bind(msg.conversation_id)
+        .bind(oid)
+        .fetch_all(self.pool())
+        .await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let direction = msg.direction.as_str();
+        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM conversations WHERE id = ?1")
+            .bind(msg.conversation_id)
+            .fetch_optional(self.pool())
+            .await?;
+        let group = kind.as_deref() == Some("muc");
+        // In a room, an archive copy of our own message that couldn't be proven ours stays
+        // incoming; it still duplicates our outgoing row when it comes from us by the same rule
+        // process_payload uses: our occupant id, else our nick.
+        let (self_occupant, self_nick) = if group {
+            (
+                self.muc_self_occupant(msg.conversation_id).await?,
+                self.muc_nick(msg.conversation_id).await?,
+            )
+        } else {
+            (None, None)
+        };
+        let from_us = |counterpart: &str, occupant: Option<&str>| match (occupant, self_occupant.as_deref()) {
+            (Some(occ), Some(own)) => occ == own,
+            _ => self_nick.as_deref().is_some_and(|nick| {
+                counterpart.rsplit_once('/').is_some_and(|(_, n)| n == nick)
+            }),
+        };
+        Ok(candidates
+            .into_iter()
+            .find(|(_, dir, counterpart, occupant)| {
+                if dir != direction {
+                    // only an own echo in a room can meet our own row from the other side
+                    return group
+                        && if direction == "in" {
+                            from_us(&msg.counterpart, msg.occupant_id.as_deref())
+                        } else {
+                            from_us(counterpart, occupant.as_deref())
+                        };
+                }
+                if direction == "out" || !group {
+                    return true;
+                }
+                match (occupant.as_deref(), msg.occupant_id.as_deref()) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => counterpart.eq_ignore_ascii_case(&msg.counterpart),
+                }
+            })
+            .map(|(id, ..)| id))
+    }
+
     /// Insert a message, deduplicating on (stanza_id|origin_id) within the conversation.
     /// Returns the row id, or `None` if it was a duplicate that we skipped.
     pub async fn insert_message(&self, msg: &NewMessage) -> Result<Option<i64>> {
@@ -145,18 +289,7 @@ impl Store {
         // Dedup: a matching origin-id or stanza-id in the same conversation means we've
         // already stored this (e.g. carbon + MAM, or our own echo).
         if msg.stanza_id.is_some() || msg.origin_id.is_some() {
-            let existing = sqlx::query!(
-                r#"SELECT id as "id!: i64" FROM messages
-                   WHERE conversation_id = ?1
-                     AND ((stanza_id IS NOT NULL AND stanza_id = ?2)
-                       OR (origin_id IS NOT NULL AND origin_id = ?3))
-                   LIMIT 1"#,
-                msg.conversation_id,
-                msg.stanza_id,
-                msg.origin_id,
-            )
-            .fetch_optional(self.pool())
-            .await?;
+            let existing = self.duplicate_of(msg).await?;
             if let Some(row) = existing {
                 // Already stored (e.g. our own message now reflected by the MUC). Backfill any
                 // ids we didn't have at first sight — crucially the room-assigned stanza-id and
@@ -166,7 +299,7 @@ impl Store {
                        SET stanza_id = COALESCE(stanza_id, ?2),
                            occupant_id = COALESCE(occupant_id, ?3)
                        WHERE id = ?1"#,
-                    row.id,
+                    row,
                     msg.stanza_id,
                     msg.occupant_id,
                 )
@@ -201,8 +334,9 @@ impl Store {
         .fetch_one(self.pool())
         .await?;
 
+        // A stored message makes a conversation created by an incoming stanza visible.
         sqlx::query!(
-            "UPDATE conversations SET last_active = ?1 WHERE id = ?2",
+            "UPDATE conversations SET last_active = ?1, pending = 0 WHERE id = ?2",
             msg.timestamp,
             msg.conversation_id
         )
@@ -422,6 +556,31 @@ impl Store {
         Ok(row)
     }
 
+    /// Like [`Self::message_by_marker`], but only one of *our own* messages (`direction = 'out'`):
+    /// the target of a correction or retraction we send. Ids are chosen by senders, so without
+    /// the direction filter an incoming message carrying the same id could be the one we
+    /// rewrite or tombstone locally.
+    async fn own_message_by_marker(
+        &self,
+        conversation_id: i64,
+        marker_id: &str,
+    ) -> Result<Option<MessageRow>> {
+        let row = sqlx::query_as::<_, MessageRow>(
+            r#"SELECT id, conversation_id, stanza_id, origin_id, counterpart, direction,
+                      body, encryption, state, edited_of, retracted, attachment, reply_to,
+                      omemo_fingerprint, timestamp, thread, moderated, moderation_reason, unstyled
+               FROM messages
+               WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2)
+                 AND direction = 'out'
+               ORDER BY id DESC LIMIT 1"#,
+        )
+        .bind(conversation_id)
+        .bind(marker_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
     /// XEP-0308: replace the body of the message targeted by `target_marker`, recording
     /// the edit pointer. No sender check — only for edits *we* make locally; incoming
     /// corrections go through [`Self::find_from_sender`] + [`Self::correct_message`].
@@ -432,7 +591,7 @@ impl Store {
         target_marker: &str,
         new_body: &str,
     ) -> Result<Option<i64>> {
-        let Some(orig) = self.message_by_marker(conversation_id, target_marker).await? else {
+        let Some(orig) = self.own_message_by_marker(conversation_id, target_marker).await? else {
             return Ok(None);
         };
         sqlx::query!(
@@ -448,7 +607,7 @@ impl Store {
 
     /// XEP-0424: tombstone the targeted message — per spec the content AND its metadata go
     /// (body, attachment, correction/reply links, fingerprint, reactions); only a minimal
-    /// stub row remains. Returns the message id and the body it had, so callers can also
+    /// stub row remains. Returns the message id and the body/attachment it had, so callers can also
     /// drop any media-cache file downloaded for it. No sender check — only for retractions
     /// *we* make locally; incoming ones go through [`Self::find_from_sender`] +
     /// [`Self::retract_message_id`].
@@ -456,8 +615,8 @@ impl Store {
         &self,
         conversation_id: i64,
         target_marker: &str,
-    ) -> Result<Option<(i64, Option<String>)>> {
-        let Some(orig) = self.message_by_marker(conversation_id, target_marker).await? else {
+    ) -> Result<Option<(i64, Tombstone)>> {
+        let Some(orig) = self.own_message_by_marker(conversation_id, target_marker).await? else {
             return Ok(None);
         };
         sqlx::query!(
@@ -470,7 +629,7 @@ impl Store {
         sqlx::query!("DELETE FROM reactions WHERE message_id = ?1", orig.id)
             .execute(self.pool())
             .await?;
-        Ok(Some((orig.id, orig.body)))
+        Ok(Some((orig.id, Tombstone { body: orig.body, attachment: orig.attachment })))
     }
 
     /// The newest non-retracted message in `conversation_id` with marker `marker_id` that was
@@ -518,10 +677,13 @@ impl Store {
 
     /// The newest non-retracted message in `conversation_id` with archive id `stanza_id` (a
     /// XEP-0425 moderation from the room references the room-assigned stanza-id only).
+    /// Also finds a message by the stanza-id of one of its corrections ([`Self::add_message_version`]).
     pub async fn find_by_stanza_id(&self, conversation_id: i64, stanza_id: &str) -> Result<Option<i64>> {
         let id: Option<i64> = sqlx::query_scalar(
             r#"SELECT id FROM messages
-               WHERE conversation_id = ?1 AND stanza_id = ?2 AND retracted = 0
+               WHERE conversation_id = ?1 AND retracted = 0
+                 AND (stanza_id = ?2
+                      OR id IN (SELECT message_id FROM message_versions WHERE stanza_id = ?2))
                ORDER BY id DESC LIMIT 1"#,
         )
         .bind(conversation_id)
@@ -539,7 +701,53 @@ impl Store {
             .bind(stanza_id)
             .execute(self.pool())
             .await?;
+        // Bounded like pending_retractions: the room sends these, but nothing ever consumes one
+        // whose message never arrives.
+        sqlx::query(
+            "DELETE FROM pending_moderations
+             WHERE conversation_id = ?1 AND rowid NOT IN (
+                 SELECT rowid FROM pending_moderations WHERE conversation_id = ?1
+                 ORDER BY rowid DESC LIMIT ?2)",
+        )
+        .bind(conversation_id)
+        .bind(MAX_PENDING_RETRACTIONS)
+        .execute(self.pool())
+        .await?;
         Ok(())
+    }
+
+    /// Remember the room stanza-id of a correction `message_id` received (XEP-0308): in the
+    /// room archive the correction is a message of its own, which a moderation of this message
+    /// has to remove too.
+    pub async fn add_message_version(&self, message_id: i64, stanza_id: &str) -> Result<()> {
+        sqlx::query("INSERT OR IGNORE INTO message_versions (message_id, stanza_id) VALUES (?1, ?2)")
+            .bind(message_id)
+            .bind(stanza_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Every room stanza-id of message `message_id`: its own (if any) first, then those of
+    /// the corrections it received.
+    pub async fn message_stanza_ids(&self, message_id: i64) -> Result<Vec<String>> {
+        let own: Option<Option<String>> = sqlx::query_scalar("SELECT stanza_id FROM messages WHERE id = ?1")
+            .bind(message_id)
+            .fetch_optional(self.pool())
+            .await?;
+        let versions: Vec<String> = sqlx::query_scalar(
+            "SELECT stanza_id FROM message_versions WHERE message_id = ?1 ORDER BY rowid",
+        )
+        .bind(message_id)
+        .fetch_all(self.pool())
+        .await?;
+        let mut ids: Vec<String> = own.flatten().into_iter().collect();
+        for v in versions {
+            if !ids.contains(&v) {
+                ids.push(v);
+            }
+        }
+        Ok(ids)
     }
 
     /// Whether room stanza-id `stanza_id` was moderated before its message arrived; consumes
@@ -661,8 +869,8 @@ impl Store {
         occupant_jid: &str,
         limit: i64,
     ) -> Result<Vec<String>> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            r#"SELECT stanza_id FROM messages
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            r#"SELECT id, stanza_id FROM messages
                WHERE conversation_id = ?1 AND direction = 'in' AND retracted = 0
                  AND stanza_id IS NOT NULL
                  AND (occupant_id = ?2 OR (?2 IS NULL AND counterpart = ?3))
@@ -674,6 +882,21 @@ impl Store {
         .bind(limit)
         .fetch_all(self.pool())
         .await?;
+        // Each message's corrections too: they are separate messages in the room archive.
+        let mut ids = Vec::with_capacity(rows.len());
+        for (mid, sid) in rows {
+            ids.push(sid);
+            let versions: Vec<String> =
+                sqlx::query_scalar("SELECT stanza_id FROM message_versions WHERE message_id = ?1")
+                    .bind(mid)
+                    .fetch_all(self.pool())
+                    .await?;
+            for v in versions {
+                if !ids.contains(&v) {
+                    ids.push(v);
+                }
+            }
+        }
         Ok(ids)
     }
 
@@ -703,15 +926,15 @@ impl Store {
     }
 
     /// XEP-0424 tombstone of message `message_id` (already authorized by the caller); same
-    /// effect as [`Self::retract_message`]. Returns the body it had.
-    pub async fn retract_message_id(&self, message_id: i64) -> Result<Option<String>> {
+    /// effect as [`Self::retract_message`]. Returns the body/attachment it had.
+    pub async fn retract_message_id(&self, message_id: i64) -> Result<Tombstone> {
         self.tombstone_message_id(message_id, false, None).await
     }
 
     /// XEP-0425 tombstone of message `message_id` by a room moderator (already authorized by
     /// the caller: the moderation came from the room itself). Like
     /// [`Self::retract_message_id`], but records the moderation and its `reason`.
-    pub async fn moderate_message_id(&self, message_id: i64, reason: Option<&str>) -> Result<Option<String>> {
+    pub async fn moderate_message_id(&self, message_id: i64, reason: Option<&str>) -> Result<Tombstone> {
         self.tombstone_message_id(message_id, true, reason).await
     }
 
@@ -720,11 +943,12 @@ impl Store {
         message_id: i64,
         moderated: bool,
         reason: Option<&str>,
-    ) -> Result<Option<String>> {
-        let body: Option<Option<String>> = sqlx::query_scalar("SELECT body FROM messages WHERE id = ?1")
-            .bind(message_id)
-            .fetch_optional(self.pool())
-            .await?;
+    ) -> Result<Tombstone> {
+        let old: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT body, attachment FROM messages WHERE id = ?1")
+                .bind(message_id)
+                .fetch_optional(self.pool())
+                .await?;
         sqlx::query(
             r#"UPDATE messages SET retracted = 1, body = NULL, attachment = NULL,
                edited_of = NULL, reply_to = NULL, omemo_fingerprint = NULL,
@@ -739,7 +963,8 @@ impl Store {
             .bind(message_id)
             .execute(self.pool())
             .await?;
-        Ok(body.flatten())
+        let (body, attachment) = old.unwrap_or_default();
+        Ok(Tombstone { body, attachment })
     }
 
     /// XEP-0184/0333 from the counterpart: advance the delivery state of one of *our* messages
@@ -879,7 +1104,7 @@ impl Store {
         let rows = sqlx::query_as::<_, Conversation>(
             r#"SELECT id, jid, kind, name, encryption, unread, last_active, muc_autojoin, notify
                FROM conversations
-               WHERE account_id = ?1 AND archived = 0
+               WHERE account_id = ?1 AND archived = 0 AND pending = 0
                ORDER BY last_active DESC NULLS LAST, COALESCE(name, jid)"#,
         )
         .bind(account_id)
@@ -965,7 +1190,7 @@ impl Store {
             r#"INSERT INTO conversations (account_id, jid, kind, name, muc_nick, muc_autojoin, notify)
                VALUES (?1, ?2, 'muc', ?3, ?4, ?5, 'mentioned')
                ON CONFLICT(account_id, jid) DO UPDATE SET
-                 kind = 'muc', name = COALESCE(excluded.name, conversations.name),
+                 kind = 'muc', pending = 0, name = COALESCE(excluded.name, conversations.name),
                  muc_nick = COALESCE(excluded.muc_nick, conversations.muc_nick),
                  muc_autojoin = excluded.muc_autojoin
                RETURNING id as "id!: i64""#,
@@ -1207,6 +1432,32 @@ impl Store {
         real_jid: Option<&str>,
         affiliation: Option<&str>,
     ) -> Result<()> {
+        // Never let a nick from the wire address an offline-member row.
+        if is_member_placeholder(nick) {
+            return Ok(());
+        }
+        self.upsert_muc_occupant_row(conversation_id, nick, real_jid, affiliation).await
+    }
+
+    /// An offline room member (from the affiliation lists): keyed by [`member_placeholder`], a
+    /// key no occupant nick can take over.
+    pub async fn upsert_muc_offline_member(
+        &self,
+        conversation_id: i64,
+        real_bare: &str,
+        affiliation: Option<&str>,
+    ) -> Result<()> {
+        self.upsert_muc_occupant_row(conversation_id, &member_placeholder(real_bare), Some(real_bare), affiliation)
+            .await
+    }
+
+    async fn upsert_muc_occupant_row(
+        &self,
+        conversation_id: i64,
+        nick: &str,
+        real_jid: Option<&str>,
+        affiliation: Option<&str>,
+    ) -> Result<()> {
         // COALESCE keeps a previously-learned real JID/affiliation if a later presence omits it.
         sqlx::query!(
             r#"INSERT INTO muc_occupants (conversation_id, nick, real_jid, affiliation)
@@ -1226,6 +1477,9 @@ impl Store {
 
     /// Drop an occupant (left the room — unavailable presence).
     pub async fn remove_muc_occupant(&self, conversation_id: i64, nick: &str) -> Result<()> {
+        if is_member_placeholder(nick) {
+            return Ok(());
+        }
         sqlx::query!(
             "DELETE FROM muc_occupants WHERE conversation_id = ?1 AND nick = ?2",
             conversation_id,
@@ -1243,7 +1497,8 @@ impl Store {
     pub async fn set_muc_affiliation_by_jid(&self, conversation_id: i64, jid: &str, affiliation: &str) -> Result<()> {
         sqlx::query(
             r#"DELETE FROM muc_occupants
-               WHERE conversation_id = ?1 AND nick = real_jid AND real_jid = ?2 COLLATE NOCASE"#,
+               WHERE conversation_id = ?1 AND nick = char(1) || 'member:' || real_jid
+                 AND real_jid = ?2 COLLATE NOCASE"#,
         )
         .bind(conversation_id)
         .bind(jid)
@@ -1261,7 +1516,7 @@ impl Store {
         .rows_affected();
         let is_member = matches!(affiliation, "member" | "admin" | "owner");
         if present == 0 && is_member && !self.is_public_group(conversation_id).await? {
-            self.upsert_muc_occupant(conversation_id, jid, Some(jid), Some(affiliation)).await?;
+            self.upsert_muc_offline_member(conversation_id, jid, Some(affiliation)).await?;
         }
         Ok(())
     }
@@ -1272,6 +1527,9 @@ impl Store {
         conversation_id: i64,
         nick: &str,
     ) -> Result<Option<String>> {
+        if is_member_placeholder(nick) {
+            return Ok(None);
+        }
         let row = sqlx::query!(
             r#"SELECT real_jid as "real_jid?: String"
                FROM muc_occupants WHERE conversation_id = ?1 AND nick = ?2"#,
@@ -1470,7 +1728,7 @@ mod sender_auth_tests {
         assert_eq!(store.find_from_sender(room, "a2", "in", Some("occ-alice"), Some(Some("fp"))).await.unwrap(), Some(a2));
 
         // Retracted messages can't be targeted again.
-        assert_eq!(store.retract_message_id(alice).await.unwrap().as_deref(), Some("edited"));
+        assert_eq!(store.retract_message_id(alice).await.unwrap().body.as_deref(), Some("edited"));
         assert_eq!(store.find_from_sender(room, "a1", "in", Some("occ-alice"), None).await.unwrap(), None);
     }
 
@@ -1491,7 +1749,7 @@ mod sender_auth_tests {
         assert_eq!(store.find_by_stanza_id(other, "sid-1").await.unwrap(), None);
         assert_eq!(store.find_by_stanza_id(room, "sid-1").await.unwrap(), Some(spam));
 
-        assert_eq!(store.moderate_message_id(spam, Some("Spam")).await.unwrap().as_deref(), Some("hello"));
+        assert_eq!(store.moderate_message_id(spam, Some("Spam")).await.unwrap().body.as_deref(), Some("hello"));
         let row = store.message_by_marker(room, "sid-1").await.unwrap().unwrap();
         assert!(row.retracted && row.moderated);
         assert_eq!(row.moderation_reason.as_deref(), Some("Spam"));
@@ -1595,9 +1853,9 @@ mod sender_auth_tests {
         assert_eq!(rows(room).await, vec![("bob".into(), Some("admin".into()))]);
         // Offline: a JID row is added, then dropped on ban.
         store.set_muc_affiliation_by_jid(room, "carl@x", "member").await.unwrap();
-        assert!(rows(room).await.contains(&("carl@x".into(), Some("member".into()))));
+        assert!(rows(room).await.contains(&(super::member_placeholder("carl@x"), Some("member".into()))));
         store.set_muc_affiliation_by_jid(room, "carl@x", "outcast").await.unwrap();
-        assert!(!rows(room).await.iter().any(|(n, _)| n == "carl@x"));
+        assert!(!rows(room).await.iter().any(|(n, _)| n.ends_with("carl@x")));
         // Public (anonymous) room: no offline roster rows at all.
         let public = store.conversation_id(acc, "pub@muc.example.org", "muc").await.unwrap();
         store.set_muc_affiliation_by_jid(public, "dan@x", "member").await.unwrap();
@@ -1647,5 +1905,139 @@ mod sender_auth_tests {
         assert!(store.mark_outgoing_state(bob, "out1", "displayed").await.unwrap());
         // No downgrade from displayed to received.
         assert!(!store.mark_outgoing_state(bob, "out1", "received").await.unwrap());
+    }
+
+    /// Another occupant can't hide a message by storing one under its origin-id first.
+    #[tokio::test]
+    async fn origin_id_dedup_is_per_sender() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        let from = |nick: &str, occ: Option<&str>| NewMessage {
+            counterpart: format!("room@muc.example.org/{nick}"),
+            ..msg(room, "same-origin", Direction::In, occ)
+        };
+        assert!(store.insert_message(&from("mallory", Some("occ-m"))).await.unwrap().is_some());
+        // the real message (other occupant id) is stored, not dropped as a duplicate
+        assert!(store.insert_message(&from("alice", Some("occ-a"))).await.unwrap().is_some());
+        // without occupant ids the occupant address decides
+        assert!(store.insert_message(&from("bob", None)).await.unwrap().is_some());
+        // the same message again (e.g. live + MAM) still is a duplicate
+        assert!(store.insert_message(&from("alice", Some("occ-a"))).await.unwrap().is_none());
+        assert!(store.insert_message(&from("bob", None)).await.unwrap().is_none());
+        // in a 1:1 chat only the peer writes: any incoming copy is the same message
+        let chat = store.conversation_id(acc, "peer@example.org", "chat").await.unwrap();
+        let a = NewMessage { counterpart: "peer@example.org/phone".into(), ..msg(chat, "o1", Direction::In, None) };
+        let b = NewMessage { counterpart: "peer@example.org/laptop".into(), ..msg(chat, "o1", Direction::In, None) };
+        assert!(store.insert_message(&a).await.unwrap().is_some());
+        assert!(store.insert_message(&b).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn media_url_in_use_ignores_retracted_rows() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let a = store.conversation_id(acc, "a@example.org", "chat").await.unwrap();
+        let b = store.conversation_id(acc, "b@example.org", "chat").await.unwrap();
+        let url = "https://up.example.org/x/cat.jpg";
+        let ma = store
+            .insert_message(&NewMessage { body: Some(url.into()), ..msg(a, "m1", Direction::In, None) })
+            .await
+            .unwrap()
+            .unwrap();
+        let mb = store
+            .insert_message(&NewMessage { body: Some("caption".into()), ..msg(b, "m2", Direction::In, None) })
+            .await
+            .unwrap()
+            .unwrap();
+        store.set_attachment(mb, &format!(r#"{{"url":"{url}","mime":"image/jpeg"}}"#)).await.unwrap();
+        store.retract_message_id(ma).await.unwrap();
+        // still used by the other chat's attachment
+        assert!(store.media_url_in_use(url).await.unwrap());
+        let gone = store.retract_message_id(mb).await.unwrap();
+        assert!(gone.attachment.as_deref().unwrap().contains(url));
+        assert!(!store.media_url_in_use(url).await.unwrap());
+    }
+
+    /// A conversation created by an incoming stanza is hidden until it holds a message.
+    #[tokio::test]
+    async fn incoming_conversation_is_pending_until_a_message() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let conv = store.conversation_id_incoming(acc, "stranger@example.org", "chat").await.unwrap();
+        assert!(store.conversations(acc).await.unwrap().is_empty());
+        store.insert_message(&msg(conv, "m1", Direction::In, None)).await.unwrap();
+        assert_eq!(store.conversations(acc).await.unwrap().len(), 1);
+        // opening a chat ourselves shows it right away
+        let other = store.conversation_id_incoming(acc, "other@example.org", "chat").await.unwrap();
+        assert_eq!(store.conversation_id(acc, "other@example.org", "chat").await.unwrap(), other);
+        assert_eq!(store.conversations(acc).await.unwrap().len(), 2);
+    }
+
+    /// An occupant whose nick is a member's bare JID doesn't touch that member's row.
+    #[tokio::test]
+    async fn nick_cannot_take_over_an_offline_member() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        store.upsert_muc_offline_member(room, "alice@example.org", Some("member")).await.unwrap();
+        store
+            .upsert_muc_occupant(room, "alice@example.org", Some("mallory@example.org"), Some("none"))
+            .await
+            .unwrap();
+        store.remove_muc_occupant(room, "alice@example.org").await.unwrap();
+        let members = store.muc_member_jids(room, "me@example.org").await.unwrap();
+        assert_eq!(members, vec!["alice@example.org".to_string()]);
+        assert_eq!(store.muc_occupant_real_jid(room, "alice@example.org").await.unwrap(), None);
+        // nicks shaped like the placeholder key are refused outright
+        store
+            .upsert_muc_occupant(room, &super::member_placeholder("alice@example.org"), Some("mallory@example.org"), None)
+            .await
+            .unwrap();
+        assert_eq!(store.muc_member_jids(room, "me@example.org").await.unwrap(), vec!["alice@example.org".to_string()]);
+    }
+
+    /// A correction's room stanza-id leads to the message, and moderation targets all versions.
+    #[tokio::test]
+    async fn correction_stanza_ids_are_versions_of_the_message() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        let mid = store
+            .insert_message(&NewMessage { stanza_id: Some("s-orig".into()), ..msg(room, "o1", Direction::In, Some("occ")) })
+            .await
+            .unwrap()
+            .unwrap();
+        store.add_message_version(mid, "s-edit").await.unwrap();
+        assert_eq!(store.find_by_stanza_id(room, "s-edit").await.unwrap(), Some(mid));
+        assert_eq!(store.message_stanza_ids(mid).await.unwrap(), vec!["s-orig".to_string(), "s-edit".to_string()]);
+    }
+
+    /// Joining a room whose JID had only sent us a bodyless stanza makes it visible.
+    #[tokio::test]
+    async fn joining_clears_pending() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        store.conversation_id_incoming(acc, "room@muc.example.org", "chat").await.unwrap();
+        assert!(store.conversations(acc).await.unwrap().is_empty());
+        store.upsert_muc(acc, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        let list = store.conversations(acc).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].kind, "muc");
+    }
+
+    /// An unproven archive copy of our own room message (incoming, from our nick) is not shown
+    /// a second time; the same origin-id from someone else is a message of its own.
+    #[tokio::test]
+    async fn own_room_echo_from_the_archive_is_a_duplicate() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.upsert_muc(acc, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        let ours = NewMessage { counterpart: "room@muc.example.org".into(), ..msg(room, "o1", Direction::Out, None) };
+        assert!(store.insert_message(&ours).await.unwrap().is_some());
+        let echo = NewMessage { counterpart: "room@muc.example.org/me".into(), ..msg(room, "o1", Direction::In, None) };
+        assert!(store.insert_message(&echo).await.unwrap().is_none());
+        let other = NewMessage { counterpart: "room@muc.example.org/eve".into(), ..msg(room, "o1", Direction::In, None) };
+        assert!(store.insert_message(&other).await.unwrap().is_some());
     }
 }

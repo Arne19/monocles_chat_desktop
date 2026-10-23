@@ -204,8 +204,22 @@ struct Endpoint {
     weight: u16,
 }
 
+/// The JID domain as an IP address, if it is an IP literal: IPv4 bare, IPv6 in brackets
+/// (`[::1]`, as the jid crate keeps it).
+fn ip_literal(domain: &str) -> Option<IpAddr> {
+    let bare = domain.strip_prefix('[').and_then(|d| d.strip_suffix(']')).unwrap_or(domain);
+    bare.parse::<IpAddr>().ok()
+}
+
 async fn endpoints(dns: &Resolvers, domain: &str) -> Vec<Endpoint> {
     let mut out = Vec::new();
+    // An IP-literal domain has no SRV records; asking would only leak the address to DNS.
+    if let Some(ip) = ip_literal(domain) {
+        for (port, direct_tls) in [(5223, true), (5222, false)] {
+            out.push(Endpoint { host: ip.to_string(), port, direct_tls, name_secure: true, priority: 0, weight: 0 });
+        }
+        return out;
+    }
     for (service, direct_tls) in [("_xmpps-client", true), ("_xmpp-client", false)] {
         let (records, validation) = lookup(dns, &format!("{service}._tcp.{domain}."), RecordType::SRV).await;
         let secure = validation == Validation::Secure;
@@ -495,10 +509,9 @@ fn tls_config(policy: TlsPolicy, verifier: DaneVerifier) -> Result<rustls::Clien
 }
 
 fn pkix_verifier() -> Result<Arc<WebPkiServerVerifier>, Error> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Mozilla bundle minus the refused roots (see tls_roots).
     WebPkiServerVerifier::builder_with_provider(
-        Arc::new(roots),
+        crate::tls_roots::xmpp_roots(),
         Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
     )
     .build()
@@ -570,7 +583,11 @@ impl SecureConnector {
             .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")))??;
         let tcp = if endpoint.direct_tls { tcp } else { starttls(tcp, domain, ns, timeouts).await? };
         // The certificate must be valid for the JID domain (RFC 6120 §13.7.2.1), and SNI names it.
-        let server_name = ServerName::try_from(domain.to_string())
+        // An IP-literal domain is checked against the certificate's IP SANs (IPv6 unbracketed).
+        let server_name = match ip_literal(domain) {
+            Some(ip) => Ok(ServerName::IpAddress(ip.into())),
+            None => ServerName::try_from(domain.to_string()),
+        }
             .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
         let tls = connector.connect(server_name, tcp).await?;
 
@@ -625,6 +642,15 @@ impl ServerConnector for SecureConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_literal_domains() {
+        assert_eq!(ip_literal("192.0.2.1"), Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(ip_literal("[2001:db8::1]"), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(ip_literal("2001:db8::1"), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(ip_literal("example.org"), None);
+        assert_eq!(ip_literal("[example.org]"), None);
+    }
 
     fn record(usage: CertUsage, selector: Selector, matching: Matching, data: Vec<u8>) -> TLSA {
         TLSA::new(usage, selector, matching, data)

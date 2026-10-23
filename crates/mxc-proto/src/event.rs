@@ -128,7 +128,14 @@ pub enum Event {
 
     /// XEP-0424: a message was retracted (tombstoned). `body` is what it contained before,
     /// so the UI can delete any media-cache file downloaded for it.
-    MessageRetracted { account_id: i64, conversation_id: i64, message_id: i64, body: Option<String> },
+    /// `body` / `attachment` are what the message held before (for dropping cached media).
+    MessageRetracted {
+        account_id: i64,
+        conversation_id: i64,
+        message_id: i64,
+        body: Option<String>,
+        attachment: Option<String>,
+    },
 
     /// XEP-0444: reaction tallies for a message changed.
     /// An outgoing message couldn't be sent; the UI restores the text + warns.
@@ -168,7 +175,8 @@ pub enum Event {
     /// A room's OMEMO capability (private + non-anonymous) and XEP-0425 moderation support,
     /// discovered on join. The UI uses them to enable/disable the encryption lock and the
     /// "Moderate…" message action for the open room.
-    MucPrivacy { account_id: i64, room: String, omemo_capable: bool, moderation: bool },
+    /// `occupant_id`: the room stamps XEP-0421 occupant ids (corrections are only offered then).
+    MucPrivacy { account_id: i64, room: String, omemo_capable: bool, moderation: bool, occupant_id: bool },
 
     /// A room's affiliation lists (owner/admin/member/outcast — offline members and bans
     /// included, ourselves excluded) as (bare JID, affiliation), fetched on request.
