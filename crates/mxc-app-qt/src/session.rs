@@ -1661,13 +1661,17 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
         {
             let qt = qt.clone();
             runtime().spawn(async move {
-                let policy = match crate::session::store().await {
-                    Ok(s) => mxc_proto::connect::TlsPolicy::load(&s).await,
-                    Err(_) => mxc_proto::connect::TlsPolicy::default(),
+                let (policy, dot) = match crate::session::store().await {
+                    Ok(s) => (
+                        mxc_proto::connect::TlsPolicy::load(&s).await,
+                        mxc_proto::connect::dns_over_tls_server(&s).await,
+                    ),
+                    Err(_) => (mxc_proto::connect::TlsPolicy::default(), None),
                 };
                 let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                     backend.as_mut().set_require_tls13(policy.require_tls13);
                     backend.as_mut().set_enforce_dane(policy.enforce_dane);
+                    backend.as_mut().set_dns_server_dot(QString::from(&dot.unwrap_or_default()));
                 });
             });
         }
@@ -2387,6 +2391,14 @@ pub fn set_flag_setting(key: &'static str, value: bool) {
     runtime().spawn(async move {
         let Ok(store) = store().await else { return };
         let _ = store.set_setting(key, if value { "1" } else { "0" }).await;
+    });
+}
+
+/// Persist a text setting (e.g. the DNS-over-TLS server; "" = unset).
+pub fn set_text_setting(key: &'static str, value: String) {
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let _ = store.set_setting(key, &value).await;
     });
 }
 

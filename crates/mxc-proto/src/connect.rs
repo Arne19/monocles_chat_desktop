@@ -14,6 +14,10 @@
 //!   *and* any CNAME/DNAME that led to them. Otherwise an unsigned (forged) CNAME could point
 //!   into a zone the attacker signs themselves.
 //! * **TLS 1.3 only** when "Require TLS 1.3" is on (the default), else TLS 1.2 or 1.3.
+//! * **Name servers**: every system name server validates on its own, and the first secure
+//!   answer wins, so a resolver that strips DNSSEC data next to a good one doesn't cost DNSSEC
+//!   or DANE (it would turn a signed zone's answers bogus). With a **DNS-over-TLS** server set,
+//!   only that server is used, and only over TLS - no fallback to the system's name servers.
 //!
 //! tokio-xmpp's own connectors build their rustls configuration internally, so none of this can
 //! be added to them; this replaces them (direct TLS first, STARTTLS as fallback, like before).
@@ -22,13 +26,16 @@ use std::borrow::Cow;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use hickory_resolver::proto::rr::rdata::tlsa::{CertUsage, Matching, Selector, TLSA};
 use hickory_resolver::net::{DnsError, NetError};
-use hickory_resolver::proto::rr::{RData, Record, RecordType};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 use hickory_resolver::TokioResolver;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
@@ -50,6 +57,8 @@ use tokio_xmpp::Error;
 /// `settings` keys (app-wide, read on every connection attempt).
 pub const SETTING_REQUIRE_TLS13: &str = "require_tls_v1_3";
 pub const SETTING_ENFORCE_DANE: &str = "enforce_dane";
+/// DNS-over-TLS server (hostname or IP); empty = the system's name servers.
+pub const SETTING_DNS_SERVER_DOT: &str = "dns_server_dot";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -93,17 +102,25 @@ pub struct SecureConnector {
     report: Arc<Mutex<LinkSecurity>>,
     /// Built on first use, inside the runtime that connects: hickory runs its connection tasks on
     /// the runtime it was created in, and every login runs its core on a fresh runtime - a
-    /// process-wide resolver would outlive it and hang the next login.
-    dns: Arc<OnceLock<Resolvers>>,
+    /// process-wide resolver would outlive it and hang the next login. Rebuilt when the
+    /// DNS-over-TLS setting changes.
+    dns: Arc<Mutex<Option<Arc<Resolvers>>>>,
 }
 
 impl SecureConnector {
     pub fn new(store: mxc_store::Store, report: Arc<Mutex<LinkSecurity>>) -> Self {
-        Self { store, report, dns: Arc::new(OnceLock::new()) }
+        Self { store, report, dns: Arc::new(Mutex::new(None)) }
     }
 
-    fn resolvers(&self) -> &Resolvers {
-        self.dns.get_or_init(Resolvers::new)
+    async fn resolvers(&self) -> Arc<Resolvers> {
+        let dot = dns_over_tls_server(&self.store).await;
+        let cached = self.dns.lock().unwrap().clone();
+        if let Some(dns) = cached.filter(|dns| dns.dot == dot) {
+            return dns;
+        }
+        let fresh = Arc::new(Resolvers::new(dot).await);
+        *self.dns.lock().unwrap() = Some(fresh.clone());
+        fresh
     }
 }
 
@@ -116,29 +133,159 @@ impl fmt::Debug for SecureConnector {
 // ---------------------------------------------------------------------------------------------
 // DNS
 
+/// The DNS-over-TLS server from the settings (see [`normalize_dot_server`]), or `None`.
+pub async fn dns_over_tls_server(store: &mxc_store::Store) -> Option<String> {
+    store.setting(SETTING_DNS_SERVER_DOT).await.ok().flatten().and_then(|v| normalize_dot_server(&v))
+}
+
+/// A DNS-over-TLS server as entered: a trimmed IP literal, or an ASCII hostname with at least
+/// one dot. `None` for anything else, empty included (= not configured). Same rules as
+/// Android's `DnsOverTls.normalize`.
+pub fn normalize_dot_server(input: &str) -> Option<String> {
+    let value = input.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return Some(value.to_string());
+    }
+    if !value.contains('.') || value.starts_with('.') || value.ends_with('.') || value.contains("..") {
+        return None;
+    }
+    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return None;
+    }
+    Name::from_ascii(value).ok()?;
+    Some(value.to_string())
+}
+
+/// How long a name server that gave a bogus answer (e.g. one that strips DNSSEC data) is asked
+/// last, and how long one that didn't answer at all is. Failures count only briefly, so a good
+/// server that timed out once is not skipped for long; an error rcode (e.g. SERVFAIL for a broken
+/// zone) says nothing about the server and doesn't count. As on Android.
+const BOGUS_MARK: Duration = Duration::from_secs(10 * 60);
+const FAILED_MARK: Duration = Duration::from_secs(60);
+
 struct Resolvers {
-    validating: TokioResolver,
-    plain: TokioResolver,
+    /// One validating resolver per name server, in configuration order (see [`lookup`]).
+    servers: Vec<(IpAddr, TokioResolver)>,
+    /// All name servers, without validation, for the Android-like plain-DNS fallback.
+    plain: Option<TokioResolver>,
+    /// The DNS-over-TLS server these resolvers use, `None` for the system's name servers.
+    dot: Option<String>,
+    marks: Mutex<Marks>,
 }
 
 impl Resolvers {
-    fn new() -> Self {
-        let builder = || {
-            TokioResolver::builder_tokio().unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "no system DNS configuration, using defaults");
-                TokioResolver::builder_with_config(
-                    hickory_resolver::config::ResolverConfig::default(),
-                    hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
-                )
-            })
+    /// With `dot`, only that DNS-over-TLS server is used - no fallback to the system's name
+    /// servers, so blocking port 853 can't downgrade to a resolver that strips DNSSEC. Its
+    /// addresses come from the system resolver; the TLS handshake authenticates the server.
+    async fn new(dot: Option<String>) -> Self {
+        let (config, options, tls) = match &dot {
+            Some(host) => (dot_config(host).await, ResolverOpts::default(), Some(dot_tls_config())),
+            None => {
+                let (config, options) = hickory_resolver::system_conf::read_system_conf().unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "no system DNS configuration, using defaults");
+                    (ResolverConfig::default(), ResolverOpts::default())
+                });
+                (config, options, None)
+            }
         };
-        let mut validating = builder();
-        validating.options_mut().validate = true;
-        validating.options_mut().edns0 = true;
-        Resolvers {
-            validating: validating.build().expect("validating resolver"),
-            plain: builder().build().expect("resolver"),
+        let (domain, search, name_servers) = config.into_parts();
+        // One entry per address: resolv.conf-style configurations may list UDP and TCP separately.
+        let mut by_ip: Vec<NameServerConfig> = Vec::new();
+        for ns in name_servers {
+            match by_ip.iter_mut().find(|known| known.ip == ns.ip) {
+                Some(known) => known.connections.extend(ns.connections),
+                None => by_ip.push(ns),
+            }
         }
+        let build = |name_servers: Vec<NameServerConfig>, validate: bool| -> Option<TokioResolver> {
+            let config = ResolverConfig::from_parts(domain.clone(), search.clone(), name_servers);
+            let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+                .with_options(options.clone());
+            if let Some(tls) = &tls {
+                builder = builder.with_tls_config(tls.clone());
+            }
+            if validate {
+                builder.options_mut().validate = true;
+                builder.options_mut().edns0 = true;
+            }
+            builder.build().map_err(|e| tracing::warn!(error = %e, "unable to build a DNS resolver")).ok()
+        };
+        let servers = by_ip.iter().filter_map(|ns| Some((ns.ip, build(vec![ns.clone()], true)?))).collect();
+        let plain = if by_ip.is_empty() { None } else { build(by_ip, false) };
+        Resolvers { servers, plain, dot, marks: Mutex::new(Marks::default()) }
+    }
+}
+
+/// The name servers of a DNS-over-TLS server (port 853, authenticated as `host`).
+async fn dot_config(host: &str) -> ResolverConfig {
+    let ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => match tokio::net::lookup_host((host, 853)).await {
+            Ok(addresses) => {
+                let mut ips = Vec::new();
+                for ip in addresses.map(|a| a.ip()) {
+                    if !ips.contains(&ip) {
+                        ips.push(ip);
+                    }
+                }
+                ips
+            }
+            Err(e) => {
+                // No addresses means no DNS at all (fail closed), never the system's name servers.
+                tracing::warn!(%host, error = %e, "unable to resolve the DNS-over-TLS server");
+                Vec::new()
+            }
+        },
+    };
+    let name: Arc<str> = Arc::from(host);
+    ResolverConfig::from_parts(None, vec![], ips.into_iter().map(|ip| NameServerConfig::tls(ip, name.clone())).collect())
+}
+
+/// TLS for DNS-over-TLS: the same root store as XMPP (Mozilla bundle minus the refused roots),
+/// TLS 1.2 or 1.3. rustls checks the certificate against the configured host (or IP).
+fn dot_tls_config() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("TLS 1.2 and 1.3 are supported")
+        .with_root_certificates(crate::tls_roots::xmpp_roots())
+        .with_no_client_auth()
+}
+
+/// Name servers to ask last, each until the given time.
+#[derive(Default)]
+struct Marks(HashMap<IpAddr, Instant>);
+
+impl Marks {
+    /// Never shortens an existing mark: a bogus answer outweighs a later timeout.
+    fn mark(&mut self, ip: IpAddr, duration: Duration, now: Instant) {
+        let until = now + duration;
+        self.0.entry(ip).and_modify(|known| *known = (*known).max(until)).or_insert(until);
+    }
+
+    fn unmark(&mut self, ip: IpAddr) {
+        self.0.remove(&ip);
+    }
+
+    fn is_marked(&mut self, ip: IpAddr, now: Instant) -> bool {
+        match self.0.get(&ip) {
+            Some(until) if *until > now => true,
+            Some(_) => {
+                self.0.remove(&ip);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Unmarked servers first, then the marked ones, each in the given order.
+    fn order(&mut self, servers: &[IpAddr], now: Instant) -> Vec<IpAddr> {
+        let (mut first, last): (Vec<IpAddr>, Vec<IpAddr>) =
+            servers.iter().partition(|ip| !self.is_marked(**ip, now));
+        first.extend(last);
+        first
     }
 }
 
@@ -167,29 +314,110 @@ fn chain_validation(answers: &[Record], rtype: RecordType) -> Validation {
     }
 }
 
-/// Records of `rtype` at `name` and the DNSSEC state of the answer.
-async fn lookup(dns: &Resolvers, name: &str, rtype: RecordType) -> (Vec<Record>, Validation) {
-    let pick = |answers: &[Record]| -> Vec<Record> {
-        answers.iter().filter(|r| r.record_type() == rtype).cloned().collect()
-    };
-    match dns.validating.lookup(name, rtype).await {
-        Ok(found) => (pick(found.answers()), chain_validation(found.answers(), rtype)),
-        Err(e) if e.is_no_records_found() => (Vec::new(), Validation::Insecure),
+/// What one name server's validating lookup gave.
+#[derive(Debug)]
+enum Outcome {
+    Answer(Vec<Record>, Validation),
+    /// No usable answer; `network` if it didn't answer at all (timeout, connection error).
+    Failed { network: bool },
+}
+
+async fn query_validating(resolver: &TokioResolver, name: &str, rtype: RecordType) -> Outcome {
+    match resolver.lookup(name, rtype).await {
+        Ok(found) => Outcome::Answer(
+            found.answers().iter().filter(|r| r.record_type() == rtype).cloned().collect(),
+            chain_validation(found.answers(), rtype),
+        ),
+        Err(e) if e.is_no_records_found() => Outcome::Answer(Vec::new(), Validation::Insecure),
         Err(NetError::Dns(DnsError::Nsec { proof, .. })) if proof.is_bogus() => {
             // A denial of existence that failed validation: the records may well exist and be
             // suppressed by an attacker. Callers decide what that means (see `tlsa_records`).
             tracing::debug!(%name, ?rtype, "DNSSEC: bogus denial of existence");
-            (Vec::new(), Validation::Bogus)
+            Outcome::Answer(Vec::new(), Validation::Bogus)
         }
         Err(e) => {
-            // As on Android: a failed validation (or a resolver that strips DNSSEC data) falls
-            // back to plain DNS - the endpoint then just isn't verified.
-            tracing::debug!(%name, ?rtype, error = %e, "DNSSEC lookup failed, retrying without validation");
-            match dns.plain.lookup(name, rtype).await {
-                Ok(found) => (pick(found.answers()), Validation::Insecure),
-                Err(_) => (Vec::new(), Validation::Insecure),
+            let network = matches!(e, NetError::Timeout | NetError::Io(_) | NetError::NoConnections | NetError::Busy);
+            tracing::debug!(%name, ?rtype, error = %e, network, "DNSSEC lookup failed");
+            Outcome::Failed { network }
+        }
+    }
+}
+
+/// Ask the name servers one after another until one gives a final answer: `Secure`, or
+/// `Insecure` (hickory reports that only for a zone proven unsigned, which a resolver that
+/// strips DNSSEC data can't fake). A `Bogus` answer - typically a resolver stripping the
+/// signatures of a signed zone - is kept, and the next server is asked; servers known to give
+/// bogus answers are skipped once one is at hand. A bogus answer is never turned into an
+/// insecure one by a server that fails. `None` if no server answered.
+///
+/// A server is marked bogus only when another one validated the same query: a zone that is
+/// bogus on every server (forged, or broken) says nothing about the servers. Marking them anyway
+/// would make the next lookups skip the good server, so after a rejected bogus TLSA answer a
+/// reconnect could get an unverified SRV answer from a stripping resolver and no DANE at all.
+async fn select<F, Fut>(servers: &[IpAddr], marks: &Mutex<Marks>, mut query: F) -> Option<(Vec<Record>, Validation)>
+where
+    F: FnMut(IpAddr) -> Fut,
+    Fut: std::future::Future<Output = Outcome>,
+{
+    let order = marks.lock().unwrap().order(servers, Instant::now());
+    let mut bogus = None;
+    let mut bogus_servers = Vec::new();
+    for ip in order {
+        if bogus.is_some() && marks.lock().unwrap().is_marked(ip, Instant::now()) {
+            continue;
+        }
+        match query(ip).await {
+            Outcome::Answer(records, Validation::Bogus) => {
+                tracing::debug!(%ip, "DNSSEC: bogus answer, asking the next name server");
+                bogus_servers.push(ip);
+                bogus.get_or_insert(records);
+            }
+            Outcome::Answer(records, validation) => {
+                if validation == Validation::Secure {
+                    let mut marks = marks.lock().unwrap();
+                    marks.unmark(ip);
+                    for bad in bogus_servers {
+                        tracing::warn!(%bad, good = %ip, "DNSSEC: a name server gave a bogus answer that another one validated; it may strip DNSSEC data");
+                        marks.mark(bad, BOGUS_MARK, Instant::now());
+                    }
+                }
+                return Some((records, validation));
+            }
+            Outcome::Failed { network } => {
+                if network {
+                    marks.lock().unwrap().mark(ip, FAILED_MARK, Instant::now());
+                }
             }
         }
+    }
+    bogus.map(|records| (records, Validation::Bogus))
+}
+
+/// Records of `rtype` at `name` and the DNSSEC state of the answer.
+async fn lookup(dns: &Resolvers, name: &str, rtype: RecordType) -> (Vec<Record>, Validation) {
+    let ips: Vec<IpAddr> = dns.servers.iter().map(|(ip, _)| *ip).collect();
+    let answer = select(&ips, &dns.marks, |ip| async move {
+        match dns.servers.iter().find(|(known, _)| *known == ip) {
+            Some((_, resolver)) => query_validating(resolver, name, rtype).await,
+            None => Outcome::Failed { network: false },
+        }
+    })
+    .await;
+    if let Some(answer) = answer {
+        return answer;
+    }
+    // As on Android: when no validating lookup worked, fall back to plain DNS - the endpoint
+    // then just isn't verified. With DNS-over-TLS this goes to the same server.
+    tracing::debug!(%name, ?rtype, "DNSSEC lookups failed, retrying without validation");
+    let Some(plain) = &dns.plain else {
+        return (Vec::new(), Validation::Insecure);
+    };
+    match plain.lookup(name, rtype).await {
+        Ok(found) => (
+            found.answers().iter().filter(|r| r.record_type() == rtype).cloned().collect(),
+            Validation::Insecure,
+        ),
+        Err(_) => (Vec::new(), Validation::Insecure),
     }
 }
 
@@ -300,7 +528,8 @@ async fn tlsa_records(dns: &Resolvers, host: &str, port: u16) -> Tlsa {
     // validation cache - and so the bogus verdict - in place.
     let retry = || {
         let name = &name;
-        async move { lookup(&Resolvers::new(), name, RecordType::TLSA).await }
+        let dot = dns.dot.clone();
+        async move { lookup(&Resolvers::new(dot).await, name, RecordType::TLSA).await }
     };
     settle_tlsa(host, port, first, retry).await
 }
@@ -559,6 +788,7 @@ impl SecureConnector {
     #[allow(clippy::too_many_arguments)]
     async fn try_endpoint(
         &self,
+        dns: &Resolvers,
         endpoint: &Endpoint,
         addr: IpAddr,
         dnssec: bool,
@@ -570,7 +800,7 @@ impl SecureConnector {
         let domain = jid.domain().as_str();
         // DANE only for a DNSSEC-verified endpoint named by host (RFC 7673).
         let tlsa = if dnssec && endpoint.host.parse::<IpAddr>().is_err() {
-            tlsa_records(self.resolvers(), &endpoint.host, endpoint.port).await
+            tlsa_records(dns, &endpoint.host, endpoint.port).await
         } else {
             Tlsa::Unavailable
         };
@@ -620,11 +850,12 @@ impl ServerConnector for SecureConnector {
         let policy = TlsPolicy::load(&self.store).await;
         let domain = jid.domain().as_str();
         let mut last_error = None;
-        for endpoint in endpoints(self.resolvers(), domain).await {
-            let (ips, addresses_secure) = addresses(self.resolvers(), &endpoint.host).await;
+        let dns = self.resolvers().await;
+        for endpoint in endpoints(&dns, domain).await {
+            let (ips, addresses_secure) = addresses(&dns, &endpoint.host).await;
             let dnssec = endpoint.name_secure && addresses_secure;
             for ip in ips {
-                match self.try_endpoint(&endpoint, ip, dnssec, policy, jid, ns, timeouts).await {
+                match self.try_endpoint(&dns, &endpoint, ip, dnssec, policy, jid, ns, timeouts).await {
                     Ok(connected) => return Ok(connected),
                     Err(e) => {
                         tracing::warn!(host = %endpoint.host, port = endpoint.port, %ip, error = %e, "connection attempt failed");
@@ -863,6 +1094,153 @@ mod tests {
     }
 
     #[test]
+    fn dot_server_input_rules_match_android() {
+        assert_eq!(normalize_dot_server("dns.quad9.net").as_deref(), Some("dns.quad9.net"));
+        assert_eq!(normalize_dot_server("  dns.quad9.net \n").as_deref(), Some("dns.quad9.net"));
+        assert_eq!(normalize_dot_server("9.9.9.9").as_deref(), Some("9.9.9.9"));
+        assert_eq!(normalize_dot_server("2620:fe::fe").as_deref(), Some("2620:fe::fe"));
+        for invalid in [
+            "", "   ", "localhost", "dns quad9.net", "https://dns.quad9.net", "dns.quad9.net:853",
+            ".quad9.net", "dns.quad9.net.", "dns..quad9.net", "dns.bücher.de",
+        ] {
+            assert_eq!(normalize_dot_server(invalid), None, "{invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dot_server_is_read_from_the_store() {
+        let store = mxc_store::Store::open_in_memory().await.unwrap();
+        assert_eq!(dns_over_tls_server(&store).await, None);
+        store.set_setting(SETTING_DNS_SERVER_DOT, " dns.quad9.net ").await.unwrap();
+        assert_eq!(dns_over_tls_server(&store).await.as_deref(), Some("dns.quad9.net"));
+        store.set_setting(SETTING_DNS_SERVER_DOT, "not a server").await.unwrap();
+        assert_eq!(dns_over_tls_server(&store).await, None);
+    }
+
+    #[test]
+    fn marks_order_and_expire() {
+        let (a, b, c): (IpAddr, IpAddr, IpAddr) =
+            ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap(), "192.0.2.3".parse().unwrap());
+        let now = Instant::now();
+        let mut marks = Marks::default();
+        marks.mark(a, FAILED_MARK, now);
+        assert_eq!(marks.order(&[a, b, c], now), vec![b, c, a]);
+        // a later, shorter mark never shortens a longer one
+        marks.mark(b, BOGUS_MARK, now);
+        marks.mark(b, FAILED_MARK, now);
+        assert!(marks.is_marked(b, now + FAILED_MARK + Duration::from_secs(1)));
+        // expired
+        assert!(!marks.is_marked(a, now + FAILED_MARK));
+        marks.unmark(b);
+        assert_eq!(marks.order(&[a, b, c], now), vec![a, b, c]);
+    }
+
+    /// Runs `select` over fake name servers; returns the answer and how often each was asked.
+    async fn run_select(
+        marks: &Mutex<Marks>,
+        servers: &[(IpAddr, Outcome)],
+    ) -> (Option<Validation>, HashMap<IpAddr, usize>) {
+        let asked = Mutex::new(HashMap::new());
+        let ips: Vec<IpAddr> = servers.iter().map(|(ip, _)| *ip).collect();
+        let answer = select(&ips, marks, |ip| {
+            *asked.lock().unwrap().entry(ip).or_insert(0) += 1;
+            let outcome = match &servers.iter().find(|(known, _)| *known == ip).unwrap().1 {
+                Outcome::Answer(records, validation) => Outcome::Answer(records.clone(), *validation),
+                Outcome::Failed { network } => Outcome::Failed { network: *network },
+            };
+            async move { outcome }
+        })
+        .await;
+        (answer.map(|(_, validation)| validation), asked.into_inner().unwrap())
+    }
+
+    fn ips() -> (IpAddr, IpAddr) {
+        ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_strips_dnssec_does_not_cost_dane() {
+        use Validation::*;
+        let (stripping, good) = ips();
+        let marks = Mutex::new(Marks::default());
+        let servers = [(stripping, Outcome::Answer(vec![], Bogus)), (good, Outcome::Answer(vec![], Secure))];
+        assert_eq!(run_select(&marks, &servers).await.0, Some(Secure));
+        // afterwards the good one is asked first
+        let (validation, asked) = run_select(&marks, &servers).await;
+        assert_eq!(validation, Some(Secure));
+        assert_eq!(asked.get(&stripping), None);
+    }
+
+    #[tokio::test]
+    async fn bogus_stays_bogus_and_a_proven_insecure_zone_is_final() {
+        use Validation::*;
+        let (first, second) = ips();
+        let marks = Mutex::new(Marks::default());
+        // every server bogus (or failing): bogus, never downgraded to "DANE does not apply"
+        let servers = [(first, Outcome::Answer(vec![], Bogus)), (second, Outcome::Failed { network: true })];
+        assert_eq!(run_select(&marks, &servers).await.0, Some(Bogus));
+        // an unsigned zone: the first insecure answer is final and marks nobody
+        let marks = Mutex::new(Marks::default());
+        let servers = [(first, Outcome::Answer(vec![], Insecure)), (second, Outcome::Answer(vec![], Secure))];
+        let (validation, asked) = run_select(&marks, &servers).await;
+        assert_eq!(validation, Some(Insecure));
+        assert_eq!(asked.get(&second), None);
+        assert_eq!(marks.lock().unwrap().order(&[first, second], Instant::now()), vec![first, second]);
+        // nothing answered at all: the caller falls back to plain DNS
+        let marks = Mutex::new(Marks::default());
+        let servers = [(first, Outcome::Failed { network: true }), (second, Outcome::Failed { network: false })];
+        assert_eq!(run_select(&marks, &servers).await.0, None);
+    }
+
+    #[tokio::test]
+    async fn a_dead_resolver_is_asked_last_but_a_servfail_marks_nothing() {
+        use Validation::*;
+        let (first, second) = ips();
+        let marks = Mutex::new(Marks::default());
+        let servers = [(first, Outcome::Failed { network: true }), (second, Outcome::Answer(vec![], Secure))];
+        run_select(&marks, &servers).await;
+        let (_, asked) = run_select(&marks, &servers).await;
+        assert_eq!(asked.get(&first), None, "the dead server costs a timeout only once");
+        // an error rcode (not a network failure) doesn't demote the server
+        let marks = Mutex::new(Marks::default());
+        let servers = [(first, Outcome::Failed { network: false }), (second, Outcome::Answer(vec![], Secure))];
+        run_select(&marks, &servers).await;
+        assert_eq!(marks.lock().unwrap().order(&[first, second], Instant::now()), vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn a_zone_that_is_bogus_everywhere_marks_nobody() {
+        use Validation::*;
+        let (stripping, good) = ips();
+        let marks = Mutex::new(Marks::default());
+        // e.g. a forged TLSA answer: bogus on every server, which says nothing about them
+        let servers = [(stripping, Outcome::Answer(vec![], Bogus)), (good, Outcome::Answer(vec![], Bogus))];
+        assert_eq!(run_select(&marks, &servers).await.0, Some(Bogus));
+        assert_eq!(marks.lock().unwrap().order(&[stripping, good], Instant::now()), vec![stripping, good]);
+        // so the next lookup (another zone) still reaches the good server
+        let servers = [(stripping, Outcome::Answer(vec![], Bogus)), (good, Outcome::Answer(vec![], Secure))];
+        let (validation, asked) = run_select(&marks, &servers).await;
+        assert_eq!(validation, Some(Secure));
+        assert_eq!(asked.get(&good), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn known_bogus_resolvers_are_skipped_once_a_bogus_answer_is_at_hand() {
+        use Validation::*;
+        let (stripping, good) = ips();
+        let marks = Mutex::new(Marks::default());
+        // the stripping server is confirmed bad by the good one
+        let servers = [(stripping, Outcome::Answer(vec![], Bogus)), (good, Outcome::Answer(vec![], Secure))];
+        run_select(&marks, &servers).await;
+        // a zone bogus everywhere: the good server's answer is enough, the known-bad one is skipped
+        let servers = [(stripping, Outcome::Answer(vec![], Bogus)), (good, Outcome::Answer(vec![], Bogus))];
+        let (validation, asked) = run_select(&marks, &servers).await;
+        assert_eq!(validation, Some(Bogus));
+        assert_eq!(asked.get(&stripping), None);
+        assert_eq!(asked.get(&good), Some(&1));
+    }
+
+    #[test]
     fn endpoint_order() {
         let e = |port, direct_tls, priority, weight| Endpoint {
             host: "h".into(), port, direct_tls, name_secure: false, priority, weight,
@@ -914,6 +1292,42 @@ mod tests {
         assert!(ok.is_err(), "enforced DANE must refuse a server without DANE");
         let (ok, sec) = connect("monocles.eu").await;
         assert!(ok.is_ok() && sec.dane, "enforced DANE still connects to a DANE server");
+    }
+
+    /// DNS-over-TLS (network; `--ignored live_`): DNSSEC and DANE through the DoT server, and
+    /// no fallback to the system's name servers when it can't be reached.
+    #[tokio::test]
+    #[ignore]
+    async fn live_dns_over_tls() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let store = mxc_store::Store::open_in_memory().await.unwrap();
+        let connect = |store: mxc_store::Store| async move {
+            let report = Arc::new(Mutex::new(LinkSecurity::default()));
+            let connector = SecureConnector::new(store, report.clone());
+            let jid: Jid = "probe@monocles.eu".parse().unwrap();
+            let result = connector.connect(&jid, xmpp_parsers::ns::JABBER_CLIENT, Timeouts::default()).await;
+            let ok = match result {
+                Ok((pending, _)) => pending.recv_features::<FallibleStreamElement>().await.is_ok(),
+                Err(e) => {
+                    println!("error: {e}");
+                    false
+                }
+            };
+            let security = report.lock().unwrap().clone();
+            (ok, security)
+        };
+        store.set_setting(SETTING_DNS_SERVER_DOT, "dns.quad9.net").await.unwrap();
+        let (ok, sec) = connect(store.clone()).await;
+        println!("DoT dns.quad9.net: {ok} {sec:?}");
+        assert!(ok && sec.dnssec && sec.dane);
+        // an IP literal is checked against the certificate's IP SANs
+        store.set_setting(SETTING_DNS_SERVER_DOT, "9.9.9.9").await.unwrap();
+        let (ok, sec) = connect(store.clone()).await;
+        println!("DoT 9.9.9.9: {ok} {sec:?}");
+        assert!(ok && sec.dnssec && sec.dane);
+        store.set_setting(SETTING_DNS_SERVER_DOT, "dot.invalid").await.unwrap();
+        let (ok, _) = connect(store.clone()).await;
+        assert!(!ok, "an unreachable DoT server must not fall back to the system's name servers");
     }
 
 

@@ -4480,6 +4480,8 @@ ApplicationWindow {
         anchors.centerIn: parent
         modal: true
         width: 380
+        // As tall as the content, but never taller than the window: the rest scrolls.
+        height: Math.min(window.height - 80, implicitHeight)
         standardButtons: Dialog.Close
         // Camera picker options: [{name, path}] with "Automatic" first. Refreshed each open so
         // newly (un)plugged cameras show up.
@@ -4498,158 +4500,198 @@ ApplicationWindow {
             }
             cameraCombo.currentIndex = sel
         }
-        contentItem: ColumnLayout {
-            spacing: 6
-            Label {
-                textFormat: Text.PlainText
-                text: qsTr("Chat background")
-                font.bold: true
-            }
-            // autoExclusive off: the visible state comes from the bound `checked`, and clicking
-            // sets the persisted mode (which re-evaluates all three) — exactly one stays on.
-            RadioButton {
-                autoExclusive: false
-                text: qsTr("Default monocles background")
-                checked: backend.chatBgMode === "default"
-                onClicked: backend.setChatBackgroundMode("default")
-            }
-            RadioButton {
-                autoExclusive: false
-                text: qsTr("None")
-                checked: backend.chatBgMode === "none"
-                onClicked: backend.setChatBackgroundMode("none")
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 8
+        contentItem: ScrollView {
+            clip: true
+            contentWidth: availableWidth
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ColumnLayout {
+                width: settingsDialog.availableWidth
+                spacing: 6
+                Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("Chat background")
+                    font.bold: true
+                }
+                // autoExclusive off: the visible state comes from the bound `checked`, and clicking
+                // sets the persisted mode (which re-evaluates all three) — exactly one stays on.
                 RadioButton {
                     autoExclusive: false
-                    text: qsTr("Custom image")
-                    checked: backend.chatBgMode === "custom"
-                    onClicked: {
-                        backend.setChatBackgroundMode("custom")
-                        if (backend.chatBgCustomPath.length === 0)
-                            chatBgFileDialog.open()
+                    text: qsTr("Default monocles background")
+                    checked: backend.chatBgMode === "default"
+                    onClicked: backend.setChatBackgroundMode("default")
+                }
+                RadioButton {
+                    autoExclusive: false
+                    text: qsTr("None")
+                    checked: backend.chatBgMode === "none"
+                    onClicked: backend.setChatBackgroundMode("none")
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    RadioButton {
+                        autoExclusive: false
+                        text: qsTr("Custom image")
+                        checked: backend.chatBgMode === "custom"
+                        onClicked: {
+                            backend.setChatBackgroundMode("custom")
+                            if (backend.chatBgCustomPath.length === 0)
+                                chatBgFileDialog.open()
+                        }
+                    }
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        text: qsTr("Choose…")
+                        enabled: backend.chatBgMode === "custom"
+                        onClicked: chatBgFileDialog.open()
                     }
                 }
-                Item { Layout.fillWidth: true }
-                Button {
-                    text: qsTr("Choose…")
-                    enabled: backend.chatBgMode === "custom"
-                    onClicked: chatBgFileDialog.open()
+                Label {
+                    textFormat: Text.PlainText
+                    visible: backend.chatBgMode === "custom" && backend.chatBgCustomPath.length > 0
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 12
+                    text: backend.chatBgCustomPath
+                    elide: Text.ElideMiddle
+                    opacity: 0.6
+                    font.pixelSize: 11
                 }
-            }
-            Label {
-                textFormat: Text.PlainText
-                visible: backend.chatBgMode === "custom" && backend.chatBgCustomPath.length > 0
-                Layout.fillWidth: true
-                Layout.leftMargin: 12
-                text: backend.chatBgCustomPath
-                elide: Text.ElideMiddle
-                opacity: 0.6
-                font.pixelSize: 11
-            }
-            Rectangle {
-                Layout.fillWidth: true
-                Layout.topMargin: 6
-                implicitHeight: 1
-                color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
-            }
-            // --- Camera (video calls) ---
-            Label {
-                textFormat: Text.PlainText
-                text: qsTr("Camera")
-                font.bold: true
-            }
-            Label {
-                textFormat: Text.PlainText
-                Layout.fillWidth: true
-                text: qsTr("Used for video calls. “Automatic” picks a working color camera and skips infrared / depth sensors.")
-                wrapMode: Text.Wrap
-                opacity: 0.6
-                font.pixelSize: 11
-            }
-            ComboBox {
-                id: cameraCombo
-                Layout.fillWidth: true
-                textRole: "name"
-                valueRole: "path"
-                model: settingsDialog.cameraOptions
-                onActivated: backend.selectPreferredCamera(currentValue)
-            }
-            Rectangle {
-                Layout.fillWidth: true
-                Layout.topMargin: 6
-                implicitHeight: 1
-                color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
-            }
-            // --- Connection security (as on monocles Android; read on every connection) ---
-            Label {
-                textFormat: Text.PlainText
-                text: qsTr("Connection security")
-                font.bold: true
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 10
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                    implicitHeight: 1
+                    color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
+                }
+                // --- Camera (video calls) ---
+                Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("Camera")
+                    font.bold: true
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: qsTr("Used for video calls. “Automatic” picks a working color camera and skips infrared / depth sensors.")
+                    wrapMode: Text.Wrap
+                    opacity: 0.6
+                    font.pixelSize: 11
+                }
+                ComboBox {
+                    id: cameraCombo
+                    Layout.fillWidth: true
+                    textRole: "name"
+                    valueRole: "path"
+                    model: settingsDialog.cameraOptions
+                    onActivated: backend.selectPreferredCamera(currentValue)
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                    implicitHeight: 1
+                    color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
+                }
+                // --- Connection security (as on monocles Android; read on every connection) ---
+                Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("Connection security")
+                    font.bold: true
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 1
+                        Label { textFormat: Text.PlainText; text: qsTr("Require TLS 1.3"); font.pixelSize: 13 }
+                        Label {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: qsTr("Require TLS 1.3 for all connections")
+                            wrapMode: Text.Wrap
+                            opacity: 0.6
+                            font.pixelSize: 11
+                        }
+                    }
+                    Switch {
+                        checked: backend.requireTls13
+                        onToggled: backend.changeRequireTls13(checked)
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 1
+                        Label { textFormat: Text.PlainText; text: qsTr("Enforce DANE"); font.pixelSize: 13 }
+                        Label {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: qsTr("Only connect if the server is verified via DANE")
+                            wrapMode: Text.Wrap
+                            opacity: 0.6
+                            font.pixelSize: 11
+                        }
+                    }
+                    Switch {
+                        checked: backend.enforceDane
+                        onToggled: backend.changeEnforceDane(checked)
+                    }
+                }
                 ColumnLayout {
                     Layout.fillWidth: true
-                    spacing: 1
-                    Label { textFormat: Text.PlainText; text: qsTr("Require TLS 1.3"); font.pixelSize: 13 }
+                    spacing: 4
+                    Label { textFormat: Text.PlainText; text: qsTr("DNS-over-TLS server"); font.pixelSize: 13 }
                     Label {
                         textFormat: Text.PlainText
                         Layout.fillWidth: true
-                        text: qsTr("Require TLS 1.3 for all connections")
+                        text: qsTr("Hostname such as dns.quad9.net. Encrypts all DNS lookups of the app. If the server can't be reached, accounts won't connect. Leave empty to use the system's DNS servers.")
                         wrapMode: Text.Wrap
                         opacity: 0.6
                         font.pixelSize: 11
                     }
-                }
-                Switch {
-                    checked: backend.requireTls13
-                    onToggled: backend.changeRequireTls13(checked)
-                }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 10
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 1
-                    Label { textFormat: Text.PlainText; text: qsTr("Enforce DANE"); font.pixelSize: 13 }
+                    TextField {
+                        id: dnsServerDotField
+                        Layout.fillWidth: true
+                        text: backend.dnsServerDot
+                        placeholderText: qsTr("dns.quad9.net")
+                        inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText | Qt.ImhUrlCharactersOnly
+                        property bool invalid: false
+                        onEditingFinished: {
+                            invalid = !backend.changeDnsServerDot(text)
+                            if (!invalid)
+                                text = backend.dnsServerDot
+                        }
+                        onTextEdited: invalid = false
+                    }
                     Label {
                         textFormat: Text.PlainText
-                        Layout.fillWidth: true
-                        text: qsTr("Only connect if the server is verified via DANE")
-                        wrapMode: Text.Wrap
-                        opacity: 0.6
+                        visible: dnsServerDotField.invalid
+                        text: qsTr("Invalid DNS server")
+                        color: "#d32f2f"
                         font.pixelSize: 11
                     }
                 }
-                Switch {
-                    checked: backend.enforceDane
-                    onToggled: backend.changeEnforceDane(checked)
+                Label {
+                    textFormat: Text.PlainText
+                    Layout.fillWidth: true
+                    text: qsTr("Changes apply to the next connection.")
+                    wrapMode: Text.Wrap
+                    opacity: 0.6
+                    font.pixelSize: 11
                 }
-            }
-            Label {
-                textFormat: Text.PlainText
-                Layout.fillWidth: true
-                text: qsTr("Changes apply to the next connection.")
-                wrapMode: Text.Wrap
-                opacity: 0.6
-                font.pixelSize: 11
-            }
-            Rectangle {
-                Layout.fillWidth: true
-                Layout.topMargin: 6
-                implicitHeight: 1
-                color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
-            }
-            Label {
-                textFormat: Text.PlainText
-                text: qsTr("More settings are coming soon.")
-                opacity: 0.6
-                font.pixelSize: 12
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                    implicitHeight: 1
+                    color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("More settings are coming soon.")
+                    opacity: 0.6
+                    font.pixelSize: 12
+                }
             }
         }
     }
