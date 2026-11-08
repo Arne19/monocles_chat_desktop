@@ -149,6 +149,10 @@ pub fn normalize_dot_server(input: &str) -> Option<String> {
     if value.parse::<IpAddr>().is_ok() {
         return Some(value.to_string());
     }
+    // A .onion/.i2p DoT server is unreachable here and its bootstrap lookup would leak the name.
+    if crate::hidden::is_hidden_service_host(value) {
+        return None;
+    }
     if !value.contains('.') || value.starts_with('.') || value.ends_with('.') || value.contains("..") {
         return None;
     }
@@ -395,6 +399,12 @@ where
 
 /// Records of `rtype` at `name` and the DNSSEC state of the answer.
 async fn lookup(dns: &Resolvers, name: &str, rtype: RecordType) -> (Vec<Record>, Validation) {
+    // Catch-all for every SRV/A/AAAA/TLSA/CNAME name (incl. server-published targets): a
+    // .onion/.i2p name is never sent to a DNS server (see crate::hidden).
+    if crate::hidden::is_hidden_service_host(name) {
+        tracing::warn!(%name, ?rtype, "not resolving a Tor/I2P hidden-service name");
+        return (Vec::new(), Validation::Insecure);
+    }
     let ips: Vec<IpAddr> = dns.servers.iter().map(|(ip, _)| *ip).collect();
     let answer = select(&ips, &dns.marks, |ip| async move {
         match dns.servers.iter().find(|(known, _)| *known == ip) {
@@ -849,6 +859,12 @@ impl ServerConnector for SecureConnector {
     ) -> Result<(PendingFeaturesRecv<Self::Stream>, ChannelBinding), Error> {
         let policy = TlsPolicy::load(&self.store).await;
         let domain = jid.domain().as_str();
+        if crate::hidden::is_hidden_service_host(domain) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{domain} is a Tor/I2P hidden service; Tor/I2P is not supported by this client"),
+            )));
+        }
         let mut last_error = None;
         let dns = self.resolvers().await;
         for endpoint in endpoints(&dns, domain).await {
@@ -1084,6 +1100,28 @@ mod tests {
         assert!(tls_config(TlsPolicy { require_tls13: false, enforce_dane: false }, verifier()).is_ok());
     }
 
+    /// A .onion/.i2p account domain is refused before any resolver is built: no DNS query, no
+    /// network wait, and an error that says why.
+    #[tokio::test]
+    async fn a_hidden_service_account_domain_fails_fast() {
+        for jid in ["user@abcdefghijklmnop.onion", "user@chat.example.i2p"] {
+            let store = mxc_store::Store::open_in_memory().await.unwrap();
+            let connector = SecureConnector::new(store, Arc::new(Mutex::new(LinkSecurity::default())));
+            let jid: Jid = jid.parse().unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                connector.connect(&jid, "jabber:client", Timeouts::default()),
+            )
+            .await
+            .expect("must fail immediately, not wait for DNS or the network");
+            match result {
+                Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{jid}: {e}"),
+                Err(other) => panic!("{jid}: unexpected error {other:?}"),
+                Ok(_) => panic!("{jid}: must not connect"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn policy_is_read_from_the_store() {
         let store = mxc_store::Store::open_in_memory().await.unwrap();
@@ -1102,6 +1140,7 @@ mod tests {
         for invalid in [
             "", "   ", "localhost", "dns quad9.net", "https://dns.quad9.net", "dns.quad9.net:853",
             ".quad9.net", "dns.quad9.net.", "dns..quad9.net", "dns.bücher.de",
+            "dns.example.onion", "DNS.EXAMPLE.ONION", "dns.example.i2p",
         ] {
             assert_eq!(normalize_dot_server(invalid), None, "{invalid:?}");
         }

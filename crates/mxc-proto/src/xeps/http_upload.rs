@@ -49,6 +49,8 @@ fn http_client() -> &'static reqwest::Client {
                     attempt.error("too many redirects")
                 } else if attempt.url().scheme() != "https" || is_local_target(attempt.url()) {
                     attempt.error("refusing redirect to a non-https or local address")
+                } else if is_hidden_target(attempt.url()) {
+                    attempt.error("refusing redirect to a Tor/I2P hidden service (not supported)")
                 } else {
                     attempt.follow()
                 }
@@ -56,6 +58,12 @@ fn http_client() -> &'static reqwest::Client {
             .build()
             .expect("reqwest client")
     })
+}
+
+/// Whether `url`'s host is a `.onion`/`.i2p` name: unreachable without Tor/I2P, and resolving it
+/// through the system resolver would leak it (see crate::hidden).
+fn is_hidden_target(url: &url::Url) -> bool {
+    matches!(url.host(), Some(url::Host::Domain(host)) if crate::hidden::is_hidden_service_host(host))
 }
 
 /// Whether `url` points at this machine or a private/link-local network. File URLs come from
@@ -100,6 +108,9 @@ fn checked_url(raw: &str) -> anyhow::Result<url::Url> {
     }
     if is_local_target(&url) {
         anyhow::bail!("refusing file url pointing at a local address");
+    }
+    if is_hidden_target(&url) {
+        anyhow::bail!("refusing Tor/I2P hidden-service url: not supported");
     }
     Ok(url)
 }
@@ -220,6 +231,9 @@ async fn request_slot(
         let parsed = url::Url::parse(u).map_err(|e| anyhow::anyhow!("bad upload slot url: {e}"))?;
         if parsed.scheme() != "https" {
             anyhow::bail!("refusing non-https upload slot url");
+        }
+        if is_hidden_target(&parsed) {
+            anyhow::bail!("refusing Tor/I2P hidden-service upload slot url: not supported");
         }
     }
     let headers = allowed_headers(put);
@@ -430,6 +444,9 @@ mod download_tests {
             "https://[::1]/x",
             "https://[fd00::1]/x",
             "https://[::ffff:192.168.0.1]/x",
+            "https://abcdef.onion/x",
+            "https://upload.example.i2p/x",
+            "https://ABCDEF.ONION./x",
         ] {
             assert!(checked_url(bad).is_err(), "{bad}");
         }
