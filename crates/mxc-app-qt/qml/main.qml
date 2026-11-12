@@ -75,9 +75,11 @@ ApplicationWindow {
     // XEP-0045: we're an admin/owner of the open room (member and ban lists).
     property bool currentRoomCanManageMembers: currentPeerIsMuc && mucModerationRev >= 0
                                                && backend.mucCanManageMembers(currentPeerJid)
-    // Pending reply (XEP-0461): the target message's marker + a preview of its text.
+    // Pending reply (XEP-0461): the target message's marker + its preview (text, or for media
+    // and files an icon + label) and, for a photo, a small image of it.
     property string replyToMarker: ""
     property string replyToText: ""
+    property string replyToImage: ""
     // Pending edit (XEP-0308): the target message's marker + its text before editing.
     property string editTargetMarker: ""
     property string editOriginalText: ""
@@ -124,14 +126,16 @@ ApplicationWindow {
         reactPickerGlobal.open()
     }
 
-    function startReply(marker, text) {
+    function startReply(marker, text, image) {
         window.clearEdit()
         window.replyToMarker = marker
         window.replyToText = text
+        window.replyToImage = image || ""
     }
     function clearReply() {
         window.replyToMarker = ""
         window.replyToText = ""
+        window.replyToImage = ""
     }
     // Load one of our own messages into the composer; the next send becomes a correction.
     function startEdit(marker, text) {
@@ -2605,7 +2609,7 @@ ApplicationWindow {
                                         MenuItem {
                                             text: qsTr("Reply")
                                             enabled: !model.retracted
-                                            onTriggered: window.startReply(model.marker, model.body)
+                                            onTriggered: window.startReply(model.marker, model.previewText, model.previewImage)
                                         }
                                         MenuItem {
                                             text: qsTr("Copy text")
@@ -2665,10 +2669,27 @@ ApplicationWindow {
                                         // jumps to (and flashes) the quoted message.
                                         Rectangle {
                                             visible: model.replyQuote.length > 0
-                                            width: quoteText.width + 22
-                                            height: quoteText.height + 12
+                                            // Room for the quoted photo's thumbnail, if any.
+                                            property int thumbSpace: model.replyQuoteImage.length > 0 ? 38 : 0
+                                            width: thumbSpace + quoteText.width + 22
+                                            height: Math.max(quoteText.height, thumbSpace > 0 ? 32 : 0) + 12
                                             radius: 6
                                             color: Qt.rgba(1, 1, 1, 0.13)
+
+                                            // Small picture of the quoted photo or sticker (cached
+                                            // only - nothing is fetched for a quote).
+                                            Image {
+                                                visible: parent.thumbSpace > 0
+                                                x: 14
+                                                y: 6
+                                                width: 32
+                                                height: 32
+                                                source: model.replyQuoteImage.length > 0 ? "file:" + model.replyQuoteImage : ""
+                                                sourceSize: Qt.size(64, 64)
+                                                fillMode: Image.PreserveAspectCrop
+                                                asynchronous: true
+                                                clip: true
+                                            }
 
                                             Rectangle {
                                                 x: 5
@@ -2682,9 +2703,9 @@ ApplicationWindow {
                                             Label {
                                                 id: quoteText
                                                 textFormat: Text.PlainText
-                                                x: 14
+                                                x: 14 + parent.thumbSpace
                                                 y: 6
-                                                width: Math.min(implicitWidth, msgDelegate.maxw - 22)
+                                                width: Math.min(implicitWidth, msgDelegate.maxw - 22 - parent.thumbSpace)
                                                 text: model.replyQuote
                                                 color: "white"
                                                 opacity: 0.85
@@ -3101,7 +3122,9 @@ ApplicationWindow {
                                 spacing: 6
                                 Rectangle {
                                     Layout.fillWidth: true
-                                    implicitHeight: replyPreviewText.implicitHeight + 12
+                                    // Room for the photo's thumbnail when replying to one.
+                                    property int thumbSpace: window.replyToImage.length > 0 ? 34 : 0
+                                    implicitHeight: Math.max(replyPreviewText.implicitHeight, thumbSpace > 0 ? 28 : 0) + 12
                                     radius: 6
                                     color: Material.theme === Material.Dark ? Qt.rgba(1, 1, 1, 0.08)
                                                                             : Qt.rgba(0, 0, 0, 0.05)
@@ -3113,12 +3136,24 @@ ApplicationWindow {
                                         radius: 1.5
                                         color: "#a8c7ff"
                                     }
+                                    Image {
+                                        visible: parent.thumbSpace > 0
+                                        x: 14
+                                        y: 6
+                                        width: 28
+                                        height: 28
+                                        source: window.replyToImage.length > 0 ? "file:" + window.replyToImage : ""
+                                        sourceSize: Qt.size(56, 56)
+                                        fillMode: Image.PreserveAspectCrop
+                                        asynchronous: true
+                                        clip: true
+                                    }
                                     Label {
                                         id: replyPreviewText
                                         textFormat: Text.PlainText
-                                        x: 14
-                                        y: 6
-                                        width: parent.width - 22
+                                        x: 14 + parent.thumbSpace
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: parent.width - 22 - parent.thumbSpace
                                         text: window.replyToText
                                         elide: Text.ElideRight
                                         maximumLineCount: 1

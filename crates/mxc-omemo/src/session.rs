@@ -1027,6 +1027,10 @@ pub async fn establish_session(
     let mut ids = stores.identity_store();
     let mut rng = rand::rng();
 
+    // Session records change only under the account's session lock (see
+    // [`crate::store::session_lock`]); the bundle was fetched before, outside it.
+    let session_lock = stores.session_lock();
+    let _guard = session_lock.lock().await;
     process_prekey_bundle(
         &remote_addr,
         &local_addr,
@@ -1167,6 +1171,10 @@ pub async fn encrypt(
     // Wrap the message key per recipient device through the libsignal ratchet.
     let local_addr = protocol_address(our_jid, our_device)?;
     let mut keys = Vec::new();
+    // Under the account's session lock: a decrypt for the same device must not interleave with
+    // the load → ratchet → store of this encrypt (see [`crate::store::session_lock`]).
+    let session_lock = stores.session_lock();
+    let _guard = session_lock.lock().await;
     for r in recipients {
         let remote_addr = protocol_address(&r.jid, r.device_id)?;
         let mut sess = stores.session_store();
@@ -1222,6 +1230,10 @@ pub async fn decrypt(
     let mut ids = stores.identity_store();
     let mut rng = rand::rng();
 
+    // Under the account's session lock (see [`crate::store::session_lock`]), released before
+    // the payload is opened.
+    let session_lock = stores.session_lock();
+    let guard = session_lock.lock().await;
     let message_key = if is_kex {
         let msg = PreKeySignalMessage::try_from(wrapped_key)?;
         let mut pre = stores.pre_key_store();
@@ -1236,6 +1248,7 @@ pub async fn decrypt(
         let msg = SignalMessage::try_from(wrapped_key)?;
         message_decrypt_signal(&msg, &remote_addr, &local_addr, &mut sess, &mut ids, &mut rng).await?
     };
+    drop(guard);
 
     let mut message_key = message_key;
     if message_key.len() != MSG_KEY_LEN {
@@ -1470,6 +1483,73 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pt, b"hello pq world");
+    }
+
+    /// Encrypt and decrypt for the same peer device, interleaved on one thread the way the
+    /// client's `spawn_local` tasks are, must keep both ratchets consistent. Without the
+    /// account's session lock a decrypt and an encrypt both load the session record, and the one
+    /// stored last discards the other's ratchet step: later messages then fail to decrypt (the
+    /// "Failed to decrypt" bubbles seen with WebXDC).
+    #[tokio::test]
+    async fn interleaved_encrypt_and_decrypt_keep_the_ratchet_consistent() {
+        let (alice_jid, bob_jid) = ("alice@example.com", "bob@example.com");
+        let (bob, bob_dev) = party(bob_jid).await;
+        let bob_bundle = generate_and_store_prekeys(&bob, 1, 1000, 100, 5).await.unwrap();
+        let (alice, alice_dev) = party(alice_jid).await;
+        let bob_addr = DeviceAddr { jid: bob_jid.into(), device_id: bob_dev };
+        let alice_addr = DeviceAddr { jid: alice_jid.into(), device_id: alice_dev };
+        establish_session(&alice, alice_jid, alice_dev, &bob_addr, &bob_bundle).await.unwrap();
+
+        let send = |from: &OmemoStores, from_jid: &'static str, from_dev: u32, to: DeviceAddr, text: String| {
+            let from = from.clone();
+            async move {
+                let to_jid = to.jid.clone();
+                let enc = encrypt(&from, from_jid, from_dev, &[to], Some(&to_jid), text.as_bytes())
+                    .await
+                    .unwrap();
+                (enc, text)
+            }
+        };
+        let open = |at: &OmemoStores, at_jid: &'static str, at_dev: u32, from: DeviceAddr, enc: EncryptedMessage| {
+            let at = at.clone();
+            async move {
+                let wk = &enc.keys[0];
+                decrypt(&at, at_jid, at_dev, &from, Some(at_jid), &wk.data, wk.kex, &enc.payload, Some(&enc.commit))
+                    .await
+            }
+        };
+
+        // Session in both directions first.
+        let (first, _) = send(&alice, alice_jid, alice_dev, bob_addr.clone(), "hi".into()).await;
+        open(&bob, bob_jid, bob_dev, alice_addr.clone(), first).await.unwrap();
+
+        for round in 0..12 {
+            // Alice sends a burst (after Bob's last reply: a new ratchet step for Bob)...
+            let mut from_alice = Vec::new();
+            for i in 0..4 {
+                from_alice.push(
+                    send(&alice, alice_jid, alice_dev, bob_addr.clone(), format!("a{round}-{i}")).await,
+                );
+            }
+            // ...which Bob decrypts while he is sending his own burst.
+            let decrypts = futures::future::join_all(from_alice.into_iter().map(|(enc, text)| {
+                let fut = open(&bob, bob_jid, bob_dev, alice_addr.clone(), enc);
+                async move { (fut.await, text) }
+            }));
+            let encrypts = futures::future::join_all(
+                (0..4).map(|i| send(&bob, bob_jid, bob_dev, alice_addr.clone(), format!("b{round}-{i}"))),
+            );
+            let (decrypted, from_bob) = futures::join!(decrypts, encrypts);
+            for (result, text) in decrypted {
+                assert_eq!(result.expect("Bob must decrypt Alice's message"), text.as_bytes());
+            }
+            for (enc, text) in from_bob {
+                let plain = open(&alice, alice_jid, alice_dev, bob_addr.clone(), enc)
+                    .await
+                    .expect("Alice must decrypt Bob's message");
+                assert_eq!(plain, text.as_bytes());
+            }
+        }
     }
 
     /// Pin-fill never overwrites: the first pin for (JID, IK) stands, a later different key is

@@ -38,6 +38,8 @@ const NS_OOB: &str = "jabber:x:oob";
 const NS_SFS: &str = "urn:xmpp:sfs:0";
 /// XEP-0446 file metadata (name/media-type/size/dimensions), inside `<file-sharing/>`.
 const NS_FILE_META: &str = "urn:xmpp:file:metadata:0";
+/// The media type of a WebXDC app archive (`.xdc`).
+const WEBXDC_MIME: &str = "application/webxdc+zip";
 /// XEP-0103 URL address — the source form Android uses (`<url-data target='…'/>`).
 const NS_URL_DATA: &str = "http://jabber.org/protocol/url-data";
 const NS_MAM: &str = "urn:xmpp:mam:2";
@@ -538,16 +540,20 @@ pub async fn send_file(
         .unwrap_or("file")
         .to_string();
     let mime = crate::xeps::http_upload::guess_mime(&filename);
+    let caption = caption.map(str::trim).filter(|c| !c.is_empty());
+
+    // PQ OMEMO2: uploaded under an opaque name and type, described only inside the encryption
+    // by a <file-sharing/> - the same wire format as several files (see send_described_files).
+    if is_omemo(store, cfg, to).await {
+        let url = crate::xeps::http_upload::upload_shared_file(w, cfg, &bytes, &filename, mime, true)
+            .await?;
+        let file = described_file(&url, &filename, mime, bytes.len());
+        return send_described_files(w, store, cfg, events, to, vec![file], caption, Encryption::Omemo2)
+            .await;
+    }
 
     let url = crate::xeps::http_upload::upload_encrypted(w, cfg, &bytes, &filename, mime).await?;
-
-    let encryption = if is_omemo(store, cfg, to).await {
-        Encryption::Omemo2
-    } else {
-        Encryption::None
-    };
-
-    let caption = caption.map(str::trim).filter(|c| !c.is_empty());
+    let encryption = Encryption::None;
     // A file send only reaches here after a successful HTTP upload, i.e. we're online.
     let origin_id = new_id("msg");
 
@@ -579,8 +585,8 @@ pub async fn send_file(
 /// For OMEMO2 chats all of that lives inside the SCE envelope — the `<url-data target>` holds the
 /// `aesgcm://` URL whose fragment is the file key, so it must never appear on the outer stanza.
 ///
-/// A single path is handed to [`send_file`], keeping that (already interoperable) wire format
-/// byte-for-byte unchanged.
+/// A single path is handed to [`send_file`]: unchanged for unencrypted chats, and in a PQ
+/// OMEMO2 chat it comes back here as a message describing one file.
 pub async fn send_files(
     w: &Writer,
     store: &Store,
@@ -597,6 +603,7 @@ pub async fn send_files(
         _ => {}
     }
 
+    let omemo2 = is_omemo(store, cfg, to).await;
     // Upload first: a failed upload must not leave a half-described message on the wire.
     let mut uploaded: Vec<serde_json::Value> = Vec::with_capacity(paths.len());
     for path in paths {
@@ -609,15 +616,36 @@ pub async fn send_files(
             .unwrap_or("file")
             .to_string();
         let mime = crate::xeps::http_upload::guess_mime(&name);
-        let size = bytes.len() as i64;
-        let url = crate::xeps::http_upload::upload_encrypted(w, cfg, &bytes, &name, mime).await?;
-        uploaded.push(serde_json::json!({
-            "url": url, "mime": mime, "name": name, "size": size,
-        }));
+        let url =
+            crate::xeps::http_upload::upload_shared_file(w, cfg, &bytes, &name, mime, omemo2).await?;
+        uploaded.push(described_file(&url, &name, mime, bytes.len()));
     }
 
-    let encryption =
-        if is_omemo(store, cfg, to).await { Encryption::Omemo2 } else { Encryption::None };
+    let encryption = if omemo2 { Encryption::Omemo2 } else { Encryption::None };
+    send_described_files(w, store, cfg, events, to, uploaded, caption, encryption).await
+}
+
+/// One uploaded file as [`send_described_files`] and the `attachment` column take it.
+fn described_file(url: &str, name: &str, mime: &str, size: usize) -> serde_json::Value {
+    serde_json::json!({ "url": url, "mime": mime, "name": name, "size": size as i64 })
+}
+
+/// Send already uploaded `files` as ONE message described by XEP-0447 `<file-sharing/>`
+/// elements (see [`send_files`]), and store it like the receive path does: body = caption,
+/// every file in the attachment column. Used for several files, and for every file of a PQ OMEMO2
+/// chat - whose upload URL has no extension, so the `<file-sharing/>` inside the encryption is
+/// the only place a receiver learns the file's type and name.
+#[allow(clippy::too_many_arguments)]
+async fn send_described_files(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    events: &Sender<Event>,
+    to: &str,
+    uploaded: Vec<serde_json::Value>,
+    caption: Option<&str>,
+    encryption: Encryption,
+) -> anyhow::Result<()> {
     let origin_id = new_id("msg");
 
     let urls: Vec<&str> = uploaded.iter().map(|f| f["url"].as_str().unwrap_or_default()).collect();
@@ -687,38 +715,48 @@ fn build_multi_file_payloads(
         }
     }
     for (i, file) in files.iter().enumerate() {
-        let Some(url) = file["url"].as_str() else { continue };
-        let mut meta = Element::builder("file", NS_FILE_META);
-        for (tag, value) in [("name", file["name"].as_str()), ("media-type", file["mime"].as_str())]
-        {
-            if let Some(value) = value.filter(|v| !v.is_empty()) {
-                meta = meta.append(Element::builder(tag, NS_FILE_META).append(value).build());
-            }
+        // XEP-0447 requires an id per element once a message describes several files; the
+        // receiver uses it to line each file up with its own row.
+        if let Some(sharing) = file_sharing_element(file, Some(&format!("{origin_id}-{i}"))) {
+            out.push(sharing);
         }
-        if let Some(size) = file["size"].as_i64().filter(|s| *s > 0) {
-            meta = meta
-                .append(Element::builder("size", NS_FILE_META).append(size.to_string()).build());
-        }
-        out.push(
-            Element::builder("file-sharing", NS_SFS)
-                .attr(crate::ncname("disposition"), "inline")
-                // XEP-0447 requires an id per element once a message describes several files;
-                // the receiver uses it to line each file up with its own row.
-                .attr(crate::ncname("id"), format!("{origin_id}-{i}"))
-                .append(meta.build())
-                .append(
-                    Element::builder("sources", NS_SFS)
-                        .append(
-                            Element::builder("url-data", NS_URL_DATA)
-                                .attr(crate::ncname("target"), url)
-                                .build(),
-                        )
-                        .build(),
-                )
-                .build(),
-        );
     }
     out
+}
+
+/// The XEP-0447 `<file-sharing/>` describing one uploaded `file` (`{url, name, mime, size}`):
+/// its metadata and its `aesgcm://` source. For an OMEMO2 chat it only ever goes inside the
+/// encryption - the source URL's fragment is the file key.
+fn file_sharing_element(file: &serde_json::Value, id: Option<&str>) -> Option<Element> {
+    let url = file["url"].as_str()?;
+    let mut meta = Element::builder("file", NS_FILE_META);
+    for (tag, value) in [("name", file["name"].as_str()), ("media-type", file["mime"].as_str())] {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            meta = meta.append(Element::builder(tag, NS_FILE_META).append(value).build());
+        }
+    }
+    if let Some(size) = file["size"].as_i64().filter(|s| *s > 0) {
+        meta = meta.append(Element::builder("size", NS_FILE_META).append(size.to_string()).build());
+    }
+    let mut sharing =
+        Element::builder("file-sharing", NS_SFS).attr(crate::ncname("disposition"), "inline");
+    if let Some(id) = id {
+        sharing = sharing.attr(crate::ncname("id"), id);
+    }
+    Some(
+        sharing
+            .append(meta.build())
+            .append(
+                Element::builder("sources", NS_SFS)
+                    .append(
+                        Element::builder("url-data", NS_URL_DATA)
+                            .attr(crate::ncname("target"), url)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build(),
+    )
 }
 
 /// Persist + emit an outgoing file message and mark it 'sent' (file sends only happen online).
@@ -798,14 +836,17 @@ pub async fn send_sticker(
     let mime = crate::xeps::http_upload::guess_mime(&filename);
 
     // Encrypted chat, or a too-large image → upload (encrypted when OMEMO2) and send the URL.
-    if is_omemo(store, cfg, to).await || bytes.len() > super::bob::MAX_INLINE {
+    if is_omemo(store, cfg, to).await {
+        // Like any file in a PQ OMEMO2 chat: opaque upload, described inside the encryption.
+        let url = crate::xeps::http_upload::upload_shared_file(w, cfg, &bytes, &filename, mime, true)
+            .await?;
+        let file = described_file(&url, &filename, mime, bytes.len());
+        return send_described_files(w, store, cfg, events, to, vec![file], None, Encryption::Omemo2)
+            .await;
+    }
+    if bytes.len() > super::bob::MAX_INLINE {
         let url = crate::xeps::http_upload::upload_encrypted(w, cfg, &bytes, &filename, mime).await?;
-        let encryption = if is_omemo(store, cfg, to).await {
-            Encryption::Omemo2
-        } else {
-            Encryption::None
-        };
-        return send_message(w, store, cfg, events, to, &url, encryption, None, true, None).await;
+        return send_message(w, store, cfg, events, to, &url, Encryption::None, None, true, None).await;
     }
 
     // Plaintext chat → a genuine inline sticker (XEP-0231 BoB) carried on the cleartext message.
@@ -919,9 +960,14 @@ pub async fn send_webxdc_file(
         .and_then(|n| n.to_str())
         .unwrap_or("app.xdc")
         .to_string();
-    let url = crate::xeps::http_upload::upload_encrypted(w, cfg, &bytes, &filename, "application/webxdc+zip").await?;
-    let thread = new_id("webxdc");
     let omemo = is_omemo(store, cfg, to).await;
+    // In a PQ OMEMO2 chat the upload service learns neither name nor type of the app; the
+    // receiver finds both in the <file-sharing/> inside the encryption (below).
+    let url = crate::xeps::http_upload::upload_shared_file(
+        w, cfg, &bytes, &filename, WEBXDC_MIME, omemo,
+    )
+    .await?;
+    let thread = new_id("webxdc");
     let encryption = if omemo { Encryption::Omemo2 } else { Encryption::None };
     let origin_id = new_id("msg");
 
@@ -950,7 +996,13 @@ pub async fn send_webxdc_file(
                 .append(thread_el);
         }
         Encryption::Omemo2 => {
-            let env = Envelope::new(&url, cfg.bare(), to, Some(crate::xeps::rfc3339_now()), &String::from(&thread_el));
+            let mut extra = String::from(&thread_el);
+            if let Some(sharing) =
+                file_sharing_element(&described_file(&url, &filename, WEBXDC_MIME, bytes.len()), None)
+            {
+                extra.push_str(&String::from(&sharing));
+            }
+            let env = Envelope::new(&url, cfg.bare(), to, Some(crate::xeps::rfc3339_now()), &extra);
             let binding_to = if is_muc_pm { None } else { Some(to) };
             let encrypted = encrypt_envelope(w, store, cfg, to, is_muc, binding_to, env.to_xml().as_bytes()).await?;
             msg = msg
@@ -1856,9 +1908,11 @@ async fn process_payload(
     // chat's setting follows is decided by timer_setting_change. 1:1 chats only.
     let message_timer = ephemeral_stamp(&content);
     if kind == "chat" {
-        let has_body = content.get_child("body", NS_CLIENT).is_some_and(|b| !b.text().is_empty());
+        // Every message of a chat with a timer is stamped with it (monocles Android stamps body-
+        // less WebXDC updates and the like too), so "no body" does not make a timer change.
+        let with_content = !is_timer_change_only(&content);
         let wants_out = content.get_child("i-want-out", NS_EPHEMERAL).is_some();
-        if let Some(seconds) = timer_setting_change(encryption == "omemo2", has_body, message_timer, wants_out) {
+        if let Some(seconds) = timer_setting_change(encryption == "omemo2", with_content, message_timer, wants_out) {
             if store.set_conversation_ephemeral_timer(conv, seconds, unix_seconds(&ts)).await.unwrap_or(false) {
                 let _ = events.send(Event::EphemeralTimerChanged {
                     account_id: cfg.account_id, conversation_id: conv, seconds,
@@ -2634,14 +2688,38 @@ fn ephemeral_stamp(content: &Element) -> Option<i64> {
 ///
 /// In an unencrypted chat this follows monocles Android's cleartext behaviour: a stamp on a
 /// message sets the timer as well.
-fn timer_setting_change(encrypted: bool, has_body: bool, stamp: Option<i64>, wants_out: bool) -> Option<i64> {
+///
+/// `with_content`: the envelope carries more than the timer control (see
+/// [`is_timer_change_only`]).
+fn timer_setting_change(encrypted: bool, with_content: bool, stamp: Option<i64>, wants_out: bool) -> Option<i64> {
     if wants_out {
         return Some(0);
     }
     match stamp {
-        Some(seconds) if !encrypted || !has_body => Some(seconds),
+        Some(seconds) if !encrypted || !with_content => Some(seconds),
         _ => None,
     }
+}
+
+/// Whether `content` (a decrypted PQ OMEMO2 envelope) is a disappearing-message timer change
+/// and nothing else: at least one `<ephemeral/>` or `<i-want-out/>`, and besides those at most
+/// an empty `<body/>`. Anything more - a WebXDC update, a reaction, a file, text - is a message
+/// that merely carries the sender's timer for itself. Same rule as monocles Android's
+/// `MessageParser.isTimerChangeOnly`.
+fn is_timer_change_only(content: &Element) -> bool {
+    let mut control = false;
+    for child in content.children() {
+        if child.ns() == NS_EPHEMERAL {
+            control |= matches!(child.name(), "ephemeral" | "i-want-out");
+        } else if child.name() == "body" {
+            if !child.text().is_empty() {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    control
 }
 
 /// Conversation metadata that is only believed when it arrives encrypted in a PQ OMEMO2 chat.
@@ -2926,6 +3004,62 @@ mod sce_time_reference_tests {
 #[cfg(test)]
 mod file_caption_tests {
     use super::*;
+
+    /// A PQ OMEMO2 file is uploaded under a random name without extension...
+    #[test]
+    fn omemo2_upload_name_says_nothing_about_the_file() {
+        let a = crate::xeps::http_upload::opaque_upload_name();
+        let b = crate::xeps::http_upload::opaque_upload_name();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        assert_eq!(crate::xeps::http_upload::OPAQUE_MIME, "application/octet-stream");
+    }
+
+    /// ...so a single file is described the way several are: one <file-sharing/> with its name,
+    /// type, size and source, and the URL span marked as a fallback for both OOB and SFS - the
+    /// format monocles Android reads (and itself sends for every OMEMO2 file).
+    #[test]
+    fn single_described_file_carries_name_type_and_source() {
+        let url = "aesgcm://up.example/s/0123456789abcdef0123456789abcdef#00ff";
+        let files = vec![described_file(url, "photo.jpg", "image/jpeg", 1234)];
+        let (body, spans) = build_multi_file_body(None, &[url]);
+        assert_eq!(body, url);
+        let payloads = build_multi_file_payloads(&files, &spans, "msg-1");
+        let fallbacks: Vec<_> = payloads.iter().filter(|e| e.name() == "fallback").collect();
+        assert_eq!(fallbacks.len(), 2);
+        let sharing = payloads.iter().find(|e| e.name() == "file-sharing" && e.ns() == NS_SFS).unwrap();
+        let meta = sharing.get_child("file", NS_FILE_META).unwrap();
+        let text = |name: &str| meta.get_child(name, NS_FILE_META).map(|e| e.text());
+        assert_eq!(text("name").as_deref(), Some("photo.jpg"));
+        assert_eq!(text("media-type").as_deref(), Some("image/jpeg"));
+        assert_eq!(text("size").as_deref(), Some("1234"));
+        let target = sharing
+            .get_child("sources", NS_SFS)
+            .and_then(|s| s.get_child("url-data", NS_URL_DATA))
+            .and_then(|u| u.attr("target"));
+        assert_eq!(target, Some(url));
+        // And the receive side of this client reads it back with its type.
+        let content: Element = format!(
+            "<content xmlns='{NS_CLIENT}'><body>{url}</body>{}</content>",
+            String::from(sharing)
+        )
+        .parse()
+        .unwrap();
+        let parsed = sfs_files(&content);
+        assert_eq!(parsed[0]["mime"], "image/jpeg");
+        assert_eq!(parsed[0]["name"], "photo.jpg");
+    }
+
+    /// A shared WebXDC app is described without an id (one file) but with its type.
+    #[test]
+    fn webxdc_description_has_the_app_type() {
+        let url = "aesgcm://up.example/s/ff#00";
+        let el = file_sharing_element(&described_file(url, "chess.xdc", WEBXDC_MIME, 10), None).unwrap();
+        assert!(el.attr("id").is_none());
+        let meta = el.get_child("file", NS_FILE_META).unwrap();
+        assert_eq!(meta.get_child("media-type", NS_FILE_META).unwrap().text(), WEBXDC_MIME);
+    }
     use minidom::Element;
 
     /// Re-parse SCE `content_inner` into a queryable element exactly like handle_incoming does.
@@ -3558,8 +3692,8 @@ mod retraction_tests {
 #[cfg(test)]
 mod ephemeral_tests {
     use super::{
-        ephemeral_element, ephemeral_stamp, is_unauthenticated_metadata, strip_unauthenticated_metadata,
-        timer_setting_change, unix_seconds, NS_CLIENT,
+        ephemeral_element, ephemeral_stamp, is_timer_change_only, is_unauthenticated_metadata,
+        strip_unauthenticated_metadata, timer_setting_change, unix_seconds, NS_CLIENT, NS_EPHEMERAL,
     };
     use minidom::Element;
 
@@ -3580,6 +3714,32 @@ mod ephemeral_tests {
         // and a message without one says nothing at all
         assert_eq!(timer_setting_change(true, true, None, false), None);
         assert_eq!(timer_setting_change(true, false, None, false), None);
+    }
+
+    /// Only an envelope that carries nothing but the timer control is a timer change; a WebXDC
+    /// update or a reaction that merely carries the sender's timer is not.
+    #[test]
+    fn timer_change_only_when_nothing_else_comes_with_it() {
+        let ns = NS_EPHEMERAL;
+        assert!(is_timer_change_only(&parse(&format!(
+            "<content xmlns='urn:xmpp:sce:1'><ephemeral xmlns='{ns}' timer='3600'/></content>"
+        ))));
+        assert!(is_timer_change_only(&parse(&format!(
+            "<content xmlns='urn:xmpp:sce:1'><body xmlns='jabber:client'/><i-want-out xmlns='{ns}'/></content>"
+        ))));
+        assert!(!is_timer_change_only(&parse(&format!(
+            "<content xmlns='urn:xmpp:sce:1'><x xmlns='urn:xmpp:webxdc:0'><data>AAAA</data></x>\
+             <thread xmlns='jabber:client'>t</thread><ephemeral xmlns='{ns}' timer='3600'/></content>"
+        ))));
+        assert!(!is_timer_change_only(&parse(&format!(
+            "<content xmlns='urn:xmpp:sce:1'><reactions xmlns='urn:xmpp:reactions:0' id='x'>\
+             <reaction>+1</reaction></reactions><ephemeral xmlns='{ns}' timer='3600'/></content>"
+        ))));
+        assert!(!is_timer_change_only(&parse(&format!(
+            "<content xmlns='urn:xmpp:sce:1'><body xmlns='jabber:client'>hi</body>\
+             <ephemeral xmlns='{ns}' timer='3600'/></content>"
+        ))));
+        assert!(!is_timer_change_only(&parse("<content xmlns='urn:xmpp:sce:1'/>")));
     }
 
     /// Unencrypted chats behave like monocles Android's cleartext path.

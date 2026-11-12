@@ -437,8 +437,14 @@ pub async fn regenerate_own_identity(
     if old_device.is_some() {
         set_retired_device(store, cfg.account_id, old_device).await?;
     }
-    store.reset_omemo2_own_state(cfg.account_id).await?;
-    store.reset_omemo2_peer_state(cfg.account_id).await?;
+    {
+        // Under the session lock (see mxc_omemo::store::session_lock): a session operation in
+        // flight must not store its record back after the wipe.
+        let session_lock = mxc_omemo::store::session_lock(cfg.account_id);
+        let _guard = session_lock.lock().await;
+        store.reset_omemo2_own_state(cfg.account_id).await?;
+        store.reset_omemo2_peer_state(cfg.account_id).await?;
+    }
     // Belt and braces: load_or_create would overwrite these anyway once the own-identity row
     // is gone, but a possibly compromised private key should not linger in the keyring for
     // even a moment longer than necessary.

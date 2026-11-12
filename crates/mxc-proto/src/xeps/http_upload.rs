@@ -304,6 +304,39 @@ pub fn is_aesgcm_url(s: &str) -> bool {
     s.starts_with("aesgcm://") && s.contains('#')
 }
 
+/// The content type a PQ OMEMO2 file is uploaded with: the upload service only ever stores
+/// ciphertext, and what kind of file it is travels inside the encryption (XEP-0447
+/// `<file-sharing/>`), like its name and size. Same as monocles Android.
+pub const OPAQUE_MIME: &str = "application/octet-stream";
+
+/// A random upload name for a PQ OMEMO2 file: 32 hex characters, no extension, nothing taken
+/// from the file or the message.
+pub fn opaque_upload_name() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// [`upload_encrypted`] for a file shared in a chat. In a PQ OMEMO2 chat the upload service
+/// learns neither the name nor the type ([`opaque_upload_name`], [`OPAQUE_MIME`]); the receiver
+/// gets both from the encrypted `<file-sharing/>`. Otherwise the file's own name and type are
+/// used, which an unencrypted chat shows anyway.
+pub async fn upload_shared_file(
+    w: &Writer,
+    cfg: &AccountConfig,
+    bytes: &[u8],
+    filename: &str,
+    content_type: &str,
+    omemo2: bool,
+) -> anyhow::Result<String> {
+    if omemo2 {
+        upload_encrypted(w, cfg, bytes, &opaque_upload_name(), OPAQUE_MIME).await
+    } else {
+        upload_encrypted(w, cfg, bytes, filename, content_type).await
+    }
+}
+
 /// Encrypt + upload `bytes` and return the `aesgcm://` URL to share.
 pub async fn upload_encrypted(
     w: &Writer,

@@ -42,6 +42,9 @@ const ROLE_FILE_NAME: i32 = 277;
 const ROLE_ATTACHMENTS: i32 = 278;
 const ROLE_STANZA_ID: i32 = 279;
 const ROLE_BODY_HTML: i32 = 280;
+const ROLE_PREVIEW_TEXT: i32 = 281;
+const ROLE_PREVIEW_IMAGE: i32 = 282;
+const ROLE_REPLY_QUOTE_IMAGE: i32 = 283;
 
 /// One message row, resolved for display.
 #[derive(Clone, Default, PartialEq)]
@@ -59,6 +62,13 @@ pub struct MessageItem {
     pub reply_quote: String,
     /// The marker this message replies to (target for jump-to-quote), or empty.
     pub reply_to: String,
+    /// Small cached image of the quoted message (a photo or sticker it shares), or empty.
+    pub reply_quote_image: String,
+    /// This message in one short line, as a reply to it shows it: the text, or for media and
+    /// files an icon and a label ("🖼 Photo", "🎤 Voice message", "📎 report.pdf", …).
+    pub preview_text: String,
+    /// A small image for [`Self::preview_text`]: the cached photo or sticker, or empty.
+    pub preview_image: String,
     /// Reaction tallies, serialized as "emoji\tcount" chips joined by '\n' (set in session.rs).
     pub reactions: String,
     /// Sender nick (resource of counterpart) — shown for incoming MUC messages.
@@ -84,8 +94,14 @@ pub struct MessageItem {
     /// A non-image/non-audio shared file's download URL, or empty (renders a file card with an
     /// "Open" button). The caption, if any, renders in `body` beneath it.
     pub file_url: String,
-    /// Display name for `file_url` (the URL's last path segment).
+    /// Display name for `file_url` (the sender's file name, else the URL's last path segment;
+    /// a type label in public groups).
     pub file_name: String,
+    /// The media type of the single shared file (from the sender's XEP-0447 description), or
+    /// empty. A PQ OMEMO2 upload URL has no extension, so this is what says what the file is.
+    pub file_mime: String,
+    /// The sender's name of the single shared file, to save a download under, or empty.
+    pub file_save_name: String,
     /// A message sharing SEVERAL files (XEP-0447): a JSON array of
     /// `{url, name, kind: image|audio|file, path}` — `path` is the local cache copy, empty
     /// until it is downloaded. Empty string for the single-file case, which keeps rendering
@@ -123,6 +139,158 @@ fn align(old: &[i64], new: &[i64]) -> Option<Alignment> {
     // deleted) resets instead.
     let reaches_end = old_start + overlap == old.len() || new_start + overlap == new.len();
     (lines_up && reaches_end && overlap > 0).then_some(Alignment { old_start, new_start, overlap })
+}
+
+#[cfg(test)]
+mod described_file_tests {
+    use super::{file_type_label, row_media_url, webxdc_url, MessageItem, MessageRow};
+
+    /// What monocles Android (and this client) send in a PQ OMEMO2 chat: an `aesgcm://` URL
+    /// without extension, its type only in the XEP-0447 description (the attachment column).
+    const OPAQUE: &str = "aesgcm://upload.example/slot/0123456789abcdef0123456789abcdef#00ff";
+
+    fn row(attachment: Option<String>, thread: Option<&str>, body: &str) -> MessageRow {
+        MessageRow {
+            id: 1,
+            conversation_id: 1,
+            stanza_id: None,
+            origin_id: None,
+            counterpart: "bob@example.com".into(),
+            direction: "in".into(),
+            body: Some(body.into()),
+            encryption: "omemo2".into(),
+            state: "received".into(),
+            edited_of: None,
+            retracted: false,
+            attachment,
+            reply_to: None,
+            omemo_fingerprint: None,
+            timestamp: "2026-11-13T00:00:00Z".into(),
+            thread: thread.map(str::to_string),
+            moderated: false,
+            moderation_reason: None,
+            unstyled: false,
+        }
+    }
+
+    fn described(mime: &str, name: &str) -> Option<String> {
+        Some(
+            serde_json::json!({
+                "url": OPAQUE, "mime": mime,
+                "files": [{ "url": OPAQUE, "mime": mime, "name": name }],
+            })
+            .to_string(),
+        )
+    }
+
+    #[test]
+    fn extensionless_upload_takes_its_type_from_the_description() {
+        assert_eq!(row_media_url(&row(described("image/png", "a.png"), None, "")), Some(OPAQUE.into()));
+        assert_eq!(row_media_url(&row(described("audio/ogg", "v.oga"), None, "")), Some(OPAQUE.into()));
+        assert_eq!(row_media_url(&row(described("application/pdf", "d.pdf"), None, "")), None);
+    }
+
+    #[test]
+    fn webxdc_is_recognised_by_its_described_type_only() {
+        let app = row(described("application/webxdc+zip", "chess.xdc"), Some("t"), "");
+        assert_eq!(webxdc_url(&app, ""), Some(OPAQUE.into()));
+        // A described file of another type in a thread is not an app, even without extension.
+        let pdf = row(described("application/pdf", "d.pdf"), Some("t"), "");
+        assert_eq!(webxdc_url(&pdf, ""), None);
+        // An undescribed, threaded, extension-less upload keeps the old guess.
+        let legacy = row(None, Some("t"), OPAQUE);
+        assert_eq!(webxdc_url(&legacy, OPAQUE), Some(OPAQUE.into()));
+    }
+
+    /// The described type only makes a file an inline image or audio player for the formats
+    /// that can actually be shown (and are fetched automatically for that).
+    #[test]
+    fn only_renderable_types_become_inline_media() {
+        for mime in ["image/svg+xml", "image/heic", "image/tiff", "audio/x-ms-wma", "video/mp4"] {
+            assert_eq!(row_media_url(&row(described(mime, "f"), None, "")), None, "{mime}");
+        }
+        assert_eq!(row_media_url(&row(described("IMAGE/JPEG; x=y", "a"), None, "")), Some(OPAQUE.into()));
+        assert_eq!(
+            row_media_url(&row(described("audio/ogg; codecs=opus", "v"), None, "")),
+            Some(OPAQUE.into())
+        );
+    }
+
+    /// A generic type says nothing about an app: the threaded, extension-less guess still applies.
+    #[test]
+    fn generic_type_keeps_the_webxdc_guess() {
+        let generic = row(described("application/octet-stream", "x"), Some("t"), "");
+        assert_eq!(webxdc_url(&generic, ""), Some(OPAQUE.into()));
+        let untyped = row(described("", "x"), Some("t"), "");
+        assert_eq!(webxdc_url(&untyped, ""), Some(OPAQUE.into()));
+        // Without a thread it is not an app.
+        let unthreaded = row(described("application/octet-stream", "x"), None, "");
+        assert_eq!(webxdc_url(&unthreaded, ""), None);
+    }
+
+    fn preview(m: &MessageRow) -> String {
+        MessageItem::from_row(m, true).preview_text
+    }
+
+    /// A message without text - a photo, voice message, file or app - still has something to
+    /// show when replied to: an icon and a label (or its caption).
+    #[test]
+    fn media_and_files_preview_by_icon_and_label() {
+        assert_eq!(preview(&row(described("image/png", "a.png"), None, "")), "🖼 Photo");
+        assert_eq!(preview(&row(described("image/png", "a.png"), None, "at the lake")), "🖼 at the lake");
+        assert_eq!(preview(&row(described("audio/ogg", "v.oga"), None, "")), "🎤 Voice message");
+        assert_eq!(preview(&row(described("application/pdf", "d.pdf"), None, "")), "📎 d.pdf");
+        assert_eq!(
+            preview(&row(described("application/webxdc+zip", "chess.xdc"), Some("t"), "")),
+            "🧩 chess"
+        );
+        let two = serde_json::json!({
+            "url": OPAQUE, "mime": "image/png",
+            "files": [
+                { "url": OPAQUE, "mime": "image/png", "name": "a.png" },
+                { "url": format!("{OPAQUE}1"), "mime": "application/pdf", "name": "d.pdf" },
+            ],
+        })
+        .to_string();
+        assert_eq!(preview(&row(Some(two.clone()), None, "")), "📎 2 files");
+        assert_eq!(preview(&row(Some(two), None, "both")), "📎 2 files · both");
+        // Text is shown as text; a retracted message as such.
+        assert_eq!(preview(&row(None, None, "hello\nthere")), "hello\nthere");
+        let mut gone = row(described("image/png", "a.png"), None, "");
+        gone.retracted = true;
+        assert_eq!(preview(&gone), "(message retracted)");
+        // Nothing is cached in the test, so no thumbnail.
+        assert_eq!(MessageItem::from_row(&row(described("image/png", "a.png"), None, ""), true).preview_image, "");
+    }
+
+    /// A reply quotes the quoted message's preview, not its (empty) text.
+    #[test]
+    fn reply_to_a_file_quotes_its_preview() {
+        let mut photo = row(described("image/jpeg", "p.jpg"), None, "");
+        photo.origin_id = Some("m1".into());
+        let mut answer = row(None, None, "nice");
+        answer.id = 2;
+        answer.reply_to = Some("m1".into());
+        let items = MessageItem::from_rows(&[photo, answer], true);
+        assert_eq!(items[1].reply_quote, "🖼 Photo");
+        assert_eq!(items[0].reply_quote, "");
+    }
+
+    #[test]
+    fn long_previews_are_capped() {
+        let long = "x".repeat(500);
+        let p = preview(&row(None, None, &long));
+        assert_eq!(p.chars().count(), super::PREVIEW_MAX_CHARS + 1);
+        assert!(p.ends_with('…'));
+    }
+
+    #[test]
+    fn label_falls_back_to_the_described_type() {
+        assert_eq!(file_type_label(OPAQUE, "application/pdf"), "PDF");
+        assert_eq!(file_type_label(OPAQUE, "image/jpeg"), "Image");
+        assert_eq!(file_type_label(OPAQUE, ""), "File");
+        assert_eq!(file_type_label("https://u.example/a/photo.jpg", "application/pdf"), "Image (JPG)");
+    }
 }
 
 #[cfg(test)]
@@ -244,13 +412,31 @@ pub struct AttachmentFile {
 impl AttachmentFile {
     /// How the file renders: inline image, audio player, or a file card.
     pub fn kind(&self) -> &'static str {
-        if self.mime.starts_with("image/") || image_url(&self.url).is_some() {
+        if image_url(&self.url).is_some() {
             "image"
-        } else if self.mime.starts_with("audio/") || audio_url(&self.url).is_some() {
+        } else if audio_url(&self.url).is_some() {
             "audio"
         } else {
-            "file"
+            renderable_kind(&self.mime).unwrap_or("file")
         }
+    }
+}
+
+/// How a file of media type `mime` can be shown inline: "image" or "audio" for exactly the
+/// formats [`image_url`] / [`audio_url`] accept by extension, else None (a file card). The type
+/// is the sender's word, and a single-file message is fetched automatically when it says
+/// "image" or "audio" - so `image/svg+xml`, `image/heic`, `audio/x-ms-wma` and the like must not
+/// turn into an image or a player that cannot show them.
+fn renderable_kind(mime: &str) -> Option<&'static str> {
+    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match mime.as_str() {
+        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "image/bmp" => {
+            Some("image")
+        }
+        "audio/ogg" | "audio/opus" | "audio/mp4" | "audio/x-m4a" | "audio/m4a" | "audio/mpeg"
+        | "audio/mp3" | "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/aac" | "audio/flac"
+        | "audio/x-flac" | "audio/amr" => Some("audio"),
+        _ => None,
     }
 }
 
@@ -289,8 +475,9 @@ pub fn attachment_files_json(json: &str) -> Vec<AttachmentFile> {
 /// The downloadable image/audio URL for a row: the attachment URL for captioned files, else the
 /// single-URL body heuristic (legacy / caption-less). Used by rendering and the prefetch.
 pub fn row_media_url(m: &MessageRow) -> Option<String> {
-    if let Some(att) = attachment_url(m) {
-        return image_url(&att).or_else(|| audio_url(&att));
+    if let Some(file) = attachment_files(m).into_iter().next() {
+        // By the described type first: a PQ OMEMO2 upload URL carries no extension.
+        return matches!(file.kind(), "image" | "audio").then_some(file.url);
     }
     m.body.as_deref().and_then(media_url)
 }
@@ -334,12 +521,13 @@ fn file_name_of(url: &str) -> String {
 
 /// A human file-type label from a URL's extension (e.g. "Image (JPG)", "Video (MP4)", "File"),
 /// used to name the download button in public groups where media isn't auto-fetched.
-fn file_type_label(url: &str) -> String {
+fn file_type_label(url: &str, mime: &str) -> String {
     let name = url.rsplit('/').next().unwrap_or("");
     let name = name.split(['?', '#']).next().unwrap_or(name).to_ascii_lowercase();
     let ext = match name.rsplit_once('.') {
         Some((_, e)) if !e.is_empty() => e.to_string(),
-        _ => return "File".to_string(),
+        // No extension (a PQ OMEMO2 upload): label by the described type instead.
+        _ => return mime_type_label(mime),
     };
     let kind = match ext.as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => "Image",
@@ -353,12 +541,81 @@ fn file_type_label(url: &str) -> String {
     format!("{} ({})", kind, ext.to_uppercase())
 }
 
+/// The longest preview line kept (in characters); the QML elides it further to the width.
+const PREVIEW_MAX_CHARS: usize = 160;
+
+/// `text` capped to [`PREVIEW_MAX_CHARS`] characters (with "…"). Line breaks are kept - the
+/// quote shows up to two lines - but trailing whitespace is not.
+fn capped_preview(text: &str) -> String {
+    let text = text.trim_end();
+    if text.chars().count() <= PREVIEW_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(PREVIEW_MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// A human label for a media type, for a file whose URL has no extension.
+fn mime_type_label(mime: &str) -> String {
+    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let label = match mime.as_str() {
+        "application/pdf" => "PDF",
+        WEBXDC_MIME => "App",
+        "application/zip" | "application/x-7z-compressed" | "application/vnd.rar"
+        | "application/x-tar" | "application/gzip" => "Archive",
+        m if m.starts_with("image/") => "Image",
+        m if m.starts_with("video/") => "Video",
+        m if m.starts_with("audio/") => "Audio",
+        m if m.starts_with("text/") => "Document",
+        m if m.starts_with("application/vnd.oasis.opendocument")
+            || m.starts_with("application/vnd.openxmlformats-officedocument")
+            || m == "application/msword" =>
+        {
+            "Document"
+        }
+        _ => "File",
+    };
+    label.to_string()
+}
+
+/// The media type of a WebXDC app archive.
+const WEBXDC_MIME: &str = "application/webxdc+zip";
+
 /// If the message is a shared WebXDC app, return its upload URL. Mirrors the GTK client's
 /// detection: a single file URL whose name ends `.xdc`, OR an encrypted (`aesgcm://`),
 /// **threaded**, extension-less upload — monocles Android names `.xdc` uploads by CID (no
 /// extension), but always attaches the instance `<thread>`; normal shared files keep their
 /// extension so they aren't misdetected.
 pub fn webxdc_url(m: &MessageRow, body: &str) -> Option<String> {
+    // A described file (XEP-0447, how monocles Android and this client share an app in a PQ
+    // OMEMO2 chat): its type says it, the URL has no extension. A described file of another
+    // type is never an app - the extension-less guess below is only for undescribed uploads.
+    let files = attachment_files(m);
+    if let [file] = files.as_slice() {
+        if file.mime.eq_ignore_ascii_case(WEBXDC_MIME)
+            || file_name_of(&file.url).to_ascii_lowercase().ends_with(".xdc")
+        {
+            return Some(file.url.clone());
+        }
+        let mime = file.mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if !mime.is_empty() && mime != "application/octet-stream" {
+            return None;
+        }
+        // A generic type (e.g. guessed from an extension-less OOB URL) says nothing: fall back
+        // to the guess below, for the attachment's URL as well as the body.
+        if let Some(url) = guessed_webxdc_url(m, &file.url) {
+            return Some(url);
+        }
+    } else if !files.is_empty() {
+        return None;
+    }
+    guessed_webxdc_url(m, body)
+}
+
+/// The undescribed-upload guess of [`webxdc_url`]: a single URL ending `.xdc`, or a threaded,
+/// extension-less `aesgcm://` upload.
+fn guessed_webxdc_url(m: &MessageRow, body: &str) -> Option<String> {
     let t = body.trim();
     if t.contains(char::is_whitespace) {
         return None;
@@ -397,17 +654,32 @@ impl MessageItem {
         // Several files in one message (XEP-0447): rendered as a tile per file, so the
         // single-file slots below stay empty and `body` keeps just the caption.
         let shared_files = if m.retracted { Vec::new() } else { attachment_files(m) };
+        // The one described file of a single-file message: its type decides how it renders
+        // (a PQ OMEMO2 upload URL has no extension to go by).
+        let single = if shared_files.len() == 1 { shared_files.first().cloned() } else { None };
+        let described = |url: &str| single.as_ref().filter(|f| f.url == url);
+        let is_image = |url: &str| {
+            image_url(url).is_some() || described(url).is_some_and(|f| f.kind() == "image")
+        };
+        let is_audio = |url: &str| {
+            audio_url(url).is_some() || described(url).is_some_and(|f| f.kind() == "audio")
+        };
+        let mime_of = |url: &str| described(url).map(|f| f.mime.clone()).unwrap_or_default();
+        let view = |url: &str| crate::session::media_view_typed(url, &mime_of(url));
         let mut attachments = String::new();
+        // The first already-cached photo of a multi-file message, for its preview.
+        let mut first_photo = String::new();
         if shared_files.len() > 1 {
-            let tiles: Vec<serde_json::Value> = shared_files
-                .iter()
-                .map(|f| {
-                    let path = crate::session::media_view(&f.url);
-                    serde_json::json!({
-                        "url": f.url, "name": f.name, "kind": f.kind(), "path": path,
-                    })
-                })
-                .collect();
+            let mut tiles: Vec<serde_json::Value> = Vec::with_capacity(shared_files.len());
+            for f in &shared_files {
+                let path = crate::session::media_view_typed(&f.url, &f.mime);
+                if first_photo.is_empty() && f.kind() == "image" && !path.is_empty() {
+                    first_photo = path.clone();
+                }
+                tiles.push(serde_json::json!({
+                    "url": f.url, "name": f.name, "kind": f.kind(), "path": path,
+                }));
+            }
             attachments = serde_json::to_string(&tiles).unwrap_or_default();
         }
         let (body, image_path, audio_path) = if m.moderated {
@@ -440,37 +712,33 @@ impl MessageItem {
                 .or_else(|| other_file_url(&raw))
             {
                 Some(url) => {
-                    let is_media = image_url(&url).is_some() || audio_url(&url).is_some();
-                    let cached = if is_media {
-                        crate::session::media_view(&url)
-                    } else {
-                        String::new()
-                    };
-                    if image_url(&url).is_some() && !cached.is_empty() {
+                    let is_media = is_image(&url) || is_audio(&url);
+                    let cached = if is_media { view(&url) } else { String::new() };
+                    if is_image(&url) && !cached.is_empty() {
                         (caption.clone(), cached, String::new())
-                    } else if audio_url(&url).is_some() && !cached.is_empty() {
+                    } else if is_audio(&url) && !cached.is_empty() {
                         (caption.clone(), String::new(), cached)
                     } else {
                         // Not downloaded yet (or a non-media file): a typed download button.
-                        file_name = file_type_label(&url);
+                        file_name = file_type_label(&url, &mime_of(&url));
                         file_url = url;
                         (caption.clone(), String::new(), String::new())
                     }
                 }
-                None => (raw, String::new(), String::new()),
+                None => (raw.clone(), String::new(), String::new()),
             }
-        } else if let Some(url) = image_url(&media_src) {
+        } else if let Some(url) = Some(media_src.trim().to_string()).filter(|u| is_image(u)) {
             // A shared image / large or animated sticker sent as an upload URL. Show it once the
             // background fetch has cached it (see session::prefetch_images), else a placeholder.
             // `caption` (empty for caption-less files) renders beneath the image.
-            match crate::session::media_view(&url) {
+            match view(&url) {
                 p if !p.is_empty() => (caption.clone(), p, String::new()),
                 _ if caption.is_empty() => ("🖼 Loading image…".to_string(), String::new(), String::new()),
                 _ => (caption.clone(), String::new(), String::new()),
             }
-        } else if let Some(url) = audio_url(&media_src) {
+        } else if let Some(url) = Some(media_src.trim().to_string()).filter(|u| is_audio(u)) {
             // A voice message / shared audio file — rendered as an in-bubble player once cached.
-            match crate::session::media_view(&url) {
+            match view(&url) {
                 p if !p.is_empty() => (caption.clone(), String::new(), p),
                 _ if caption.is_empty() => ("🎤 Voice message".to_string(), String::new(), String::new()),
                 _ => (caption.clone(), String::new(), String::new()),
@@ -478,16 +746,61 @@ impl MessageItem {
         } else if let Some(url) = att_url.as_deref() {
             // A captioned non-image/audio file: render a file card (Open button) + the caption.
             file_url = url.to_string();
-            file_name = file_name_of(url);
-            (caption, String::new(), String::new())
+            file_name = described(url).map(|f| f.name.clone()).unwrap_or_else(|| file_name_of(url));
+            (caption.clone(), String::new(), String::new())
         } else if let Some(url) = other_file_url(&raw) {
             // A caption-less file sent the legacy way (URL in the body): same file card.
             file_url = url.clone();
             file_name = file_name_of(&url);
             (String::new(), String::new(), String::new())
         } else {
-            (raw, String::new(), String::new())
+            (raw.clone(), String::new(), String::new())
         };
+        // The message in one short line, for replies to it: media and files by icon + label
+        // (a file without caption has no text at all), everything else by its text. Only an
+        // image that is already cached is shown - nothing is fetched for a preview.
+        let caption_or = |label: &str| {
+            if caption.trim().is_empty() { label.to_string() } else { caption.clone() }
+        };
+        let media = media_src.trim();
+        let (preview_text, preview_image) = if m.moderated {
+            ("(removed by a moderator)".to_string(), String::new())
+        } else if m.retracted {
+            ("(message retracted)".to_string(), String::new())
+        } else if shared_files.len() > 1 {
+            let n = shared_files.len();
+            let label = if shared_files.iter().all(|f| f.kind() == "image") {
+                format!("🖼 {n} photos")
+            } else {
+                format!("📎 {n} files")
+            };
+            let text = if raw.trim().is_empty() { label } else { format!("{label} · {}", raw.trim()) };
+            (text, first_photo)
+        } else if xdc_url.is_some() {
+            let name = single
+                .as_ref()
+                .map(|f| f.name.trim())
+                .filter(|n| !n.is_empty())
+                .map(|n| n.strip_suffix(".xdc").unwrap_or(n).to_string())
+                .unwrap_or_else(|| "App".to_string());
+            (format!("🧩 {name}"), String::new())
+        } else if is_sticker_cid(&raw) {
+            ("🙂 Sticker".to_string(), image_path.clone())
+        } else if is_image(media) {
+            (format!("🖼 {}", caption_or("Photo")), image_path.clone())
+        } else if is_audio(media) {
+            (format!("🎤 {}", caption_or("Voice message")), String::new())
+        } else if att_url.is_some() || other_file_url(&raw).is_some() {
+            let name = described(media)
+                .map(|f| f.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| file_name_of(media));
+            (format!("📎 {}", caption_or(&name)), String::new())
+        } else {
+            (raw.clone(), String::new())
+        };
+        let preview_text = capped_preview(&preview_text);
+
         // Only the sender's own text is styled - never our placeholders or tombstones.
         let body_html = if m.retracted || m.moderated {
             String::new()
@@ -506,6 +819,9 @@ impl MessageItem {
             marker: m.origin_id.clone().or_else(|| m.stanza_id.clone()).unwrap_or_default(),
             reply_quote: String::new(),
             reply_to: m.reply_to.clone().unwrap_or_default(),
+            reply_quote_image: String::new(),
+            preview_text,
+            preview_image,
             reactions: String::new(),
             sender: match m.counterpart.rsplit_once('/') {
                 Some((_, nick)) => nick.to_string(),
@@ -518,6 +834,8 @@ impl MessageItem {
             retracted: m.retracted,
             webxdc_url: xdc_url.unwrap_or_default(),
             thread: m.thread.clone().unwrap_or_default(),
+            file_mime: single.as_ref().map(|f| f.mime.clone()).unwrap_or_default(),
+            file_save_name: single.as_ref().map(|f| f.name.clone()).unwrap_or_default(),
             file_url,
             file_name,
             attachments,
@@ -529,26 +847,33 @@ impl MessageItem {
     /// (XEP-0461 `reply_to` points at another message's stanza/origin id). `auto_download` is
     /// false for public groups (media renders as a typed download button, never auto-fetched).
     pub fn from_rows(rows: &[MessageRow], auto_download: bool) -> Vec<MessageItem> {
-        let mut by_marker: HashMap<&str, &str> = HashMap::new();
-        for r in rows {
-            if let Some(body) = r.body.as_deref() {
-                if let Some(id) = r.stanza_id.as_deref() {
-                    by_marker.insert(id, body);
-                }
-                if let Some(id) = r.origin_id.as_deref() {
-                    by_marker.insert(id, body);
-                }
+        let mut items: Vec<MessageItem> =
+            rows.iter().map(|r| MessageItem::from_row(r, auto_download)).collect();
+        // A quote shows the quoted message's preview: its text, or for a photo, voice message
+        // or file an icon and label (plus the photo, if cached) - such messages have no text.
+        let mut by_marker: HashMap<&str, usize> = HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            if let Some(id) = r.stanza_id.as_deref() {
+                by_marker.insert(id, i);
+            }
+            if let Some(id) = r.origin_id.as_deref() {
+                by_marker.insert(id, i);
             }
         }
-        rows.iter()
+        let quotes: Vec<Option<(String, String)>> = rows
+            .iter()
             .map(|r| {
-                let mut item = MessageItem::from_row(r, auto_download);
-                if let Some(rt) = r.reply_to.as_deref() {
-                    item.reply_quote = by_marker.get(rt).map(|s| s.to_string()).unwrap_or_default();
-                }
-                item
+                let target = *by_marker.get(r.reply_to.as_deref()?)?;
+                Some((items[target].preview_text.clone(), items[target].preview_image.clone()))
             })
-            .collect()
+            .collect();
+        for (item, quote) in items.iter_mut().zip(quotes) {
+            if let Some((text, image)) = quote {
+                item.reply_quote = text;
+                item.reply_quote_image = image;
+            }
+        }
+        items
     }
 }
 
@@ -731,6 +1056,38 @@ pub struct MessageModelRust {
     limit: i64,
 }
 
+impl MessageModelRust {
+    /// How the sender described the file at `url` among the loaded messages: its kind (image,
+    /// audio, file) and its name. None when no loaded message describes it.
+    fn described_file(&self, url: &str) -> Option<(String, String)> {
+        for item in &self.items {
+            if item.file_url == url && !item.file_mime.is_empty() {
+                let file = AttachmentFile {
+                    url: url.to_string(),
+                    name: item.file_save_name.clone(),
+                    mime: item.file_mime.clone(),
+                };
+                return Some((file.kind().to_string(), item.file_save_name.clone()));
+            }
+            if item.attachments.is_empty() {
+                continue;
+            }
+            let Ok(tiles) = serde_json::from_str::<Vec<serde_json::Value>>(&item.attachments) else {
+                continue;
+            };
+            for tile in tiles {
+                if tile.get("url").and_then(|u| u.as_str()) == Some(url) {
+                    let text = |key: &str| {
+                        tile.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                    };
+                    return Some((text("kind"), text("name")));
+                }
+            }
+        }
+        None
+    }
+}
+
 impl qobject::MessageModel {
     pub fn open(mut self: Pin<&mut Self>, conversation_id: i64) {
         self.as_mut().rust_mut().conversation_id = conversation_id;
@@ -758,12 +1115,14 @@ impl qobject::MessageModel {
 
     pub fn download_attachment(self: Pin<&mut Self>, url: &QString) {
         let url = url.to_string();
-        if image_url(&url).is_some() || audio_url(&url).is_some() {
+        // What the sender described for this URL (a PQ OMEMO2 upload URL has no extension).
+        let (kind, name) = self.rust().described_file(&url).unwrap_or_default();
+        if image_url(&url).is_some() || audio_url(&url).is_some() || matches!(kind.as_str(), "image" | "audio") {
             // Media: fetch into the cache and reload so it renders inline in the bubble.
             crate::session::fetch_media(url, self.qt_thread());
         } else {
             // Other files: save to the downloads folder and open with the system handler.
-            crate::session::download_file(url, String::new());
+            crate::session::download_file(url, name);
         }
     }
 
@@ -947,6 +1306,9 @@ impl qobject::MessageModel {
             ROLE_ATTACHMENTS => QVariant::from(&QString::from(item.attachments.as_str())),
             ROLE_STANZA_ID => QVariant::from(&QString::from(item.stanza_id.as_str())),
             ROLE_BODY_HTML => QVariant::from(&QString::from(item.body_html.as_str())),
+            ROLE_PREVIEW_TEXT => QVariant::from(&QString::from(item.preview_text.as_str())),
+            ROLE_PREVIEW_IMAGE => QVariant::from(&QString::from(item.preview_image.as_str())),
+            ROLE_REPLY_QUOTE_IMAGE => QVariant::from(&QString::from(item.reply_quote_image.as_str())),
             _ => QVariant::default(),
         }
     }
@@ -994,6 +1356,9 @@ impl qobject::MessageModel {
         roles.insert(ROLE_ATTACHMENTS, QByteArray::from("attachments"));
         roles.insert(ROLE_STANZA_ID, QByteArray::from("stanzaId"));
         roles.insert(ROLE_BODY_HTML, QByteArray::from("bodyHtml"));
+        roles.insert(ROLE_PREVIEW_TEXT, QByteArray::from("previewText"));
+        roles.insert(ROLE_PREVIEW_IMAGE, QByteArray::from("previewImage"));
+        roles.insert(ROLE_REPLY_QUOTE_IMAGE, QByteArray::from("replyQuoteImage"));
         roles
     }
 }

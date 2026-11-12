@@ -687,7 +687,13 @@ impl CoreActor {
                 // Wipe all cached peer state (sessions, identities/trust, PQ pins, device lists)
                 // and the in-memory failure caches, then re-advertise our (unchanged) bundle so
                 // peers can re-establish. Our own identity/fingerprint is preserved.
-                self.store.reset_omemo2_peer_state(account_id).await?;
+                // Under the session lock, so an encrypt/decrypt in flight cannot store its
+                // (old) record back after the wipe.
+                {
+                    let session_lock = mxc_omemo::store::session_lock(account_id);
+                    let _guard = session_lock.lock().await;
+                    self.store.reset_omemo2_peer_state(account_id).await?;
+                }
                 xeps::omemo::forget_caches(account_id);
                 if let Err(e) = xeps::omemo::ensure_initialized(w, &self.store, cfg, &self.events).await {
                     warn!(error = %e, "omemo: republish after reset failed (will retry on reconnect)");

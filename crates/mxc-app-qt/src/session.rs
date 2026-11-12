@@ -460,15 +460,49 @@ static STORY_MEDIA_FAILED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| M
 /// has no usable extension gets one from its type — the copy is handed to the system player,
 /// which can't play a `.img`.
 pub(crate) fn story_view(url: &str, mime: &str) -> String {
-    let url_ext = url_ext(url);
-    let ext = match mime {
-        _ if url_ext != "img" => url_ext.as_str(),
+    media_view_typed(url, mime)
+}
+
+/// The extension for a media type, only if it is one of [`SAFE_OPEN_EXTENSIONS`] (the copy may
+/// be handed to the system's default application, and the type is the sender's word).
+pub(crate) fn safe_ext_for_mime(mime: &str) -> Option<&'static str> {
+    let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let ext = match mime.as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/avif" => "avif",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/x-m4a" | "audio/m4a" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" => "oga",
+        "audio/opus" => "opus",
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
         "video/mp4" => "mp4",
         "video/webm" => "webm",
         "video/quicktime" => "mov",
         "video/x-matroska" => "mkv",
         "video/3gpp" => "3gp",
-        _ => "img",
+        "application/pdf" => "pdf",
+        _ => return None,
+    };
+    debug_assert!(SAFE_OPEN_EXTENSIONS.contains(&ext));
+    Some(ext)
+}
+
+/// [`media_view`] for media whose type is known: the URL's own (safe) extension, else one from
+/// `mime` - a PQ OMEMO2 upload URL has none, and a player handed a `.img` can't play it.
+pub(crate) fn media_view_typed(url: &str, mime: &str) -> String {
+    let url_ext = url_ext(url);
+    let ext = if url_ext != "img" {
+        url_ext.as_str()
+    } else {
+        safe_ext_for_mime(mime).unwrap_or("img")
     };
     mxc_store::cache::view(&image_cache_path(url), Some(ext))
         .map(|p| p.to_string_lossy().into_owned())
@@ -2799,10 +2833,14 @@ pub fn download_file(url: String, filename: String) {
         .split(['?', '#'])
         .next()
         .unwrap_or("");
-    let filename = if !from_url.is_empty() {
+    // A PQ OMEMO2 upload URL ends in a random name without extension; then the sender's own
+    // file name (from its XEP-0447 description) is the better one to save under.
+    let given = filename.trim();
+    let has_ext = |name: &str| name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty());
+    let filename = if !from_url.is_empty() && (has_ext(from_url) || !has_ext(given)) {
         from_url.to_string()
-    } else if !filename.trim().is_empty() {
-        filename.trim().to_string()
+    } else if !given.is_empty() {
+        given.to_string()
     } else {
         "file".to_string()
     };
@@ -3214,7 +3252,22 @@ fn backend_update(qt: &CxxQtThread<Backend>, status: &str, connected: bool) {
 
 #[cfg(test)]
 mod received_file_tests {
-    use super::{image_cache_path, safe_to_open, url_ext};
+    use super::{image_cache_path, safe_ext_for_mime, safe_to_open, url_ext, SAFE_OPEN_EXTENSIONS};
+
+    #[test]
+    fn described_types_map_only_to_safe_extensions() {
+        assert_eq!(safe_ext_for_mime("image/jpeg"), Some("jpg"));
+        assert_eq!(safe_ext_for_mime("audio/ogg; codecs=opus"), Some("oga"));
+        assert_eq!(safe_ext_for_mime("Application/PDF"), Some("pdf"));
+        // Unknown, generic or executable types never get an extension a handler would run.
+        for mime in ["application/octet-stream", "application/x-desktop", "application/x-msdownload",
+                     "application/webxdc+zip", "text/html", ""] {
+            assert_eq!(safe_ext_for_mime(mime), None, "{mime}");
+        }
+        for mime in ["image/png", "image/webp", "audio/mpeg", "video/mp4", "video/webm", "audio/flac"] {
+            assert!(SAFE_OPEN_EXTENSIONS.contains(&safe_ext_for_mime(mime).unwrap()));
+        }
+    }
 
     #[test]
     fn cache_names_take_only_safe_extensions() {

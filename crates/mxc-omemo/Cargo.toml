@@ -33,6 +33,9 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+# join!/join_all to interleave encrypt and decrypt futures on one thread, as the client's
+# spawn_local tasks do (session-lock regression test).
+futures = { workspace = true }
 # The SCE tests re-parse `content_inner` with the same XML model the caller uses
 # (mxc-proto's `wrapped.parse::<Element>()`), so a reconstruction that is merely
 # self-consistent but not well-formed still fails the test.

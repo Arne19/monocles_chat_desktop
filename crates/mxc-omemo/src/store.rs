@@ -38,6 +38,34 @@ fn parts(address: &ProtocolAddress) -> (String, i64) {
     (address.name().to_string(), u32::from(address.device_id()) as i64)
 }
 
+/// The lock that serialises every change of this account's session records.
+///
+/// libsignal leaves that to the caller: `message_encrypt`, `message_decrypt_*` and
+/// `process_prekey_bundle` load a session record, change it and store it back, awaiting the
+/// database in between. Every stanza and every command runs as its own `spawn_local` task, so
+/// a decrypt and an encrypt for the same peer device can interleave at those awaits; the record
+/// stored last then discards the other's ratchet step, the two sides' ratchets drift apart and
+/// later messages fail to decrypt (seen with WebXDC, which sends and receives in quick
+/// succession). Same fix as monocles Android's `SQLiteAxolotlStore.getSessionLock()`.
+///
+/// Keyed by account rather than held in [`OmemoStores`], so that a store rebuilt after an
+/// identity change still shares it with tasks holding the old one.
+///
+/// Lock order: innermost. Hold it only around the libsignal call (store and database work) -
+/// never across network awaits, and never while calling something that takes it again (the
+/// mutex is not re-entrant).
+pub fn session_lock(account_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(account_id)
+        .or_default()
+        .clone()
+}
+
 /// Holder that vends the five per-account store views.
 #[derive(Clone)]
 pub struct OmemoStores {
@@ -65,6 +93,10 @@ impl OmemoStores {
             registration_id,
             pq_identity: Arc::new(pq_identity),
         }
+    }
+    /// [`session_lock`] of this account.
+    pub fn session_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        session_lock(self.account_id)
     }
     pub fn identity(&self) -> &IdentityKeyPair {
         &self.identity
