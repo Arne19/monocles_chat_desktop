@@ -1636,7 +1636,9 @@ pub async fn handle_iq(
                 if let Some(transport) = content.get_child("transport", jingle_sdp::NS_ICE) {
                     let calls = calls.borrow();
                     if let Some(call) = calls.active.get(&sid) {
-                        for c in transport.children().filter(|c| c.name() == "candidate") {
+                        // a real transport-info carries one or a few; never let one stanza
+                        // feed the ICE agent without bound
+                        for c in transport.children().filter(|c| c.name() == "candidate").take(MAX_CANDIDATES_PER_INFO) {
                             if let Some(line) = jingle_sdp::candidate_to_sdp(c) {
                                 call.engine.add_remote_ice(0, &format!("candidate:{line}"));
                             }
@@ -1686,6 +1688,9 @@ pub async fn handle_iq(
 }
 
 /// Reply to a Jingle IQ with a `<tie-break/>` error (XEP-0166 §8): crossed requests, ours wins.
+/// Upper bound on the candidates taken from one transport-info.
+const MAX_CANDIDATES_PER_INFO: usize = 32;
+
 fn tie_break(w: &Writer, iq: &Element) {
     let mut b = Element::builder("iq", NS_CLIENT).attr(crate::ncname("type"), "error");
     if let Some(from) = iq.attr("from") {

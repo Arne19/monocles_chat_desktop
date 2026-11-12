@@ -110,6 +110,9 @@ pub enum Command {
     /// XEP-0333 read marker; also zeroes the conversation's unread counter.
     MarkRead { account_id: i64, conversation_id: i64, to: String, stanza_id: String },
 
+    /// Disappearing messages: set the chat's timer (seconds, 0 = off) and tell the contact.
+    SetEphemeralTimer { account_id: i64, conversation_id: i64, to: String, seconds: i64 },
+
     /// XEP-0444 reaction set (full replace per spec).
     React { account_id: i64, to: String, target_id: String, emojis: Vec<String> },
 

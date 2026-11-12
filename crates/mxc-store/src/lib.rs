@@ -57,6 +57,7 @@ async fn repair_draft_migration_0020(pool: &SqlitePool) -> Result<()> {
 pub mod accounts;
 pub mod cache;
 pub mod calls;
+pub mod ephemeral;
 pub mod feeds;
 pub mod roster;
 pub mod messages;

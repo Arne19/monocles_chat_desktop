@@ -47,6 +47,7 @@ fn main() {
         "icons/lock-omemo2.svg",
         "icons/bookmark.svg",
         "icons/lock-open.svg",
+        "icons/timer.svg",
         "icons/members.svg",
         "icons/verified.svg",
         "icons/account-circle.svg",

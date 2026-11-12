@@ -1165,6 +1165,39 @@ pub fn set_auto_trust(value: bool) {
     }
 }
 
+/// Disappearing messages: report the timer of the direct chat with `jid` to QML.
+pub fn request_ephemeral_timer(jid: String) {
+    let Some((_, account_id, _)) = client_info() else { return };
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let seconds = store.conversation_ephemeral_timer_by_jid(account_id, &jid).await.unwrap_or(0);
+        emit_ephemeral_timer(jid, seconds);
+    });
+}
+
+fn emit_ephemeral_timer(jid: String, seconds: i64) {
+    if let Some(qt) = backend_qt() {
+        let seconds = i32::try_from(seconds).unwrap_or(0);
+        let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
+            backend.as_mut().ephemeral_timer_changed(QString::from(&jid), seconds);
+        });
+    }
+}
+
+/// Disappearing messages: set the timer of the direct chat with `jid`. The core stores it,
+/// tells the contact (encrypted in a PQ OMEMO2 chat) and answers with
+/// `Event::EphemeralTimerChanged`.
+pub fn set_ephemeral_timer(jid: String, seconds: i64) {
+    let Some((commands, account_id, _)) = client_info() else { return };
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let Ok(conversation_id) = store.conversation_id(account_id, &jid, "chat").await else { return };
+        let _ = commands
+            .send(Command::SetEphemeralTimer { account_id, conversation_id, to: jid, seconds })
+            .await;
+    });
+}
+
 /// Persist a conversation's encryption mode (used by the header lock toggle).
 pub fn set_conversation_encryption(conversation_id: i64, encrypted: bool) {
     let mode = if encrypted { "omemo2" } else { "none" };
@@ -1760,7 +1793,15 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                 // chats too: keep it while any of them still names that URL (Conversations
                 // b12fc68c8), or a sender could post a URL from elsewhere and retract it to
                 // delete everyone's copy.
-                Event::MessageRetracted { conversation_id, body, attachment, .. } => {
+                Event::EphemeralTimerChanged { conversation_id, seconds, .. } => {
+                    if let Ok(Some((jid, _))) = store.conversation_target(conversation_id).await {
+                        emit_ephemeral_timer(jid, seconds);
+                    }
+                }
+                // A disappearing message ran out: the core deleted the row; drop its cached
+                // media under the same "still used elsewhere?" rule as for a retraction.
+                Event::MessageExpired { conversation_id, body, attachment, .. }
+                | Event::MessageRetracted { conversation_id, body, attachment, .. } => {
                     let mut urls: Vec<String> =
                         body.as_deref().and_then(crate::messages::media_url).into_iter().collect();
                     for f in attachment.as_deref().map(crate::messages::attachment_files_json).unwrap_or_default() {

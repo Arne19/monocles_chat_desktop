@@ -137,6 +137,19 @@ pub enum Event {
         attachment: Option<String>,
     },
 
+    /// Disappearing messages: a message's timer ran out and it was deleted. `body` /
+    /// `attachment` are what it held (for dropping cached media).
+    MessageExpired {
+        account_id: i64,
+        conversation_id: i64,
+        message_id: i64,
+        body: Option<String>,
+        attachment: Option<String>,
+    },
+
+    /// Disappearing messages: the chat's timer changed (seconds, 0 = off).
+    EphemeralTimerChanged { account_id: i64, conversation_id: i64, seconds: i64 },
+
     /// XEP-0444: reaction tallies for a message changed.
     /// An outgoing message couldn't be sent; the UI restores the text + warns.
     SendFailed { account_id: i64, to: String, body: String, reason: String },

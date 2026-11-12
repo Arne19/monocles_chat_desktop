@@ -489,10 +489,10 @@ impl MessageItem {
             (raw, String::new(), String::new())
         };
         // Only the sender's own text is styled - never our placeholders or tombstones.
-        let body_html = if m.retracted || m.moderated || m.unstyled {
+        let body_html = if m.retracted || m.moderated {
             String::new()
         } else {
-            mxc_proto::xeps::styling::to_html(&body).unwrap_or_default()
+            mxc_proto::xeps::styling::to_html(&body, !m.unstyled).unwrap_or_default()
         };
         Self {
             id: m.id,

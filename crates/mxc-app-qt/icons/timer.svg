@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Disappearing messages: a stopwatch. White → tinted via ColorIcon. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="#ffffff" d="M9,1h6v2H9zM11,8h2v6h-2zM19.03,7.39l1.42-1.42 -1.41-1.41 -1.42,1.42C16.07,4.74 14.12,4 12,4c-4.97,0-9,4.03-9,9s4.02,9 9,9 9-4.03 9-9c0-2.12-0.74-4.07-1.97-5.61zM12,20c-3.87,0-7-3.13-7-7s3.13-7 7-7 7,3.13 7,7 -3.13,7-7,7z"/></svg>

@@ -227,8 +227,37 @@ pub fn contents_to_sdp_for(contents: &[&Element], remote_initiator: bool) -> Opt
     contents_to_sdp_impl(contents, Some(remote_initiator))
 }
 
+/// More m-lines than any call of ours has (audio, camera, screen) - a bound, not a feature.
+const MAX_CONTENTS: usize = 8;
+
+/// Whether `value` could break out of the SDP line it is written into. SDP is line based, so a
+/// CR or LF (or any other control character) in a value taken from the peer's Jingle would add
+/// lines of its own - for instance a second `a=fingerprint:`. That matters most in an
+/// OMEMO-verified call: only the fingerprint is encrypted there, everything around it reaches
+/// us the way the server passed it on.
+fn breaks_sdp_line(value: &str) -> bool {
+    value.chars().any(|c| c.is_control())
+}
+
+/// Whether any attribute value below `el` (or its text, where it has no children) would break
+/// out of an SDP line.
+fn carries_line_break(el: &Element) -> bool {
+    if el.attrs().iter().any(|(_, value)| breaks_sdp_line(value)) {
+        return true;
+    }
+    let mut children = el.children().peekable();
+    if children.peek().is_none() {
+        return breaks_sdp_line(&el.text());
+    }
+    children.any(carries_line_break)
+}
+
 fn contents_to_sdp_impl(contents: &[&Element], remote_initiator: Option<bool>) -> Option<String> {
-    if contents.is_empty() {
+    if contents.is_empty() || contents.len() > MAX_CONTENTS {
+        return None;
+    }
+    if contents.iter().any(|c| carries_line_break(c)) {
+        tracing::warn!("refusing Jingle content with control characters in it (SDP injection)");
         return None;
     }
     let mids: Vec<&str> = contents.iter().map(|c| c.attr("name").unwrap_or("0")).collect();
@@ -356,6 +385,9 @@ pub fn candidate_to_jingle(value: &str) -> Option<Element> {
 
 /// Jingle `<candidate>` element → SDP `candidate:` attribute value.
 pub fn candidate_to_sdp(c: &Element) -> Option<String> {
+    if carries_line_break(c) {
+        return None;
+    }
     let foundation = c.attr("foundation")?;
     let component = c.attr("component")?;
     let protocol = c.attr("protocol")?;
@@ -389,6 +421,43 @@ a=ssrc:42 cname:c\r\na=candidate:1 1 udp 2122260223 1.2.3.4 5000 typ host\r\n\
 m=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\na=rtcp-mux\r\n\
 a=ice-ufrag:aud\r\na=ice-pwd:audpwd\r\na=fingerprint:sha-256 AA:BB\r\na=setup:actpass\r\n\
 a=mid:1\r\na=sendrecv\r\na=rtpmap:96 VP8/90000\r\na=rtcp-fb:96 nack\r\na=ssrc:99 cname:c\r\n";
+
+    /// A value from the peer's Jingle must not be able to add SDP lines of its own.
+    #[test]
+    fn values_with_line_breaks_are_refused() {
+        let (contents, _) = sdp_to_contents(AUDIO_VIDEO_SDP);
+        let clean: Vec<&Element> = contents.iter().collect();
+        assert!(contents_to_sdp(&clean).is_some());
+
+        // XML happily carries a newline in an attribute value (&#10;)
+        let poisoned = String::from(&contents[0]).replace(
+            "name='opus'",
+            "name='opus/48000&#13;&#10;a=fingerprint:sha-256 EE:EE&#13;&#10;a=rtpmap:111 opus'",
+        );
+        assert_ne!(poisoned, String::from(&contents[0]), "test must actually poison the content");
+        let poisoned: Element = poisoned.parse().unwrap();
+        assert!(contents_to_sdp(&[&poisoned]).is_none());
+        assert!(contents_to_sdp_for(&[&poisoned], true).is_none());
+    }
+
+    #[test]
+    fn candidates_with_line_breaks_are_refused() {
+        let good = candidate_to_jingle("1 1 udp 2122260223 192.168.1.5 51234 typ host generation 0").unwrap();
+        assert!(candidate_to_sdp(&good).is_some());
+        let bad: Element = String::from(&good)
+            .replace("ip='192.168.1.5'", "ip='192.168.1.5 9 typ host&#10;a=fingerprint:sha-256 EE'")
+            .parse()
+            .unwrap();
+        assert!(bad.attr("ip").unwrap().contains('\n'), "test must actually poison the candidate");
+        assert!(candidate_to_sdp(&bad).is_none());
+    }
+
+    #[test]
+    fn absurd_number_of_contents_is_refused() {
+        let (contents, _) = sdp_to_contents(AUDIO_VIDEO_SDP);
+        let many: Vec<&Element> = std::iter::repeat(&contents[0]).take(MAX_CONTENTS + 1).collect();
+        assert!(contents_to_sdp(&many).is_none());
+    }
 
     #[test]
     fn audio_video_round_trip() {

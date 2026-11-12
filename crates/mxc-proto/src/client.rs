@@ -235,8 +235,16 @@ impl CoreActor {
         let mut backoff = std::time::Duration::from_secs(2);
         let mut reconnect_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
 
+        // Disappearing messages: delete what is due, also while offline.
+        let mut expiry_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                _ = expiry_tick.tick() => {
+                    xeps::messaging::expire_due(&self.store, &self.events).await;
+                }
+
                 // --- drain outgoing queue (only once online) ---
                 // Gated on `online`: sending a stanza mid-handshake (e.g. a FetchAvatar/
                 // FetchOwnKeys IQ the UI fires during an early/instant open, before SASL+bind
@@ -505,8 +513,19 @@ impl CoreActor {
             Command::SendChatState { to, state, .. } => {
                 xeps::messaging::send_chat_state(w, &self.store, cfg, &to, &state).await
             }
+            Command::SetEphemeralTimer { conversation_id, to, seconds, .. } => {
+                xeps::messaging::set_ephemeral_timer(
+                    w, &self.store, cfg, &self.events, conversation_id, &to, seconds,
+                )
+                .await
+            }
             Command::MarkRead { to, stanza_id, conversation_id, .. } => {
                 self.store.clear_unread(conversation_id).await.ok();
+                // Disappearing messages: what was just read starts counting down.
+                self.store
+                    .start_expiry_on_read(conversation_id, chrono::Utc::now().timestamp())
+                    .await
+                    .ok();
                 xeps::messaging::send_read_marker(w, &self.store, cfg, &to, &stanza_id).await
             }
             Command::React { to, target_id, emojis, .. } => {

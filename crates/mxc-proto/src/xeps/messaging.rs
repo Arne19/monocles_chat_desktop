@@ -94,6 +94,7 @@ pub async fn send_message(
             timestamp: now,
             thread: None,
             unstyled: false,
+            ephemeral_timer: store.conversation_ephemeral_timer(conv).await.unwrap_or(0),
         },
         false,
         /*live=*/ true,
@@ -154,7 +155,15 @@ async fn send_text_stanza(
     // on the outer stanza for plaintext and INSIDE the SCE envelope for OMEMO2, so that for an
     // encrypted chat the file names, sizes and the aesgcm URLs (whose fragment is the key) are
     // never readable by the server. See build_file_oob / build_multi_file_payloads.
-    let file_oob: &[Element] = file_payloads;
+    // Disappearing messages: the chat's timer rides on every message - next to the body, so
+    // inside the SCE envelope for OMEMO2 - and the server is asked not to archive it.
+    let timer = store.conversation_ephemeral_timer_by_jid(cfg.account_id, to).await.unwrap_or(0);
+    let mut payloads: Vec<Element> = file_payloads.to_vec();
+    if timer > 0 {
+        payloads.push(ephemeral_element(timer));
+        msg = msg.append(Element::builder("no-permanent-store", NS_HINTS).build());
+    }
+    let file_oob: &[Element] = &payloads;
     match encryption {
         Encryption::None => {
             if let Some(rid) = reply_to {
@@ -253,6 +262,8 @@ pub async fn flush_outbox(
 }
 
 const NS_HINTS: &str = "urn:xmpp:hints";
+/// Disappearing messages, as monocles Android.
+const NS_EPHEMERAL: &str = "urn:xmpp:ephemeral:0";
 const NS_MUC_USER: &str = "http://jabber.org/protocol/muc#user";
 const NS_ATTENTION: &str = "urn:xmpp:attention:0";
 const NS_OCCUPANT: &str = "urn:xmpp:occupant-id:0";
@@ -747,6 +758,7 @@ async fn persist_file_message(
             timestamp: now,
             thread: None,
             unstyled: false,
+            ephemeral_timer: store.conversation_ephemeral_timer(conv).await.unwrap_or(0),
         },
         false,
         /*live=*/ true,
@@ -828,6 +840,7 @@ pub async fn send_sticker(
             timestamp: now,
             thread: None,
             unstyled: false,
+            ephemeral_timer: store.conversation_ephemeral_timer(conv).await.unwrap_or(0),
         },
         false,
         /*live=*/ true,
@@ -873,6 +886,12 @@ async fn send_plain_sticker_stanza(
         msg = msg
             .append(Element::builder("request", NS_RECEIPTS).build())
             .append(Element::builder("markable", NS_MARKERS).build());
+    }
+    let timer = store.conversation_ephemeral_timer_by_jid(cfg.account_id, to).await.unwrap_or(0);
+    if timer > 0 {
+        msg = msg
+            .append(ephemeral_element(timer))
+            .append(Element::builder("no-permanent-store", NS_HINTS).build());
     }
     msg = msg
         .append(Element::builder("body", NS_CLIENT).append(cid_uri).build())
@@ -967,6 +986,7 @@ pub async fn send_webxdc_file(
             timestamp: now,
             thread: Some(thread),
             unstyled: false,
+            ephemeral_timer: 0,
         },
         false, /*live=*/ true, /*mentioned=*/ false, /*reply_to_me=*/ false,
     ).await?;
@@ -1061,6 +1081,7 @@ pub async fn send_webxdc_update(
                 timestamp: now,
                 thread: Some(thread.to_string()),
                 unstyled: false,
+                ephemeral_timer: 0,
             },
             false, /*live=*/ true, /*mentioned=*/ false, /*reply_to_me=*/ false,
         ).await?;
@@ -1458,6 +1479,7 @@ async fn persist_decrypt_failure(
         timestamp: ts.to_string(),
         thread: None,
         unstyled: false,
+        ephemeral_timer: 0,
     };
     if let Err(e) = persist_and_emit(
         store, cfg, events, conv, row,
@@ -1813,10 +1835,37 @@ async fn process_payload(
             (msg.clone(), "none", None)
         };
 
+    // Strict mode: in a chat set to PQ OMEMO2 everything about the conversation travels inside
+    // the encryption. An unencrypted stanza there can still be shown as an (unencrypted)
+    // message, but its receipts, read markers, typing, reactions, timer changes and app updates
+    // are the server's word, not the contact's - drop them before any handler sees them.
+    let content = if encryption != "omemo2"
+        && store.conversation_encryption_by_id(conv).await.ok().flatten().as_deref() == Some("omemo2")
+    {
+        strip_unauthenticated_metadata(content)
+    } else {
+        content
+    };
+
     // Whether this stanza was sent by us (another of our devices, or our own MUC reflection,
     // which arrives as Direction::In from our nick).
     // A proven own room echo already turned into Direction::Out above.
     let own_side = direction == Direction::Out;
+
+    // Disappearing messages. The timer a message carries is that message's own; whether the
+    // chat's setting follows is decided by timer_setting_change. 1:1 chats only.
+    let message_timer = ephemeral_stamp(&content);
+    if kind == "chat" {
+        let has_body = content.get_child("body", NS_CLIENT).is_some_and(|b| !b.text().is_empty());
+        let wants_out = content.get_child("i-want-out", NS_EPHEMERAL).is_some();
+        if let Some(seconds) = timer_setting_change(encryption == "omemo2", has_body, message_timer, wants_out) {
+            if store.set_conversation_ephemeral_timer(conv, seconds, unix_seconds(&ts)).await.unwrap_or(false) {
+                let _ = events.send(Event::EphemeralTimerChanged {
+                    account_id: cfg.account_id, conversation_id: conv, seconds,
+                }).await;
+            }
+        }
+    }
 
     // --- markers (0333) / receipts (0184) / chat-states (0085) from the content ---
     // Only the counterpart (an incoming stanza in this conversation) can confirm delivery/read
@@ -2140,8 +2189,10 @@ async fn process_payload(
     let mut reply_to_me = false;
     if direction == Direction::In && kind == "muc" {
         // XEP-0224 attention ("buzz") counts as a highlight.
+        // Read from the stanza itself only when that is all there is: beside an OMEMO2
+        // message it would be something the server could have added.
         let is_attention = content.get_child("attention", NS_ATTENTION).is_some()
-            || msg.get_child("attention", NS_ATTENTION).is_some();
+            || (encryption != "omemo2" && msg.get_child("attention", NS_ATTENTION).is_some());
         // Highlight on our MUC nick *and* our display name (the account's local part), like
         // monocles Android matches both getActualNick() and getActualName().
         let mut names: Vec<String> = Vec::new();
@@ -2206,6 +2257,7 @@ async fn process_payload(
         thread: content.get_child("thread", NS_CLIENT).map(|t| t.text()).filter(|s| !s.is_empty()),
         // XEP-0393: from the SCE content for OMEMO2, else from the stanza itself
         unstyled: content.get_child("unstyled", crate::xeps::styling::NS_STYLING).is_some(),
+        ephemeral_timer: message_timer.unwrap_or(0),
     };
     if pre_retracted {
         tracing::debug!(?marker_ids, "storing a message that was retracted before it arrived");
@@ -2556,6 +2608,130 @@ async fn fetch_row(store: &Store, conv: i64, message_id: i64) -> Option<mxc_stor
 }
 
 /// Insert a message (dedup-aware), bump unread if asked, and emit the UI events.
+fn ephemeral_element(seconds: i64) -> Element {
+    Element::builder("ephemeral", NS_EPHEMERAL)
+        .attr(crate::ncname("timer"), seconds.to_string())
+        .build()
+}
+
+/// The timer (seconds, > 0) stamped on a message, read from where its body is read.
+fn ephemeral_stamp(content: &Element) -> Option<i64> {
+    content
+        .get_child("ephemeral", NS_EPHEMERAL)
+        .and_then(|e| e.attr("timer"))
+        .and_then(|t| t.trim().parse::<i64>().ok())
+        .and_then(mxc_store::ephemeral::sane_timer)
+        .filter(|t| *t > 0)
+}
+
+/// Whether what a stanza carries changes the chat's timer setting, and to what (0 = off).
+///
+/// In a PQ OMEMO2 chat only an explicit change counts: `<i-want-out/>`, or an `<ephemeral/>`
+/// that comes on its own. The stamp on a message is that message's timer and nothing more, so
+/// a client that only stamps its messages cannot move our setting and nothing has to be guessed
+/// from a stamp being there or not. (All of it is read from the decrypted envelope; what is
+/// sent unencrypted in such a chat never gets here.)
+///
+/// In an unencrypted chat this follows monocles Android's cleartext behaviour: a stamp on a
+/// message sets the timer as well.
+fn timer_setting_change(encrypted: bool, has_body: bool, stamp: Option<i64>, wants_out: bool) -> Option<i64> {
+    if wants_out {
+        return Some(0);
+    }
+    match stamp {
+        Some(seconds) if !encrypted || !has_body => Some(seconds),
+        _ => None,
+    }
+}
+
+/// Conversation metadata that is only believed when it arrives encrypted in a PQ OMEMO2 chat.
+fn is_unauthenticated_metadata(el: &Element) -> bool {
+    el.ns() == NS_CHATSTATES
+        || (el.name() == "received" && (el.ns() == NS_RECEIPTS || el.ns() == NS_MARKERS))
+        || (el.name() == "displayed" && el.ns() == NS_MARKERS)
+        || el.ns() == NS_REACTIONS
+        || el.ns() == NS_EPHEMERAL
+        || (el.name() == "x" && el.ns() == super::webxdc::NS_WEBXDC)
+}
+
+/// `content` without the elements of [`is_unauthenticated_metadata`].
+fn strip_unauthenticated_metadata(mut content: Element) -> Element {
+    let unwanted: Vec<(String, String)> = content
+        .children()
+        .filter(|c| is_unauthenticated_metadata(c))
+        .map(|c| (c.name().to_string(), c.ns()))
+        .collect();
+    for (name, ns) in unwanted {
+        tracing::debug!(%name, "ignoring unencrypted metadata in a PQ OMEMO2 chat");
+        // one per listed element: remove_child takes the first match each time
+        let _ = content.remove_child(name.as_str(), ns.as_str());
+    }
+    content
+}
+
+/// Unix seconds of an RFC 3339 timestamp; now, if it does not parse.
+fn unix_seconds(rfc3339: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|t| t.timestamp())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp())
+}
+
+/// Change a chat's disappearing-message timer (0 = off) and tell the contact. In a PQ OMEMO2
+/// chat the announcement is encrypted like all other chat metadata; otherwise it is the
+/// cleartext control message monocles Android uses.
+pub async fn set_ephemeral_timer(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    events: &Sender<Event>,
+    conversation_id: i64,
+    to: &str,
+    seconds: i64,
+) -> anyhow::Result<()> {
+    let seconds = mxc_store::ephemeral::sane_timer(seconds).unwrap_or(0);
+    if store.conversation_kind(cfg.account_id, to).await?.as_deref() != Some("chat") {
+        anyhow::bail!("Disappearing messages are only available in direct chats");
+    }
+    if !store
+        .set_conversation_ephemeral_timer(conversation_id, seconds, chrono::Utc::now().timestamp())
+        .await?
+    {
+        return Ok(());
+    }
+    let control = if seconds > 0 {
+        ephemeral_element(seconds)
+    } else {
+        Element::builder("i-want-out", NS_EPHEMERAL).build()
+    };
+    send_meta(w, store, cfg, to, vec![control], true).await?;
+    let _ = events
+        .send(Event::EphemeralTimerChanged { account_id: cfg.account_id, conversation_id, seconds })
+        .await;
+    Ok(())
+}
+
+/// Delete the messages whose timer has run out and tell the UI.
+pub async fn expire_due(store: &Store, events: &Sender<Event>) {
+    let expired = match store.take_expired(chrono::Utc::now().timestamp()).await {
+        Ok(expired) => expired,
+        Err(e) => {
+            tracing::warn!(error = %e, "expiring messages failed");
+            return;
+        }
+    };
+    for gone in expired {
+        let _ = events
+            .send(Event::MessageExpired {
+                account_id: gone.account_id,
+                conversation_id: gone.conversation_id,
+                message_id: gone.message_id,
+                body: gone.body,
+                attachment: gone.attachment,
+            })
+            .await;
+    }
+}
+
 async fn persist_and_emit(
     store: &Store,
     cfg: &AccountConfig,
@@ -2600,6 +2776,13 @@ async fn persist_and_emit_with_remote_id(
         }
         if msg.unstyled {
             store.set_unstyled(id).await.ok();
+        }
+        // A timed message of ours counts down from when it was sent; one of theirs from when
+        // it is read (Store::start_expiry_on_read).
+        if msg.ephemeral_timer > 0 {
+            let expire_at = (msg.direction == Direction::Out)
+                .then(|| unix_seconds(&msg.timestamp) + msg.ephemeral_timer);
+            store.set_message_ephemeral(id, msg.ephemeral_timer, expire_at).await.ok();
         }
         if bump_unread {
             store.bump_unread(conv).await.ok();
@@ -3169,6 +3352,7 @@ mod retraction_tests {
             timestamp: "2026-10-21T00:00:00Z".into(),
             thread: None,
             unstyled: false,
+            ephemeral_timer: 0,
         }
     }
 
@@ -3368,5 +3552,102 @@ mod retraction_tests {
             assert_eq!(row.retracted, retracted, "{origin}");
             assert_eq!(row.stanza_id.as_deref(), Some(sid), "stanza-id backfilled");
         }
+    }
+}
+
+#[cfg(test)]
+mod ephemeral_tests {
+    use super::{
+        ephemeral_element, ephemeral_stamp, is_unauthenticated_metadata, strip_unauthenticated_metadata,
+        timer_setting_change, unix_seconds, NS_CLIENT,
+    };
+    use minidom::Element;
+
+    fn parse(xml: &str) -> Element {
+        xml.parse().unwrap()
+    }
+
+    /// PQ OMEMO2: only an explicit change moves the setting.
+    #[test]
+    fn encrypted_chat_follows_explicit_changes_only() {
+        // a timer on its own: the contact changed the setting
+        assert_eq!(timer_setting_change(true, false, Some(3600), false), Some(3600));
+        // "off", with or without a message
+        assert_eq!(timer_setting_change(true, false, None, true), Some(0));
+        assert_eq!(timer_setting_change(true, true, None, true), Some(0));
+        // a stamp on a message is that message's timer, not a change of our setting
+        assert_eq!(timer_setting_change(true, true, Some(3600), false), None);
+        // and a message without one says nothing at all
+        assert_eq!(timer_setting_change(true, true, None, false), None);
+        assert_eq!(timer_setting_change(true, false, None, false), None);
+    }
+
+    /// Unencrypted chats behave like monocles Android's cleartext path.
+    #[test]
+    fn cleartext_chat_also_follows_the_stamp() {
+        assert_eq!(timer_setting_change(false, true, Some(60), false), Some(60));
+        assert_eq!(timer_setting_change(false, false, Some(60), false), Some(60));
+        assert_eq!(timer_setting_change(false, true, None, true), Some(0));
+        assert_eq!(timer_setting_change(false, true, None, false), None);
+    }
+
+    #[test]
+    fn stamp_is_read_and_sanity_checked() {
+        let with = |timer: &str| {
+            parse(&format!(
+                "<message xmlns='{NS_CLIENT}'><body>hi</body><ephemeral xmlns='urn:xmpp:ephemeral:0' timer='{timer}'/></message>"
+            ))
+        };
+        assert_eq!(ephemeral_stamp(&with("3600")), Some(3600));
+        assert_eq!(ephemeral_stamp(&with("0")), None);
+        assert_eq!(ephemeral_stamp(&with("-5")), None);
+        assert_eq!(ephemeral_stamp(&with("abc")), None);
+        assert_eq!(ephemeral_stamp(&with("99999999999999")), None);
+        assert_eq!(ephemeral_stamp(&parse(&format!("<message xmlns='{NS_CLIENT}'><body>hi</body></message>"))), None);
+        // what we send is what we read
+        let mut msg = parse(&format!("<message xmlns='{NS_CLIENT}'/>"));
+        msg.append_child(ephemeral_element(300));
+        assert_eq!(ephemeral_stamp(&msg), Some(300));
+    }
+
+    /// Strict mode: the unencrypted stanza keeps its message, loses its metadata.
+    #[test]
+    fn unencrypted_metadata_is_stripped_but_the_message_stays() {
+        let msg = parse(&format!(
+            "<message xmlns='{NS_CLIENT}' from='bob@example.org/a' type='chat' id='m1'>\
+               <body>hello</body>\
+               <composing xmlns='http://jabber.org/protocol/chatstates'/>\
+               <received xmlns='urn:xmpp:receipts' id='x'/>\
+               <received xmlns='urn:xmpp:chat-markers:0' id='x'/>\
+               <displayed xmlns='urn:xmpp:chat-markers:0' id='x'/>\
+               <reactions xmlns='urn:xmpp:reactions:0' id='x'/>\
+               <ephemeral xmlns='urn:xmpp:ephemeral:0' timer='5'/>\
+               <i-want-out xmlns='urn:xmpp:ephemeral:0'/>\
+               <x xmlns='urn:xmpp:webxdc:0'/>\
+               <request xmlns='urn:xmpp:receipts'/>\
+               <markable xmlns='urn:xmpp:chat-markers:0'/>\
+               <origin-id xmlns='urn:xmpp:sid:0' id='m1'/>\
+             </message>"
+        ));
+        let stripped = strip_unauthenticated_metadata(msg);
+        assert_eq!(stripped.attr("from"), Some("bob@example.org/a"));
+        assert_eq!(stripped.attr("id"), Some("m1"));
+        let left: Vec<&str> = stripped.children().map(|c| c.name()).collect();
+        assert_eq!(left, vec!["body", "request", "markable", "origin-id"]);
+        assert!(!stripped.children().any(is_unauthenticated_metadata));
+    }
+
+    #[test]
+    fn nothing_to_strip_leaves_the_stanza_alone() {
+        let msg = parse(&format!("<message xmlns='{NS_CLIENT}' id='m1'><body>hello</body></message>"));
+        let stripped = strip_unauthenticated_metadata(msg.clone());
+        assert_eq!(String::from(&stripped), String::from(&msg));
+    }
+
+    #[test]
+    fn timestamps_become_unix_seconds() {
+        assert_eq!(unix_seconds("1970-01-01T00:01:40Z"), 100);
+        assert_eq!(unix_seconds("1970-01-01T01:01:40.250+01:00"), 100);
+        assert!(unix_seconds("not a time") > 1_700_000_000);
     }
 }

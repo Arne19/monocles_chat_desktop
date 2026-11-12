@@ -182,37 +182,172 @@ fn is_opening_position(region: &Region, i: usize, from: usize) -> bool {
         || (KEYWORDS.contains(&previous) && previous != region.at(i) && is_opening_position(region, i - 1, from))
 }
 
-/// The body as Qt rich text, or `None` when nothing is styled (render it as plain text then).
-/// Every character of the body is escaped; the only markup emitted is the styling itself.
-pub fn to_html(text: &str) -> Option<String> {
-    let mut styles = parse(text);
-    if styles.is_empty() {
-        return None;
+/// A detected link: first and last char of the link text, and its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub start: usize,
+    pub end: usize,
+    pub href: String,
+}
+
+/// Link prefixes recognised in message text, with the scheme prepended to the target.
+const LINK_PREFIXES: [(&str, &str); 4] = [("https://", ""), ("http://", ""), ("xmpp:", ""), ("www.", "https://")];
+
+fn starts_with_ci(chars: &[char], i: usize, prefix: &str) -> bool {
+    let mut k = i;
+    for p in prefix.chars() {
+        if k >= chars.len() || chars[k].to_ascii_lowercase() != p {
+            return false;
+        }
+        k += 1;
     }
+    true
+}
+
+/// Web (`http(s)://`, `www.`) and `xmpp:` links in plain text. A link starts at a word
+/// boundary and runs to whitespace or `<>"\``; trailing punctuation and styling directives are
+/// not part of it, nor is a closing parenthesis without a matching opening one inside the link.
+pub fn find_links(text: &str) -> Vec<Link> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut links = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let boundary = i == 0 || {
+            let p = chars[i - 1];
+            !(p.is_alphanumeric() || matches!(p, '@' | '/' | '.' | ':' | '-'))
+        };
+        let prefix = if boundary { LINK_PREFIXES.iter().find(|(p, _)| starts_with_ci(&chars, i, p)) } else { None };
+        let Some((prefix, scheme)) = prefix else {
+            i += 1;
+            continue;
+        };
+        let body_start = i + prefix.chars().count();
+        let mut end = body_start;
+        while end < chars.len() && !chars[end].is_whitespace() && !matches!(chars[end], '<' | '>' | '"' | '`') {
+            end += 1;
+        }
+        // Trim trailing punctuation, directives and unbalanced ')' (counted once, so hostile
+        // input stays linear).
+        let open_parens = chars[i..end].iter().filter(|&&c| c == '(').count();
+        let mut close_parens = chars[i..end].iter().filter(|&&c| c == ')').count();
+        while end > body_start {
+            let c = chars[end - 1];
+            let unbalanced_paren = c == ')' && close_parens > open_parens;
+            if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '*' | '_' | '~') || unbalanced_paren {
+                if c == ')' {
+                    close_parens -= 1;
+                }
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        let rest = &chars[body_start..end];
+        let valid = rest.first().is_some_and(|c| c.is_alphanumeric())
+            && (*prefix != "www." || rest.contains(&'.'));
+        if !valid {
+            i = end.max(i + 1);
+            continue;
+        }
+        let link_text: String = chars[i..end].iter().collect();
+        links.push(Link { start: i, end: end - 1, href: format!("{scheme}{link_text}") });
+        i = end;
+    }
+    links
+}
+
+fn push_escaped(out: &mut String, c: char) {
+    match c {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#39;"),
+        _ => out.push(c),
+    }
+}
+
+fn push_link_open(out: &mut String, link: &Link) {
+    out.push_str("<a href=\"");
+    link.href.chars().for_each(|c| push_escaped(out, c));
+    out.push_str("\">");
+}
+
+/// The body as Qt rich text, or `None` when there is nothing to mark up (render it as plain
+/// text then). Every character of the body is escaped; the only markup emitted is the XEP-0393
+/// styling itself (when `styled`; off for `<unstyled/>` messages) and links (see
+/// [`find_links`]; never inside preformatted text).
+pub fn to_html(text: &str, styled: bool) -> Option<String> {
+    let mut styles = if styled { parse(text) } else { Vec::new() };
     // Styles are laminar (nested or disjoint): open outer first, close inner first.
     styles.sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
+    // Code ranges never nest in each other, so they come out disjoint and sorted; links are
+    // sorted too, so one forward pass drops every link overlapping code (linear on hostile input).
+    let code: Vec<(usize, usize)> = styles
+        .iter()
+        .filter(|s| matches!(s.kind, Kind::PreformattedSpan | Kind::PreformattedBlock))
+        .map(|s| (s.start, s.end))
+        .collect();
+    let mut c = 0;
+    let links: Vec<Link> = find_links(text)
+        .into_iter()
+        .filter(|l| {
+            while c < code.len() && code[c].1 < l.start {
+                c += 1;
+            }
+            !(c < code.len() && code[c].0 <= l.end)
+        })
+        .collect();
+    if styles.is_empty() && links.is_empty() {
+        return None;
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len() + 64);
     out.push_str("<span style=\"white-space: pre-wrap;\">");
     let mut open: Vec<&Style> = Vec::new();
     let mut next = 0;
+    let mut next_link = 0;
+    // The link currently open, if any. Style tags inside a link close and reopen the <a> around
+    // them so the markup stays properly nested.
+    let mut in_link: Option<&Link> = None;
     for (i, c) in chars.iter().enumerate() {
-        while next < styles.len() && styles[next].start == i {
-            out.push_str(tag(styles[next].kind, false));
-            open.push(&styles[next]);
-            next += 1;
+        if next < styles.len() && styles[next].start == i {
+            if in_link.is_some() {
+                out.push_str("</a>");
+            }
+            while next < styles.len() && styles[next].start == i {
+                out.push_str(tag(styles[next].kind, false));
+                open.push(&styles[next]);
+                next += 1;
+            }
+            if let Some(l) = in_link {
+                push_link_open(&mut out, l);
+            }
         }
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(*c),
+        if next_link < links.len() && links[next_link].start == i {
+            push_link_open(&mut out, &links[next_link]);
+            in_link = Some(&links[next_link]);
+            next_link += 1;
         }
-        while open.last().is_some_and(|s| s.end == i) {
-            out.push_str(tag(open.pop().unwrap().kind, true));
+        push_escaped(&mut out, *c);
+        if in_link.is_some_and(|l| l.end == i) {
+            out.push_str("</a>");
+            in_link = None;
         }
+        if open.last().is_some_and(|s| s.end == i) {
+            if in_link.is_some() {
+                out.push_str("</a>");
+            }
+            while open.last().is_some_and(|s| s.end == i) {
+                out.push_str(tag(open.pop().unwrap().kind, true));
+            }
+            if let Some(l) = in_link {
+                push_link_open(&mut out, l);
+            }
+        }
+    }
+    if in_link.is_some() {
+        out.push_str("</a>");
     }
     while let Some(s) = open.pop() {
         out.push_str(tag(s.kind, true));
@@ -329,18 +464,82 @@ mod tests {
 
     #[test]
     fn html_rendering_escapes_everything() {
-        assert_eq!(to_html("plain <b>text</b>"), None);
+        assert_eq!(to_html("plain <b>text</b>", true), None);
         assert_eq!(
-            to_html("*<script>* & `x`"),
+            to_html("*<script>* & `x`", true),
             Some("<span style=\"white-space: pre-wrap;\"><b>*&lt;script&gt;*</b> &amp; <code>`x`</code></span>".into())
         );
         assert_eq!(
-            to_html("*_both_*"),
+            to_html("*_both_*", true),
             Some("<span style=\"white-space: pre-wrap;\"><b>*<i>_both_</i>*</b></span>".into())
         );
         assert_eq!(
-            to_html("> *q*"),
+            to_html("> *q*", true),
             Some("<span style=\"white-space: pre-wrap;\">&gt; <b>*q*</b></span>".into())
         );
+    }
+
+    fn link_texts(text: &str) -> Vec<(String, String)> {
+        let chars: Vec<char> = text.chars().collect();
+        find_links(text)
+            .into_iter()
+            .map(|l| (chars[l.start..=l.end].iter().collect(), l.href))
+            .collect()
+    }
+
+    #[test]
+    fn links_are_detected_and_trimmed() {
+        let l = |t: &str, h: &str| (t.to_string(), h.to_string());
+        assert_eq!(link_texts("see https://example.org/x?a=1."), [l("https://example.org/x?a=1", "https://example.org/x?a=1")]);
+        assert_eq!(link_texts("go to www.monocles.eu!"), [l("www.monocles.eu", "https://www.monocles.eu")]);
+        assert_eq!(
+            link_texts("(see https://en.wikipedia.org/wiki/A_(b))"),
+            [l("https://en.wikipedia.org/wiki/A_(b)", "https://en.wikipedia.org/wiki/A_(b)")]
+        );
+        assert_eq!(link_texts("join xmpp:room@muc.example?join"), [l("xmpp:room@muc.example?join", "xmpp:room@muc.example?join")]);
+        assert_eq!(link_texts("HTTP://EXAMPLE.ORG"), [l("HTTP://EXAMPLE.ORG", "HTTP://EXAMPLE.ORG")]);
+        assert_eq!(link_texts("*https://x.org*"), [l("https://x.org", "https://x.org")]);
+        for t in ["https://", "www.", "www.nodot", "foohttps://x.org", "user@www.x.org", "plain text"] {
+            assert!(find_links(t).is_empty(), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn links_render_escaped_and_nested() {
+        assert_eq!(
+            to_html("a https://x.org/?q=<b>&r=\"1\"", true),
+            Some(
+                "<span style=\"white-space: pre-wrap;\">a <a href=\"https://x.org/?q=\">https://x.org/?q=</a>&lt;b&gt;&amp;r=&quot;1&quot;</span>"
+                    .into()
+            )
+        );
+        assert_eq!(
+            to_html("*https://x.org*", true),
+            Some("<span style=\"white-space: pre-wrap;\"><b>*<a href=\"https://x.org\">https://x.org</a>*</b></span>".into())
+        );
+        assert_eq!(
+            to_html("`https://x.org`", true),
+            Some("<span style=\"white-space: pre-wrap;\"><code>`https://x.org`</code></span>".into())
+        );
+        // A styled span right after a link stays outside it.
+        assert_eq!(
+            to_html("https://x.org/a *b*", true),
+            Some("<span style=\"white-space: pre-wrap;\"><a href=\"https://x.org/a\">https://x.org/a</a> <b>*b*</b></span>".into())
+        );
+        assert_eq!(
+            to_html("*bold* https://x.org", false),
+            Some("<span style=\"white-space: pre-wrap;\">*bold* <a href=\"https://x.org\">https://x.org</a></span>".into())
+        );
+        assert_eq!(to_html("no links here", true), None);
+    }
+
+    #[test]
+    fn many_links_and_code_spans_stay_linear() {
+        let text = "`x` https://x.org ".repeat(50_000);
+        let t = std::time::Instant::now();
+        let html = to_html(&text, true).unwrap();
+        assert_eq!(html.matches("<a href=").count(), 50_000);
+        assert_eq!(html.matches("<code>").count(), 50_000);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
     }
 }

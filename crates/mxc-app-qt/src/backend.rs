@@ -680,6 +680,24 @@ pub mod qobject {
         #[cxx_name = "messageStored"]
         fn message_stored(self: Pin<&mut Backend>, conversation_id: i64);
 
+        /// Disappearing messages: the timer of the direct chat with `jid` is `seconds`
+        /// (0 = off). Emitted when it changes and in answer to `requestEphemeralTimer`.
+        #[qsignal]
+        #[cxx_name = "ephemeralTimerChanged"]
+        fn ephemeral_timer_changed(self: Pin<&mut Backend>, jid: QString, seconds: i32);
+
+        /// Ask for the disappearing-message timer of the direct chat with `jid`
+        /// (→ `ephemeralTimerChanged`).
+        #[qinvokable]
+        #[cxx_name = "requestEphemeralTimer"]
+        fn request_ephemeral_timer(self: &Backend, jid: &QString);
+
+        /// Set the disappearing-message timer of the direct chat with `jid` (seconds, 0 = off)
+        /// and tell the contact.
+        #[qinvokable]
+        #[cxx_name = "setEphemeralTimer"]
+        fn set_ephemeral_timer(self: &Backend, jid: &QString, seconds: i32);
+
         /// Emitted when a downloaded file finished saving; `path` is the local file. QML opens it
         /// with the system handler only if `open` (plain documents/media - see safe_to_open).
         #[qsignal]
@@ -1180,6 +1198,16 @@ impl qobject::Backend {
     }
 
     /// QML entry point — query a room's OMEMO capability.
+    /// QML entry point — report a conversation's disappearing-message timer.
+    pub fn request_ephemeral_timer(&self, jid: &QString) {
+        crate::session::request_ephemeral_timer(jid.to_string());
+    }
+
+    /// QML entry point — change a direct chat's disappearing-message timer.
+    pub fn set_ephemeral_timer(&self, jid: &QString, seconds: i32) {
+        crate::session::set_ephemeral_timer(jid.to_string(), i64::from(seconds.max(0)));
+    }
+
     pub fn muc_omemo_capable(&self, room: &QString) -> bool {
         crate::session::muc_omemo_capable(&room.to_string())
     }

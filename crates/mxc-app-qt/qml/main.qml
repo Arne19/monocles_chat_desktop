@@ -41,6 +41,24 @@ ApplicationWindow {
     property string currentPeerJid: ""
     property string currentPeerName: ""
     property bool currentPeerEncrypted: false
+    // Disappearing messages (direct chats): the open chat's id and its timer in seconds, 0 = off.
+    property bool currentPeerIsDirect: false
+    property int currentEphemeralTimer: 0
+    readonly property var ephemeralDurations: [30, 60, 300, 1800, 3600, 21600, 43200, 86400, 604800, 2592000]
+    function ephemeralLabel(seconds) {
+        if (seconds <= 0) return qsTr("Off")
+        if (seconds < 60) return qsTr("%n second(s)", "", seconds)
+        if (seconds < 3600) return qsTr("%n minute(s)", "", Math.round(seconds / 60))
+        if (seconds < 86400) return qsTr("%n hour(s)", "", Math.round(seconds / 3600))
+        return qsTr("%n day(s)", "", Math.round(seconds / 86400))
+    }
+    // Call after currentPeerJid is set: `direct` = a 1:1 chat (not a room or room PM).
+    function noteOpenedChat(direct) {
+        window.currentPeerIsDirect = direct
+        window.currentEphemeralTimer = 0
+        if (direct)
+            backend.requestEphemeralTimer(window.currentPeerJid)
+    }
     property string currentPeerAvatar: ""
     property string currentPeerPresence: ""
     property bool currentPeerIsMuc: false
@@ -442,6 +460,10 @@ ApplicationWindow {
         function onMessageStored(conversationId) {
             msgModel.noteStored(conversationId)
         }
+        function onEphemeralTimerChanged(jid, seconds) {
+            if (window.currentPeerIsDirect && jid === window.currentPeerJid)
+                window.currentEphemeralTimer = seconds
+        }
         function onRefreshOpen() {
             msgModel.reloadCurrent()
         }
@@ -572,6 +594,7 @@ ApplicationWindow {
         window.currentPeerPresence = presence
         window.currentPeerIsMuc = (kind === "muc")
         window.currentRoomOmemoCapable = (kind === "muc") ? backend.mucOmemoCapable(jid) : true
+        window.noteOpenedChat(kind === "chat")
         msgModel.open(convId)
     }
 
@@ -591,6 +614,7 @@ ApplicationWindow {
         // Set after the peer assignment above (which clears it) so the count-reset during
         // load doesn't snap to the bottom; jumpReady then scrolls to the message.
         messageList.pendingJumpMarker = marker
+        window.noteOpenedChat(kind === "chat")
         msgModel.openAround(convId, messageId, marker)
     }
 
@@ -604,6 +628,7 @@ ApplicationWindow {
         window.currentPeerPresence = presence
         window.currentPeerIsMuc = false
         window.currentRoomOmemoCapable = true
+        window.noteOpenedChat(true)
         msgModel.openPeer(jid)
     }
 
@@ -640,6 +665,7 @@ ApplicationWindow {
         window.currentPeerPresence = ""
         window.currentPeerIsMuc = true
         window.currentRoomOmemoCapable = backend.mucOmemoCapable(room)
+        window.noteOpenedChat(false)
         msgModel.openPeerKind(room, "muc")
     }
 
@@ -662,6 +688,7 @@ ApplicationWindow {
         window.currentPeerPresence = ""
         window.currentPeerIsMuc = false
         window.currentRoomOmemoCapable = true
+        window.noteOpenedChat(false)
         msgModel.openPeerKind(occupantJid, "muc_pm")
     }
 
@@ -1973,6 +2000,46 @@ ApplicationWindow {
                                     }
                                 }
 
+                                // Disappearing messages (direct chats): pick how long messages
+                                // stay. Highlighted while a timer is set.
+                                ToolButton {
+                                    id: ephemeralButton
+                                    implicitWidth: 32
+                                    implicitHeight: 32
+                                    visible: window.currentPeerIsDirect
+                                    opacity: window.currentEphemeralTimer > 0 ? 1.0 : 0.55
+                                    ToolTip.text: window.currentEphemeralTimer > 0
+                                        ? qsTr("Disappearing messages: %1").arg(window.ephemeralLabel(window.currentEphemeralTimer))
+                                        : qsTr("Disappearing messages: off")
+                                    ToolTip.visible: hovered
+                                    onClicked: ephemeralMenu.popup(ephemeralButton, 0, ephemeralButton.height)
+                                    contentItem: ColorIcon {
+                                        implicitWidth: 17
+                                        implicitHeight: 17
+                                        source: window.iconBase + "timer.svg"
+                                        color: "white"
+                                    }
+                                    Menu {
+                                        id: ephemeralMenu
+                                        MenuItem {
+                                            text: qsTr("Off")
+                                            checkable: true
+                                            checked: window.currentEphemeralTimer === 0
+                                            onTriggered: backend.setEphemeralTimer(window.currentPeerJid, 0)
+                                        }
+                                        Repeater {
+                                            model: window.ephemeralDurations
+                                            MenuItem {
+                                                required property int modelData
+                                                text: window.ephemeralLabel(modelData)
+                                                checkable: true
+                                                checked: window.currentEphemeralTimer === modelData
+                                                onTriggered: backend.setEphemeralTimer(window.currentPeerJid, modelData)
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // PQ OMEMO2 encryption toggle. Disabled for MUCs that can't do it.
                                 ToolButton {
                                     implicitWidth: 32
@@ -2540,6 +2607,12 @@ ApplicationWindow {
                                             enabled: !model.retracted
                                             onTriggered: window.startReply(model.marker, model.body)
                                         }
+                                        MenuItem {
+                                            text: qsTr("Copy text")
+                                            visible: model.body.length > 0 && !model.retracted
+                                            height: visible ? implicitHeight : 0
+                                            onTriggered: window.copyText(model.body)
+                                        }
                                         // Own plain-text messages can be corrected (XEP-0308).
                                         MenuItem {
                                             text: qsTr("Edit")
@@ -2898,9 +2971,10 @@ ApplicationWindow {
 
                                         Label {
                                             id: bubbleText
-                                            // XEP-0393 styling: `bodyHtml` is escaped rich text
-                                            // built in Rust (only <b>/<i>/<s>/<code>, no links or
-                                            // images); empty when nothing is styled.
+                                            // XEP-0393 styling + links: `bodyHtml` is escaped rich
+                                            // text built in Rust (only <b>/<i>/<s>/<code> and
+                                            // http(s)/xmpp <a> links, no images); empty when there
+                                            // is nothing to mark up.
                                             textFormat: model.bodyHtml.length > 0 ? Text.RichText : Text.PlainText
                                             visible: model.body.length > 0
                                             // A caption wraps to the width of the media above it
@@ -2923,6 +2997,12 @@ ApplicationWindow {
                                             // Colour emoji via the app font's emoji fallback (set in
                                             // main.rs) + the native renderer.
                                             renderType: Text.NativeRendering
+                                            linkColor: "#cfe0ff"
+                                            onLinkActivated: (url) => window.openSafeUrl(url)
+                                            HoverHandler {
+                                                cursorShape: bubbleText.hoveredLink.length > 0
+                                                             ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                            }
                                         }
 
                                         // Reaction chips (XEP-0444), laid out beside each other.

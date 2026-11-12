@@ -102,6 +102,9 @@ pub struct NewMessage {
     /// XEP-0393 `<unstyled/>`. Like `attachment`, not part of the INSERT; persist_and_emit
     /// sets it right after.
     pub unstyled: bool,
+    /// Disappearing messages: the timer (seconds) this message carries, 0 = none. Like
+    /// `attachment`, set right after the INSERT (see `Store::set_message_ephemeral`).
+    pub ephemeral_timer: i64,
 }
 
 /// The `muc_occupants.nick` key of an offline member's row. A control character can't occur in
@@ -286,6 +289,15 @@ impl Store {
         // Serialize the dedup-check + insert so two concurrent deliveries of the same message
         // (e.g. live groupchat + MAM catch-up) can't both miss the dedup and double-insert.
         let _guard = self.insert_lock.lock().await;
+        // A disappearing message that already expired here stays gone, whoever sends us
+        // another copy of it.
+        {
+            let markers: Vec<&str> =
+                [msg.stanza_id.as_deref(), msg.origin_id.as_deref()].into_iter().flatten().collect();
+            if !markers.is_empty() && self.was_expired(msg.conversation_id, &markers).await? {
+                return Ok(None);
+            }
+        }
         // Dedup: a matching origin-id or stanza-id in the same conversation means we've
         // already stored this (e.g. carbon + MAM, or our own echo).
         if msg.stanza_id.is_some() || msg.origin_id.is_some() {
@@ -525,6 +537,7 @@ impl Store {
             timestamp: timestamp.to_string(),
             thread: None,
             unstyled: false,
+            ephemeral_timer: 0,
         };
         // Dedup-aware: if this id already exists (e.g. a retry), don't double-insert.
         if self.insert_message(&msg).await?.is_none() {
@@ -1668,6 +1681,7 @@ mod sender_auth_tests {
             timestamp: "2026-10-04T00:00:00Z".into(),
             thread: None,
             unstyled: false,
+            ephemeral_timer: 0,
         }
     }
 
