@@ -15,14 +15,22 @@ cd "$(dirname "$0")/.."
 DB_FILE=".sqlx-dev.db"
 export DATABASE_URL="sqlite://$(pwd)/${DB_FILE}"
 
-if ! command -v sqlx >/dev/null 2>&1; then
+# `cargo install sqlx-cli` installs both `sqlx` and `cargo-sqlx` into ~/.cargo/bin, which is
+# often not on PATH (e.g. with a distro-packaged cargo). `cargo sqlx` still works then, because
+# cargo looks up `cargo-<subcommand>` in $CARGO_HOME/bin itself.
+if command -v sqlx >/dev/null 2>&1; then
+  SQLX=(sqlx)
+elif command -v cargo >/dev/null 2>&1 && cargo sqlx --version >/dev/null 2>&1; then
+  SQLX=(cargo sqlx)
+else
   echo "sqlx-cli not found. Install with: cargo install sqlx-cli --no-default-features --features sqlite,rustls"
-  echo "Or create the DB manually with sqlite3:"
-  echo "  sqlite3 ${DB_FILE} < crates/mxc-store/migrations/0001_init.sql"
+  echo "Or create the DB manually from ALL migrations with sqlite3:"
+  echo "  rm -f ${DB_FILE}; for m in crates/mxc-store/migrations/*.sql; do sqlite3 ${DB_FILE} < \"\$m\"; done"
+  echo "(or use the python snippet in README.md)"
   exit 1
 fi
 
-sqlx database create
-sqlx migrate run --source crates/mxc-store/migrations
+"${SQLX[@]}" database create
+"${SQLX[@]}" migrate run --source crates/mxc-store/migrations
 echo "Dev DB ready at $(pwd)/${DB_FILE}."
 echo "DATABASE_URL is set in .cargo/config.toml — update it if you move this folder."
