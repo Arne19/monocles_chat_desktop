@@ -531,28 +531,24 @@ pub async fn send_file(
     path: &str,
     caption: Option<&str>,
 ) -> anyhow::Result<()> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
-    let filename = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file")
-        .to_string();
-    let mime = crate::xeps::http_upload::guess_mime(&filename);
+    let file = prepare_shared_file(path, "file").await?;
     let caption = caption.map(str::trim).filter(|c| !c.is_empty());
 
     // PQ OMEMO2: uploaded under an opaque name and type, described only inside the encryption
     // by a <file-sharing/> - the same wire format as several files (see send_described_files).
     if is_omemo(store, cfg, to).await {
-        let url = crate::xeps::http_upload::upload_shared_file(w, cfg, &bytes, &filename, mime, true)
-            .await?;
-        let file = described_file(&url, &filename, mime, bytes.len());
-        return send_described_files(w, store, cfg, events, to, vec![file], caption, Encryption::Omemo2)
+        let url = crate::xeps::http_upload::upload_shared_file(
+            w, cfg, &file.bytes, &file.wire_name, &file.mime, true,
+        )
+        .await?;
+        let described = file.described(&url);
+        return send_described_files(w, store, cfg, events, to, vec![described], caption, Encryption::Omemo2)
             .await;
     }
 
-    let url = crate::xeps::http_upload::upload_encrypted(w, cfg, &bytes, &filename, mime).await?;
+    let url =
+        crate::xeps::http_upload::upload_encrypted(w, cfg, &file.bytes, &file.wire_name, &file.mime)
+            .await?;
     let encryption = Encryption::None;
     // A file send only reaches here after a successful HTTP upload, i.e. we're online.
     let origin_id = new_id("msg");
@@ -607,18 +603,12 @@ pub async fn send_files(
     // Upload first: a failed upload must not leave a half-described message on the wire.
     let mut uploaded: Vec<serde_json::Value> = Vec::with_capacity(paths.len());
     for path in paths {
-        let bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
-        let name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-        let mime = crate::xeps::http_upload::guess_mime(&name);
-        let url =
-            crate::xeps::http_upload::upload_shared_file(w, cfg, &bytes, &name, mime, omemo2).await?;
-        uploaded.push(described_file(&url, &name, mime, bytes.len()));
+        let file = prepare_shared_file(path, "file").await?;
+        let url = crate::xeps::http_upload::upload_shared_file(
+            w, cfg, &file.bytes, &file.wire_name, &file.mime, omemo2,
+        )
+        .await?;
+        uploaded.push(file.described(&url));
     }
 
     let encryption = if omemo2 { Encryption::Omemo2 } else { Encryption::None };
@@ -628,6 +618,102 @@ pub async fn send_files(
 /// One uploaded file as [`send_described_files`] and the `attachment` column take it.
 fn described_file(url: &str, name: &str, mime: &str, size: usize) -> serde_json::Value {
     serde_json::json!({ "url": url, "mime": mime, "name": name, "size": size as i64 })
+}
+
+/// A file about to be shared in a chat, prepared so that it gives away nothing but itself.
+struct SharedFile {
+    /// The content to upload: for photos and videos without location and device metadata.
+    bytes: Vec<u8>,
+    /// The name others see (upload slot, URL, `<file-sharing/>`): random, the extension kept.
+    wire_name: String,
+    /// The real file name, shown only in the user's own chat.
+    local_name: String,
+    /// The type, from the content where it can be recognised, else from the name.
+    mime: String,
+}
+
+impl SharedFile {
+    /// [`described_file`] with the random name, plus the real one for the user's own chat (see
+    /// [`local_attachment_files`]).
+    fn described(&self, url: &str) -> serde_json::Value {
+        let mut file = described_file(url, &self.wire_name, &self.mime, self.bytes.len());
+        file["local_name"] = serde_json::json!(self.local_name);
+        file
+    }
+}
+
+/// Reads `path` and prepares it for sharing: photos and videos stripped of metadata (see
+/// [`strip_for_sharing`]), and a random name in place of the real one, which can say more
+/// than meant ("passport Anna.pdf", "IMG_20261113_Berlin.jpg"). Fails rather than send a
+/// photo or video whose metadata could not be removed.
+async fn prepare_shared_file(path: &str, fallback_name: &str) -> anyhow::Result<SharedFile> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
+    let local_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(fallback_name)
+        .to_string();
+    let fallback_mime = crate::xeps::http_upload::guess_mime(&local_name).to_string();
+    let (bytes, mime) =
+        tokio::task::spawn_blocking(move || strip_for_sharing(bytes, &fallback_mime)).await??;
+    let wire_name = wire_file_name(safe_extension(&local_name).as_deref());
+    Ok(SharedFile { bytes, wire_name, local_name, mime })
+}
+
+/// The bytes to share and their type. Photos and videos of a type [`crate::media_strip`] can
+/// clean lose their location, device and time metadata; if that fails the file is not sent.
+/// Other formats - also images it cannot clean, like HEIC - go out unchanged, as monocles
+/// Android sends what it cannot re-encode.
+pub(crate) fn strip_for_sharing(data: Vec<u8>, fallback_mime: &str) -> anyhow::Result<(Vec<u8>, String)> {
+    use anyhow::Context;
+    let mime = crate::media_strip::sniff(&data).unwrap_or(fallback_mime).to_string();
+    if crate::media_strip::can_strip(&mime) {
+        let stripped = crate::media_strip::strip(&data, &mime).context(
+            "Could not remove location and device data from this file. It was not sent",
+        )?;
+        Ok((stripped, mime))
+    } else {
+        Ok((data, mime))
+    }
+}
+
+/// The extension of `name`, lower case, if it is a plain one (at most 5 ASCII letters and
+/// digits) - anything else is not worth keeping on the wire.
+pub(crate) fn safe_extension(name: &str) -> Option<String> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() || ext.len() > 5 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// A random file name for the wire: 32 hex characters, plus `ext` so that receivers still know
+/// the type (in an unencrypted chat that is all they have). Unlike a content hash it does not
+/// tell that two shares are the same file.
+fn wire_file_name(ext: Option<&str>) -> String {
+    let random = crate::xeps::http_upload::opaque_upload_name();
+    match ext {
+        Some(ext) => format!("{random}.{ext}"),
+        None => random,
+    }
+}
+
+/// The files as the user's own chat stores them: with their real names, which never went out.
+fn local_attachment_files(uploaded: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    uploaded
+        .iter()
+        .map(|file| {
+            let mut file = file.clone();
+            if let Some(obj) = file.as_object_mut() {
+                if let Some(local) = obj.remove("local_name") {
+                    obj.insert("name".into(), local);
+                }
+            }
+            file
+        })
+        .collect()
 }
 
 /// Send already uploaded `files` as ONE message described by XEP-0447 `<file-sharing/>`
@@ -653,14 +739,15 @@ async fn send_described_files(
     let payloads = build_multi_file_payloads(&uploaded, &spans, &origin_id);
     send_text_stanza(w, store, cfg, to, &wire_body, encryption, &None, &origin_id, &payloads)
         .await?;
-    // Stored locally as ONE message: body = caption, every file in the attachment column.
+    // Stored locally as ONE message: body = caption, every file in the attachment column - under
+    // its real name, which only the user's own chat knows.
     persist_file_message(
         store,
         cfg,
         events,
         to,
         caption.unwrap_or(""),
-        attachment_json_files(&uploaded),
+        attachment_json_files(&local_attachment_files(&uploaded)),
         encryption,
         &origin_id,
     )
@@ -825,37 +912,35 @@ pub async fn send_sticker(
     to: &str,
     path: &str,
 ) -> anyhow::Result<()> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
-    let filename = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("sticker")
-        .to_string();
-    let mime = crate::xeps::http_upload::guess_mime(&filename);
+    // Like any shared file: metadata stripped, a random name on the wire.
+    let file = prepare_shared_file(path, "sticker").await?;
+    let bytes = &file.bytes;
+    let mime = file.mime.as_str();
 
     // Encrypted chat, or a too-large image → upload (encrypted when OMEMO2) and send the URL.
     if is_omemo(store, cfg, to).await {
         // Like any file in a PQ OMEMO2 chat: opaque upload, described inside the encryption.
-        let url = crate::xeps::http_upload::upload_shared_file(w, cfg, &bytes, &filename, mime, true)
-            .await?;
-        let file = described_file(&url, &filename, mime, bytes.len());
-        return send_described_files(w, store, cfg, events, to, vec![file], None, Encryption::Omemo2)
+        let url = crate::xeps::http_upload::upload_shared_file(
+            w, cfg, bytes, &file.wire_name, mime, true,
+        )
+        .await?;
+        let described = file.described(&url);
+        return send_described_files(w, store, cfg, events, to, vec![described], None, Encryption::Omemo2)
             .await;
     }
     if bytes.len() > super::bob::MAX_INLINE {
-        let url = crate::xeps::http_upload::upload_encrypted(w, cfg, &bytes, &filename, mime).await?;
+        let url =
+            crate::xeps::http_upload::upload_encrypted(w, cfg, bytes, &file.wire_name, mime).await?;
         return send_message(w, store, cfg, events, to, &url, Encryption::None, None, true, None).await;
     }
 
     // Plaintext chat → a genuine inline sticker (XEP-0231 BoB) carried on the cleartext message.
-    let cid_ssp = super::bob::cid_ssp(&bytes);
+    let cid_ssp = super::bob::cid_ssp(bytes);
     let cid_uri = format!("cid:{cid_ssp}");
-    let _ = super::bob::save(&cid_uri, &bytes);
+    let _ = super::bob::save(&cid_uri, bytes);
 
     let origin_id = new_id("msg");
-    send_plain_sticker_stanza(w, store, cfg, to, &cid_uri, &cid_ssp, mime, &bytes, &origin_id).await?;
+    send_plain_sticker_stanza(w, store, cfg, to, &cid_uri, &cid_ssp, mime, bytes, &origin_id).await?;
 
     let conv_kind = match store.conversation_kind(cfg.account_id, to).await?.as_deref() {
         Some("muc") => "muc",
@@ -3004,6 +3089,95 @@ mod sce_time_reference_tests {
 #[cfg(test)]
 mod file_caption_tests {
     use super::*;
+
+    /// Shared files go out under a random name; only the extension is kept, so receivers still
+    /// know the type.
+    #[test]
+    fn wire_names_are_random_and_keep_only_the_extension() {
+        let a = wire_file_name(Some("pdf"));
+        let b = wire_file_name(Some("pdf"));
+        let (stem, ext) = a.rsplit_once('.').unwrap();
+        assert_eq!(ext, "pdf");
+        assert_eq!(stem.len(), 32);
+        assert!(stem.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        let bare = wire_file_name(None);
+        assert_eq!(bare.len(), 32);
+        assert!(!bare.contains('.'));
+    }
+
+    #[test]
+    fn only_plain_extensions_are_kept() {
+        assert_eq!(safe_extension("Passport scan Anna.PDF").as_deref(), Some("pdf"));
+        assert_eq!(safe_extension("backup.tar.gz").as_deref(), Some("gz"));
+        assert_eq!(safe_extension("x.verylong"), None);
+        assert_eq!(safe_extension("x.p-f"), None);
+        assert_eq!(safe_extension("noext"), None);
+        assert_eq!(safe_extension(".bashrc"), None);
+        assert_eq!(safe_extension("trailing."), None);
+    }
+
+    fn jpeg_with_gps() -> Vec<u8> {
+        let mut j = vec![0xFF, 0xD8];
+        let mut exif = b"Exif\0\0MM\x00\x2A\x00\x00\x00\x08\x00\x00".to_vec();
+        exif.extend_from_slice(b"GPS-SECRET");
+        j.extend_from_slice(&[0xFF, 0xE1]);
+        j.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        j.extend_from_slice(&exif);
+        j.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x04, 0x00, 0x01]);
+        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x03, 0x01, 0x12, 0xFF, 0x00, 0x34]);
+        j.extend_from_slice(&[0xFF, 0xD9]);
+        j
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A photo loses its location and device data before it is shared; what cannot be cleaned
+    /// but is no photo/video format we handle goes out unchanged; a photo that cannot be
+    /// cleaned is not sent at all.
+    #[test]
+    fn shared_photos_lose_their_metadata() {
+        // The type comes from the content even when the name says otherwise.
+        let (out, mime) = strip_for_sharing(jpeg_with_gps(), "application/octet-stream").unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert!(out.starts_with(&[0xFF, 0xD8]));
+        assert!(!contains(&out, b"GPS-SECRET"));
+        assert!(!contains(&out, b"Exif"));
+
+        let text = b"just some notes".to_vec();
+        let (out, mime) = strip_for_sharing(text.clone(), "text/plain").unwrap();
+        assert_eq!((out, mime.as_str()), (text, "text/plain"));
+
+        // A HEIC photo cannot be cleaned here; like on Android it goes out as it is (and is
+        // not mistaken for an MP4 video, whose cleaner would refuse it).
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0mif1heic".to_vec();
+        let (out, mime) = strip_for_sharing(heic.clone(), "application/octet-stream").unwrap();
+        assert_eq!((out, mime.as_str()), (heic, "image/heic"));
+
+        // Only a start-of-image marker: recognised as JPEG, cannot be cleaned, not sent.
+        assert!(strip_for_sharing(vec![0xFF, 0xD8, 0xFF], "image/jpeg").is_err());
+    }
+
+    /// Others see the random name, the user's own chat the real one.
+    #[test]
+    fn the_real_name_stays_in_the_own_chat() {
+        let file = SharedFile {
+            bytes: vec![1, 2, 3],
+            wire_name: "0123456789abcdef0123456789abcdef.pdf".into(),
+            local_name: "Passport scan Anna.pdf".into(),
+            mime: "application/pdf".into(),
+        };
+        let uploaded = vec![file.described("aesgcm://up.example/s/x#00")];
+        let wire = file_sharing_element(&uploaded[0], None).unwrap();
+        let wire_xml = String::from(&wire);
+        assert!(wire_xml.contains("0123456789abcdef0123456789abcdef.pdf"));
+        assert!(!wire_xml.contains("Passport"));
+        let local = local_attachment_files(&uploaded);
+        assert_eq!(local[0]["name"], "Passport scan Anna.pdf");
+        assert!(local[0].get("local_name").is_none());
+    }
 
     /// A PQ OMEMO2 file is uploaded under a random name without extension...
     #[test]

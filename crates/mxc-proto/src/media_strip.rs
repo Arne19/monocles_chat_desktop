@@ -55,6 +55,12 @@ pub fn sniff(data: &[u8]) -> Option<&'static str> {
         Some(match &data[8..12] {
             b"qt  " => "video/quicktime",
             b if b.starts_with(b"3g") => "video/3gpp",
+            // HEIF/AVIF photos are ISO-BMFF as well, but not videos: they must not reach the
+            // MP4 cleaner (which would refuse or mangle them).
+            b"heic" | b"heix" | b"heim" | b"heis" | b"hevc" | b"hevx" | b"mif1" | b"msf1" => {
+                "image/heic"
+            }
+            b"avif" | b"avis" => "image/avif",
             _ => "video/mp4",
         })
     } else if data.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
@@ -854,5 +860,10 @@ mod tests {
         assert!(strip(b"not an image", "image/jpeg").is_err());
         assert!(strip(b"x", "image/heic").is_err());
         assert!(!can_strip("image/heic"));
+        // HEIF/AVIF photos are ISO-BMFF too, but are recognised as images, not videos.
+        assert_eq!(sniff(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"), Some("image/heic"));
+        assert_eq!(sniff(b"\0\0\0\x18ftypmif1\0\0\0\0mif1heic"), Some("image/heic"));
+        assert_eq!(sniff(b"\0\0\0\x1cftypavif\0\0\0\0avifmif1"), Some("image/avif"));
+        assert_eq!(sniff(b"\0\0\0\x18ftypisom\0\0\0\0isomiso2"), Some("video/mp4"));
     }
 }

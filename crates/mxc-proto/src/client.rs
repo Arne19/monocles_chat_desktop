@@ -1157,10 +1157,10 @@ impl CoreActor {
 /// Returns the URL and the uploaded type.
 async fn upload_broadcast_media(w: &Writer, cfg: &AccountConfig, path: &str) -> anyhow::Result<(String, String)> {
     let bytes = tokio::fs::read(path).await?;
-    let ext = std::path::Path::new(path)
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .filter(|e| !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+    let file_name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned());
+    let ext = file_name
+        .as_deref()
+        .and_then(xeps::messaging::safe_extension)
         .unwrap_or_else(|| "bin".into());
     let fallback = xeps::http_upload::guess_mime(&format!("x.{ext}"));
     let (bytes, mime) =
