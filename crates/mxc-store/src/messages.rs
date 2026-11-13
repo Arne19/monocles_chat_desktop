@@ -688,6 +688,49 @@ impl Store {
         Ok(id)
     }
 
+    /// The direction (`in`/`out`) of the newest message in `conversation_id` whose stanza-id is
+    /// `stanza_id`. In a group chat a reply names the room's stanza-id; the sender-chosen
+    /// origin-id is not used to resolve it.
+    pub async fn direction_by_stanza_id(&self, conversation_id: i64, stanza_id: &str) -> Result<Option<String>> {
+        let direction: Option<String> = sqlx::query_scalar(
+            r#"SELECT direction FROM messages
+               WHERE conversation_id = ?1 AND stanza_id = ?2
+               ORDER BY id DESC LIMIT 1"#,
+        )
+        .bind(conversation_id)
+        .bind(stanza_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(direction)
+    }
+
+    /// Whether `marker_id` names a message of this sender side (same rules as
+    /// [`Self::find_from_sender`], fingerprint aside) that is already retracted. A correction of
+    /// such a message is dropped: retracted is final, and a late correction (archive catch-up,
+    /// a re-delivered stanza) must neither bring the content back nor show up as a new message.
+    pub async fn retracted_from_sender(
+        &self,
+        conversation_id: i64,
+        marker_id: &str,
+        direction: &str,
+        occupant_id: Option<&str>,
+    ) -> Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            r#"SELECT id FROM messages
+               WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2 OR remote_id = ?2)
+                     AND direction = ?3 AND (?4 IS NULL OR occupant_id = ?4)
+                     AND retracted = 1
+               LIMIT 1"#,
+        )
+        .bind(conversation_id)
+        .bind(marker_id)
+        .bind(direction)
+        .bind(occupant_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(found.is_some())
+    }
+
     /// The newest non-retracted message in `conversation_id` with archive id `stanza_id` (a
     /// XEP-0425 moderation from the room references the room-assigned stanza-id only).
     /// Also finds a message by the stanza-id of one of its corrections ([`Self::add_message_version`]).
@@ -1389,6 +1432,42 @@ impl Store {
         })
     }
 
+    /// The kind of a conversation (`chat`, `muc`, `muc_pm`), or None if it doesn't exist.
+    pub async fn conversation_kind_by_id(&self, conversation_id: i64) -> Result<Option<String>> {
+        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM conversations WHERE id = ?1")
+            .bind(conversation_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(kind)
+    }
+
+    /// Whether media in a conversation is downloaded without the user asking. Every automatic
+    /// download tells the host of the file (usually the sender's server) our IP address and
+    /// when we read the chat, so it is only done where the sender is known:
+    /// - one-to-one: only when the peer is in our roster;
+    /// - group chat: only when it is not public (see [`Self::is_public_group`]);
+    /// - private messages from room occupants (`muc_pm`) and anything else: never.
+    pub async fn auto_download_allowed(&self, conversation_id: i64) -> Result<bool> {
+        let Some(kind) = self.conversation_kind_by_id(conversation_id).await? else {
+            return Ok(false);
+        };
+        match kind.as_str() {
+            "chat" => {
+                let found: Option<i64> = sqlx::query_scalar(
+                    r#"SELECT 1 FROM conversations c
+                       JOIN roster r ON r.account_id = c.account_id AND lower(r.jid) = lower(c.jid)
+                       WHERE c.id = ?1 LIMIT 1"#,
+                )
+                .bind(conversation_id)
+                .fetch_optional(self.pool())
+                .await?;
+                Ok(found.is_some())
+            }
+            "muc" => Ok(!self.is_public_group(conversation_id).await?),
+            _ => Ok(false),
+        }
+    }
+
     // ---- Encrypted-MUC support (room privacy features + occupant real JIDs) ----
 
     /// Cache a room's two privacy features (from disco#info). Together they decide whether
@@ -1683,6 +1762,57 @@ mod sender_auth_tests {
             unstyled: false,
             ephemeral_timer: 0,
         }
+    }
+
+    /// Media is fetched automatically only where the sender is known: roster contacts and
+    /// private (members-only, non-anonymous) groups - never strangers, public rooms or room PMs.
+    #[tokio::test]
+    async fn auto_download_only_for_known_senders() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let friend = store.conversation_id(acc, "friend@example.org", "chat").await.unwrap();
+        let stranger = store.conversation_id(acc, "stranger@example.net", "chat").await.unwrap();
+        store
+            .replace_roster_item(
+                acc,
+                &crate::roster::RosterItem {
+                    jid: "Friend@example.org".into(),
+                    name: None,
+                    subscription: "both".into(),
+                    ask: None,
+                    groups: None,
+                },
+            )
+            .await
+            .unwrap();
+        let public = store.upsert_muc(acc, "public@muc.example.org", None, Some("me"), true).await.unwrap();
+        let private = store.upsert_muc(acc, "private@muc.example.org", None, Some("me"), true).await.unwrap();
+        store.set_muc_features(private, true, true).await.unwrap();
+        let pm = store.conversation_id(acc, "private@muc.example.org/alice", "muc_pm").await.unwrap();
+        assert!(store.auto_download_allowed(friend).await.unwrap(), "roster contact");
+        assert!(!store.auto_download_allowed(stranger).await.unwrap(), "not in roster");
+        assert!(!store.auto_download_allowed(public).await.unwrap(), "public group");
+        assert!(store.auto_download_allowed(private).await.unwrap(), "private group");
+        assert!(!store.auto_download_allowed(pm).await.unwrap(), "room PM");
+        assert!(!store.auto_download_allowed(9999).await.unwrap(), "no such conversation");
+    }
+
+    /// A reply in a room is resolved by the room's stanza-id, never by an origin-id; a
+    /// retracted message is found as such (a correction of it is dropped).
+    #[tokio::test]
+    async fn stanza_id_lookup_and_retracted_target() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.upsert_muc(acc, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        let mut m = msg(room, "o1", Direction::Out, None);
+        m.stanza_id = Some("s1".into());
+        let id = store.insert_message(&m).await.unwrap().unwrap();
+        assert_eq!(store.direction_by_stanza_id(room, "s1").await.unwrap().as_deref(), Some("out"));
+        assert_eq!(store.direction_by_stanza_id(room, "o1").await.unwrap(), None);
+        assert!(!store.retracted_from_sender(room, "o1", "out", None).await.unwrap());
+        store.retract_message_id(id).await.unwrap();
+        assert!(store.retracted_from_sender(room, "o1", "out", None).await.unwrap());
+        assert!(!store.retracted_from_sender(room, "o1", "in", None).await.unwrap(), "other side");
     }
 
     #[tokio::test]

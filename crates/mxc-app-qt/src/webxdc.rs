@@ -108,7 +108,9 @@ pub fn open(peer: String, thread: String, url: String) {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, %url, "webxdc: download failed");
+                    // never the fragment: for an encrypted share it is the file key
+                    let host_path = url.split('#').next().unwrap_or("");
+                    tracing::warn!(error = %e, url = %host_path, "webxdc: download failed");
                     return;
                 }
             }

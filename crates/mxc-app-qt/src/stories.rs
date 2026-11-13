@@ -210,11 +210,13 @@ impl qobject::StoryModel {
 
     fn fetch_media(self: Pin<&mut Self>, index: i32) {
         let Some(s) = self.items.get(index as usize).filter(|s| s.local_path.is_empty()) else { return };
-        crate::session::prefetch_story_media(
-            s.url.clone(),
-            mxc_proto::xeps::http_upload::MANUAL_DOWNLOAD_LIMIT,
-            &self.qt_thread(),
-        );
+        // Images keep the automatic size limit; only videos may be as large as a manual download.
+        let limit = if s.mime.starts_with("video/") {
+            mxc_proto::xeps::http_upload::MANUAL_DOWNLOAD_LIMIT
+        } else {
+            mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT
+        };
+        crate::session::prefetch_story_media(s.url.clone(), limit, &self.qt_thread());
         // Show it as downloading (and no longer failed).
         self.reload_self();
     }

@@ -765,6 +765,8 @@ ApplicationWindow {
         // Opening a section clears its "new items" badge (the chats badge instead follows
         // the per-conversation unread counters, zeroed by the read markers on open).
         onSectionIndexChanged: {
+            // Contacts' post images are only downloaded while the Feeds section is shown.
+            backend.setFeedsVisible(sectionIndex === 4)
             if (sectionIndex === 2)
                 callLogModel.markSeen()
             else if (sectionIndex === 3)
@@ -2626,7 +2628,7 @@ ApplicationWindow {
                                                      && model.imagePath.length === 0
                                                      && model.audioPath.length === 0
                                             height: visible ? implicitHeight : 0
-                                            onTriggered: window.startEdit(model.marker, model.body)
+                                            onTriggered: window.startEdit(model.editMarker, model.body)
                                         }
                                         // Own messages can be retracted (XEP-0424), with confirmation.
                                         MenuItem {
@@ -3905,7 +3907,7 @@ ApplicationWindow {
                     readonly property bool storyLoading: model.downloading
                     readonly property bool storyFailed: model.failed
                     readonly property bool mediaShown: isVideo || storyImage.status === Image.Ready
-                    // Videos are downloaded when they come up (images are prefetched).
+                    // A contact's story is downloaded when it comes up (only our own are prefetched).
                     readonly property bool wantsFetch: ListView.isCurrentItem && storyViewer.visible
                         && model.localPath.length === 0 && !model.downloading && !model.failed
                     onWantsFetchChanged: if (wantsFetch) viewerStories.fetchMedia(index)

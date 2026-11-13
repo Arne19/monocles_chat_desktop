@@ -45,6 +45,7 @@ const ROLE_BODY_HTML: i32 = 280;
 const ROLE_PREVIEW_TEXT: i32 = 281;
 const ROLE_PREVIEW_IMAGE: i32 = 282;
 const ROLE_REPLY_QUOTE_IMAGE: i32 = 283;
+const ROLE_EDIT_MARKER: i32 = 284;
 
 /// One message row, resolved for display.
 #[derive(Clone, Default, PartialEq)]
@@ -56,8 +57,15 @@ pub struct MessageItem {
     pub encrypted: bool,
     /// Delivery state for outgoing messages: pending/sent/received/displayed.
     pub state: String,
-    /// The id others reference (origin id, else stanza id) — used as a reply target.
+    /// The id others reference: a reply, reaction or retraction target. In a group chat the
+    /// room's stanza-id (XEP-0461/0444/0424: the only id every participant agrees on; the
+    /// origin-id only until the room's id is known), elsewhere the origin id, else stanza id.
     pub marker: String,
+    /// The id a XEP-0308 correction references: the message's own (origin) id, else the
+    /// stanza id - also in a group chat.
+    pub edit_marker: String,
+    /// The message's origin-id, or empty (for jump-to lookups by either id).
+    pub origin_id: String,
     /// Quoted body of the message this one replies to (XEP-0461), if resolvable.
     pub reply_quote: String,
     /// The marker this message replies to (target for jump-to-quote), or empty.
@@ -263,6 +271,34 @@ mod described_file_tests {
         assert_eq!(MessageItem::from_row(&row(described("image/png", "a.png"), None, ""), true).preview_image, "");
     }
 
+    /// In a group chat a reply is resolved by the room's stanza-id only (an origin-id is
+    /// chosen by its sender), and the message is referenced by its stanza-id; a correction
+    /// still names the origin-id.
+    #[test]
+    fn group_chat_replies_resolve_by_stanza_id_only() {
+        let mut original = row(None, None, "original");
+        original.origin_id = Some("o1".into());
+        original.stanza_id = Some("s1".into());
+        let mut by_stanza = row(None, None, "answer");
+        by_stanza.id = 2;
+        by_stanza.reply_to = Some("s1".into());
+        let mut by_origin = row(None, None, "fake");
+        by_origin.id = 3;
+        by_origin.reply_to = Some("o1".into());
+        let rows = [original, by_stanza, by_origin];
+
+        let muc = MessageItem::from_rows(&rows, true, true);
+        assert_eq!(muc[0].marker, "s1");
+        assert_eq!(muc[0].edit_marker, "o1");
+        assert_eq!(muc[1].reply_quote, "original");
+        assert_eq!(muc[2].reply_quote, "", "origin-id is not a reply target in a room");
+
+        let chat = MessageItem::from_rows(&rows, true, false);
+        assert_eq!(chat[0].marker, "o1");
+        assert_eq!(chat[1].reply_quote, "original");
+        assert_eq!(chat[2].reply_quote, "original");
+    }
+
     /// A reply quotes the quoted message's preview, not its (empty) text.
     #[test]
     fn reply_to_a_file_quotes_its_preview() {
@@ -271,7 +307,7 @@ mod described_file_tests {
         let mut answer = row(None, None, "nice");
         answer.id = 2;
         answer.reply_to = Some("m1".into());
-        let items = MessageItem::from_rows(&[photo, answer], true);
+        let items = MessageItem::from_rows(&[photo, answer], true, false);
         assert_eq!(items[1].reply_quote, "🖼 Photo");
         assert_eq!(items[0].reply_quote, "");
     }
@@ -635,8 +671,10 @@ fn guessed_webxdc_url(m: &MessageRow, body: &str) -> Option<String> {
 }
 
 impl MessageItem {
-    /// `auto_download` is false for public groups: remote media is never fetched automatically;
-    /// it renders as a typed download button (see `prefetch_images`, which is also skipped).
+    /// `auto_download` is false for chats without automatic download (not a roster contact, a
+    /// public group or a room PM - `Store::auto_download_allowed`): remote media is never fetched
+    /// automatically; it renders as a typed download button (see `prefetch_images`, which is
+    /// also skipped).
     pub fn from_row(m: &MessageRow, auto_download: bool) -> Self {
         let raw = m.body.clone().unwrap_or_default();
         // A captioned file stores the URL in the `attachment` column and the caption in `body`;
@@ -702,7 +740,8 @@ impl MessageItem {
                 None => ("🙂 Sticker".to_string(), String::new(), String::new()),
             }
         } else if !auto_download {
-            // Public group: never auto-fetch remote media (no IP leak to untrusted senders).
+            // No automatic download here (not a roster contact, a public group or a room PM):
+            // never auto-fetch remote media (no IP leak to untrusted senders).
             // Show media inline only once the user has downloaded it (it's in the cache);
             // otherwise a typed download button. The caption, if any, renders beneath it.
             match att_url
@@ -817,6 +856,8 @@ impl MessageItem {
             encrypted: m.encryption == "omemo2",
             state: m.state.clone(),
             marker: m.origin_id.clone().or_else(|| m.stanza_id.clone()).unwrap_or_default(),
+            edit_marker: m.origin_id.clone().or_else(|| m.stanza_id.clone()).unwrap_or_default(),
+            origin_id: m.origin_id.clone().unwrap_or_default(),
             reply_quote: String::new(),
             reply_to: m.reply_to.clone().unwrap_or_default(),
             reply_quote_image: String::new(),
@@ -845,10 +886,18 @@ impl MessageItem {
 
     /// Build display rows, resolving each message's reply quote against the loaded page
     /// (XEP-0461 `reply_to` points at another message's stanza/origin id). `auto_download` is
-    /// false for public groups (media renders as a typed download button, never auto-fetched).
-    pub fn from_rows(rows: &[MessageRow], auto_download: bool) -> Vec<MessageItem> {
+    /// false where media is not downloaded automatically (it renders as a typed download button).
+    pub fn from_rows(rows: &[MessageRow], auto_download: bool, is_muc: bool) -> Vec<MessageItem> {
         let mut items: Vec<MessageItem> =
             rows.iter().map(|r| MessageItem::from_row(r, auto_download)).collect();
+        if is_muc {
+            // In a group chat replies, reactions and retractions name the room's stanza-id.
+            for (item, r) in items.iter_mut().zip(rows.iter()) {
+                if let Some(sid) = r.stanza_id.as_deref() {
+                    item.marker = sid.to_string();
+                }
+            }
+        }
         // A quote shows the quoted message's preview: its text, or for a photo, voice message
         // or file an icon and label (plus the photo, if cached) - such messages have no text.
         let mut by_marker: HashMap<&str, usize> = HashMap::new();
@@ -856,8 +905,13 @@ impl MessageItem {
             if let Some(id) = r.stanza_id.as_deref() {
                 by_marker.insert(id, i);
             }
-            if let Some(id) = r.origin_id.as_deref() {
-                by_marker.insert(id, i);
+            // In a group chat only the room-assigned stanza-id identifies a message: an
+            // origin-id is chosen by its sender, who could reuse another message's id to
+            // attach a false quote.
+            if !is_muc {
+                if let Some(id) = r.origin_id.as_deref() {
+                    by_marker.insert(id, i);
+                }
             }
         }
         let quotes: Vec<Option<(String, String)>> = rows
@@ -1309,6 +1363,7 @@ impl qobject::MessageModel {
             ROLE_PREVIEW_TEXT => QVariant::from(&QString::from(item.preview_text.as_str())),
             ROLE_PREVIEW_IMAGE => QVariant::from(&QString::from(item.preview_image.as_str())),
             ROLE_REPLY_QUOTE_IMAGE => QVariant::from(&QString::from(item.reply_quote_image.as_str())),
+            ROLE_EDIT_MARKER => QVariant::from(&QString::from(item.edit_marker.as_str())),
             _ => QVariant::default(),
         }
     }
@@ -1324,7 +1379,12 @@ impl qobject::MessageModel {
         }
         self.items
             .iter()
-            .position(|item| item.marker == marker)
+            .position(|item| {
+                item.marker == marker
+                    || item.edit_marker == marker
+                    || item.stanza_id == marker
+                    || item.origin_id == marker
+            })
             .map(|i| i as i32)
             .unwrap_or(-1)
     }
@@ -1359,6 +1419,7 @@ impl qobject::MessageModel {
         roles.insert(ROLE_PREVIEW_TEXT, QByteArray::from("previewText"));
         roles.insert(ROLE_PREVIEW_IMAGE, QByteArray::from("previewImage"));
         roles.insert(ROLE_REPLY_QUOTE_IMAGE, QByteArray::from("replyQuoteImage"));
+        roles.insert(ROLE_EDIT_MARKER, QByteArray::from("editMarker"));
         roles
     }
 }

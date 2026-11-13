@@ -290,6 +290,12 @@ pub mod qobject {
         #[cxx_name = "fetchFeeds"]
         fn fetch_feeds(self: Pin<&mut Backend>);
 
+        /// The Feeds section was opened (true) or left (false): post images load only while
+        /// it is visible.
+        #[qinvokable]
+        #[cxx_name = "setFeedsVisible"]
+        fn set_feeds_visible(self: Pin<&mut Backend>, visible: bool);
+
         /// Fetch a post's comments (separate node); reply arrives as `feedsChanged`.
         #[qinvokable]
         #[cxx_name = "fetchComments"]
@@ -1128,6 +1134,9 @@ impl qobject::Backend {
     // --- Feeds (XEP-0472) ---
     pub fn fetch_feeds(self: Pin<&mut Self>) {
         crate::session::fetch_feeds();
+    }
+    pub fn set_feeds_visible(self: Pin<&mut Self>, visible: bool) {
+        crate::session::set_feeds_visible(visible, &self.qt_thread());
     }
     pub fn fetch_comments(self: Pin<&mut Self>, post_author: &QString, post_id: &QString) {
         crate::session::fetch_comments(post_author.to_string(), post_id.to_string());

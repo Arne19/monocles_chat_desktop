@@ -426,11 +426,14 @@ pub fn load_stories(jid: String, contact: Option<String>, qt: CxxQtThread<StoryM
         let mut items = Vec::with_capacity(rows.len());
         for s in &rows {
             let local_path = story_view(&s.url, &s.r#type);
+            let own = s.contact.eq_ignore_ascii_case(&jid);
             if local_path.is_empty() {
-                // Images are fetched right away; videos (larger) only when the viewer reaches
-                // them (`StoryModel::fetchMedia`), as Android streams them on view. A failed
-                // download is only retried on request, or every reload would retry it.
-                if !s.r#type.starts_with("video/") && !STORY_MEDIA_FAILED.lock().unwrap().contains(&s.url) {
+                // Only our own story images are fetched right away. A contact's story is
+                // fetched when the viewer shows it (`StoryModel::fetchMedia`): fetching it on
+                // sight would tell the host the contact chose our IP address and when we
+                // looked at the list. Videos always wait for the viewer. A failed download
+                // is only retried on request, or every reload would retry it.
+                if own && !s.r#type.starts_with("video/") && !STORY_MEDIA_FAILED.lock().unwrap().contains(&s.url) {
                     prefetch_story_media(s.url.clone(), mxc_proto::xeps::http_upload::AUTO_DOWNLOAD_LIMIT, &qt);
                 }
             }
@@ -441,7 +444,7 @@ pub fn load_stories(jid: String, contact: Option<String>, qt: CxxQtThread<StoryM
                 title: s.title.clone().unwrap_or_default(),
                 mime: s.r#type.clone(),
                 published: s.published,
-                own: s.contact.eq_ignore_ascii_case(&jid),
+                own,
                 local_path,
                 avatar_path: avatar_path_for(&s.contact),
                 url: s.url.clone(),
@@ -862,12 +865,32 @@ fn request_comments(posts: &[FeedPost]) {
     }
 }
 
+/// Whether the Feeds section is on screen. A contact's post image is only fetched then:
+/// fetching it whenever a post is pushed would tell the host the author chose our IP address,
+/// without the user ever looking at the post.
+static FEEDS_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the UI when the Feeds section is opened or left. Opening it fetches the image
+/// attachments of the posts already known.
+pub fn set_feeds_visible(visible: bool, qt: &CxxQtThread<Backend>) {
+    let was = FEEDS_VISIBLE.swap(visible, std::sync::atomic::Ordering::SeqCst);
+    if visible && !was {
+        let posts: Vec<FeedPost> = FEED_POSTS.lock().unwrap().values().flatten().cloned().collect();
+        prefetch_feed_media(&posts, qt);
+    }
+}
+
 /// Download + cache the image attachments of `posts` (and their authors' avatars), then
-/// reload the feed.
+/// reload the feed. Attachments of others' posts only while the Feeds section is visible.
 fn prefetch_feed_media(posts: &[FeedPost], qt: &CxxQtThread<Backend>) {
+    let visible = FEEDS_VISIBLE.load(std::sync::atomic::Ordering::SeqCst);
+    let own_jid = CLIENT.lock().unwrap().as_ref().map(|ctx| ctx.jid.clone()).unwrap_or_default();
     for p in posts {
         if !p.author.is_empty() {
             request_avatar(&p.author, false);
+        }
+        if !visible && !p.author.eq_ignore_ascii_case(&own_jid) {
+            continue;
         }
         let url = p.attachment_url.clone();
         let lower = url.to_ascii_lowercase();
@@ -1427,8 +1450,9 @@ fn safe_to_open(path: &str) -> bool {
 /// then reload the model so the freshly-cached images appear. Deduped + runs off-thread.
 fn prefetch_images(rows: &[mxc_store::MessageRow], qt: &CxxQtThread<MessageModel>, auto_download: bool) {
     if !auto_download {
-        // Public group: don't auto-fetch remote media (avoids leaking our IP to untrusted
-        // senders and pulling unwanted content). The user downloads explicitly per file.
+        // Not a roster contact, a public group or a room PM (Store::auto_download_allowed):
+        // don't auto-fetch remote media (avoids leaking our IP to untrusted senders and
+        // pulling unwanted content). The user downloads explicitly per file.
         return;
     }
     // One message may share several files (XEP-0447), so fetch every media URL it carries.
@@ -2674,7 +2698,8 @@ async fn build_items(
     rows: &[mxc_store::MessageRow],
     auto_download: bool,
 ) -> Vec<MessageItem> {
-    let mut items = MessageItem::from_rows(rows, auto_download);
+    let is_muc = store.conversation_kind_by_id(conversation_id).await.ok().flatten().as_deref() == Some("muc");
+    let mut items = MessageItem::from_rows(rows, auto_download, is_muc);
     // Per-message sender avatar for incoming MUC messages (counterpart = room@host/nick).
     for (item, row) in items.iter_mut().zip(rows.iter()) {
         if row.direction == "in" {
@@ -2997,7 +3022,7 @@ pub fn load_messages(conversation_id: i64, limit: i64, qt: CxxQtThread<MessageMo
             .await
             .unwrap_or_default();
         mark_displayed(conversation_id, &rows);
-        let auto_download = !store.is_public_group(conversation_id).await.unwrap_or(false);
+        let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
@@ -3025,7 +3050,7 @@ pub fn load_older(conversation_id: i64, limit: i64, qt: CxxQtThread<MessageModel
                 });
             }
         }
-        let auto_download = !store.is_public_group(conversation_id).await.unwrap_or(false);
+        let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
@@ -3049,7 +3074,7 @@ pub fn load_messages_around(
         let limit = (count + crate::messages::INITIAL_LIMIT).max(crate::messages::INITIAL_LIMIT);
         let rows = store.recent_messages(conversation_id, limit).await.unwrap_or_default();
         mark_displayed(conversation_id, &rows);
-        let auto_download = !store.is_public_group(conversation_id).await.unwrap_or(false);
+        let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |mut model: Pin<&mut MessageModel>| {
@@ -3114,7 +3139,7 @@ pub fn open_peer_kind(jid: String, kind: String, qt: CxxQtThread<MessageModel>) 
             .await
             .unwrap_or_default();
         mark_displayed(conversation_id, &rows);
-        let auto_download = !store.is_public_group(conversation_id).await.unwrap_or(false);
+        let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {

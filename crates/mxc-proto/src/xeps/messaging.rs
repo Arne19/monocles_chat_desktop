@@ -1481,6 +1481,30 @@ async fn find_own_or_sender(
     Ok(None)
 }
 
+/// Whether a correction that matched no live message names a retracted one of the same sender
+/// side (see [`Store::retracted_from_sender`]); such a correction is dropped, never shown.
+async fn correction_targets_retracted(
+    store: &Store,
+    conv: i64,
+    target: &str,
+    kind: &str,
+    own_side: bool,
+    occupant_id: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some((dir, occ)) = sender_filter(kind, own_side, occupant_id) else {
+        return Ok(false);
+    };
+    if store.retracted_from_sender(conv, target, dir, occ).await? {
+        return Ok(true);
+    }
+    if own_side && kind == "muc" {
+        if let Some(occ) = occupant_id {
+            return Ok(store.retracted_from_sender(conv, target, "in", Some(occ)).await?);
+        }
+    }
+    Ok(false)
+}
+
 /// Tolerated skew for the SCE `<time>` binding (proto-XEP §4.6.2): ±7 days, generous
 /// enough to absorb badly wrong sender clocks.
 const SCE_MAX_SKEW_DAYS: i64 = 7;
@@ -2204,9 +2228,17 @@ async fn process_payload(
             }
         }
     }
+    // Each fetch is a cleartext IQ awaited right here: a message naming many cids must not
+    // stall processing (or make us send a burst of requests), so only a few are fetched.
+    const MAX_BOB_FETCHES_PER_MESSAGE: usize = 4;
+    let mut fetches = 0usize;
     for (ssp, _) in &refs {
         let uri = format!("cid:{ssp}");
         if !super::bob::is_cached(&uri) && encryption != "omemo2" {
+            if fetches >= MAX_BOB_FETCHES_PER_MESSAGE {
+                continue;
+            }
+            fetches += 1;
             // Cleartext fetch — only for an unencrypted chat. Best-effort; on failure we fall
             // back to the text/shortcode body rather than a broken image.
             match super::bob::fetch(w, &from, ssp).await {
@@ -2308,6 +2340,10 @@ async fn process_payload(
                 }
                 return Ok(());
             }
+            if correction_targets_retracted(store, conv, target, kind, own_side, occupant_id.as_deref()).await? {
+                tracing::debug!("ignoring correction of a retracted message");
+                return Ok(());
+            }
         }
     }
 
@@ -2346,9 +2382,10 @@ async fn process_payload(
         }
         mentioned = is_attention || names.iter().any(|n| mentions_nick(&body, n));
 
+        // In a room a reply names the room's stanza-id; an origin-id is the sender's choice.
         if let Some(target) = &reply_to {
-            if let Ok(Some(replied)) = store.message_by_marker(conv, target).await {
-                reply_to_me = replied.direction == "out";
+            if let Ok(Some(direction)) = store.direction_by_stanza_id(conv, target).await {
+                reply_to_me = direction == "out";
             }
         }
     }
@@ -3599,6 +3636,36 @@ mod retraction_tests {
         assert_eq!(row.body, None);
         // The fallback body of the retraction itself is never stored.
         assert!(h.store.message_by_marker(conv, "r1").await.unwrap().is_none());
+    }
+
+    /// Retracted is final: a correction arriving after the retraction neither brings the
+    /// content back nor shows up as a message of its own.
+    #[tokio::test]
+    async fn correction_of_a_retracted_message_is_dropped() {
+        let h = harness().await;
+        h.feed(
+            "<message xmlns='jabber:client' from='peer@example.org/phone' to='me@example.org' type='chat' id='m1'>\
+               <origin-id xmlns='urn:xmpp:sid:0' id='m1'/><body>secret</body></message>",
+            Direction::In, None,
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='peer@example.org/phone' to='me@example.org' type='chat' id='r1'>\
+               <retract xmlns='urn:xmpp:message-retract:1' id='m1'/>\
+               <fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:message-retract:1'/>\
+               <body>[This message was retracted]</body></message>",
+            Direction::In, None,
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='peer@example.org/phone' to='me@example.org' type='chat' id='c1'>\
+               <origin-id xmlns='urn:xmpp:sid:0' id='c1'/>\
+               <replace xmlns='urn:xmpp:message-correct:0' id='m1'/><body>secret again</body></message>",
+            Direction::In, None,
+        ).await;
+        let conv = h.store.conversation_id(h.cfg.account_id, "peer@example.org", "chat").await.unwrap();
+        let row = h.store.message_by_marker(conv, "m1").await.unwrap().unwrap();
+        assert!(row.retracted);
+        assert_eq!(row.body, None);
+        assert!(h.store.message_by_marker(conv, "c1").await.unwrap().is_none());
     }
 
     #[tokio::test]
