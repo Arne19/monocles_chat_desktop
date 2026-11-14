@@ -80,7 +80,10 @@ git clone https://codeberg.org/monocles/pq-omemo-2.git deps/libsignal
 # predate the v4 bundle transcript (signed by both identity keys) and the <pq-auth>
 # handshake transcript, and a mismatched pair fails to establish a session rather
 # than degrading — so the symptom looks like a broken build, not a version skew.
-git -C deps/libsignal checkout 10861bff671740174f4e99f7e30dc492fcf6ec8b  # "PQ auth check and hardening"
+# This revision adds the upstream v0.108.0 sync (PreKey messages naming a session we
+# started are rejected, SPQR 1.7.0, RustSec fixes). It doesn't change the wire format:
+# a revision from 10861bff on still interoperates, but lacks these fixes.
+git -C deps/libsignal checkout 8a36417b9f48ae43ee3a27ae696f355b4c3785e8  # "Sync with upstream v0.106.2..v0.108.0"
 ```
 
 **Dev database (sqlx):** `mxc-store`'s compile-time `query!` macros need a SQLite DB with
