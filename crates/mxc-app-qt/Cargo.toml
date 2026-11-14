@@ -40,7 +40,7 @@ gstreamer = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 base64 = "0.22"
 # Extract `.xdc` (zip) WebXDC app bundles before serving them to the embedded web view.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Parse the WebXDC JS bridge messages (sendUpdate/sendToChat payloads).
 serde_json = "1"
 # Per-instance WebXDC origin (webxdc::instance_host).
