@@ -4755,6 +4755,29 @@ ApplicationWindow {
                         onToggled: backend.changeEnforceDane(checked)
                     }
                 }
+                // Per-account DANE pin (as on Android): shown once the server proved DANE.
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    visible: backend.danePinned
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 1
+                        Label { textFormat: Text.PlainText; text: qsTr("DANE required for this account"); font.pixelSize: 13 }
+                        Label {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: qsTr("The server proved its certificate with DANE before, so connections without DANE are refused. Only stop requiring it if you trust the network and the server dropped DANE on purpose.")
+                            wrapMode: Text.Wrap
+                            opacity: 0.6
+                            font.pixelSize: 11
+                        }
+                    }
+                    Button {
+                        text: qsTr("Stop requiring DANE")
+                        onClicked: backend.resetDanePin()
+                    }
+                }
                 ColumnLayout {
                     Layout.fillWidth: true
                     spacing: 4

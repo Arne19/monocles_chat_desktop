@@ -8,8 +8,15 @@
 //!   records are fetched. A DANE-EE match is trusted on its own; a PKIX-EE match still needs
 //!   the CA check; TLSA records that match nothing reject the certificate. Without usable
 //!   records the normal CA check applies - unless "Enforce DANE" is on, then it fails.
-//!   A *bogus* TLSA answer (DNSSEC validation failed, as opposed to an unsigned zone) always
-//!   rejects the certificate (RFC 6698 §4.1), like Android's MiniDNS 1.1.3 does.
+//!   A *bogus* TLSA answer (signatures or a denial proof that are present but fail) always
+//!   rejects the certificate (RFC 6698 §4.1). An *unverifiable* one - no signatures or no denial
+//!   proof although the zone is signed, as a resolver that strips DNSSEC data (or a forwarding,
+//!   VPN or split-horizon one) produces - counts as "DANE not verified": fatal only when DANE is
+//!   enforced, by the setting or by the account's DANE pin (set once the server proved DANE).
+//!   Same rule as monocles Android (Codeberg #564-#566).
+//! * TLSA records reached through a CNAME: if the combined answer doesn't validate, the CNAME is
+//!   queried on its own, and if it is authenticated the target's TLSA answer is validated on its
+//!   own (as Android's DaneVerifier does), so a stripped target zone is unverifiable, not bogus.
 //! * A lookup only counts as validated when the whole answer chain is: the requested records
 //!   *and* any CNAME/DNAME that led to them. Otherwise an unsigned (forged) CNAME could point
 //!   into a zone the attacker signs themselves.
@@ -31,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use hickory_resolver::proto::dnssec::rdata::DNSSECRData;
 use hickory_resolver::proto::rr::rdata::tlsa::{CertUsage, Matching, Selector, TLSA};
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
@@ -100,6 +108,8 @@ impl TlsPolicy {
 pub struct SecureConnector {
     store: mxc_store::Store,
     report: Arc<Mutex<LinkSecurity>>,
+    /// Whose DANE pin applies (`accounts.dane_pin`).
+    account_id: i64,
     /// Built on first use, inside the runtime that connects: hickory runs its connection tasks on
     /// the runtime it was created in, and every login runs its core on a fresh runtime - a
     /// process-wide resolver would outlive it and hang the next login. Rebuilt when the
@@ -108,8 +118,27 @@ pub struct SecureConnector {
 }
 
 impl SecureConnector {
-    pub fn new(store: mxc_store::Store, report: Arc<Mutex<LinkSecurity>>) -> Self {
-        Self { store, report, dns: Arc::new(Mutex::new(None)) }
+    pub fn new(store: mxc_store::Store, report: Arc<Mutex<LinkSecurity>>, account_id: i64) -> Self {
+        Self { store, report, account_id, dns: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The policy for this account: the settings, with DANE also enforced once the account is
+    /// DANE-pinned (HSTS-style, as on Android: set after the first DANE-verified login, so a
+    /// network that later strips DNSSEC can't quietly downgrade the server to the CA check).
+    async fn policy(&self) -> TlsPolicy {
+        let mut policy = TlsPolicy::load(&self.store).await;
+        let pinned = match self.store.dane_pinned(self.account_id).await {
+            Ok(pinned) => pinned,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the DANE pin");
+                false
+            }
+        };
+        if pinned && !policy.enforce_dane {
+            tracing::debug!(account = self.account_id, "DANE enforced by the account's DANE pin");
+        }
+        policy.enforce_dane |= pinned;
+        policy
     }
 
     async fn resolvers(&self) -> Arc<Resolvers> {
@@ -300,17 +329,52 @@ enum Validation {
     Secure,
     /// Unsigned, unvalidated or unavailable: usable, but not DNSSEC-verified.
     Insecure,
-    /// DNSSEC validation failed: someone tampered with the answer (or a signature broke).
+    /// Not validated although the zone is signed, and the evidence is simply missing: no RRSIGs
+    /// for the records, or no (signed) NSEC/NSEC3 for a denial. A resolver that strips DNSSEC data
+    /// (or a forwarding/VPN/split-horizon one) looks exactly like this, as does an attacker who
+    /// strips signatures - so it is not trusted, but only fatal for DANE when DANE is enforced.
+    Unverifiable,
+    /// DNSSEC validation failed with the evidence present: someone tampered with the answer (or
+    /// a signature broke).
     Bogus,
+}
+
+impl Validation {
+    /// Bogus or unverifiable: another name server may still validate the answer.
+    fn is_final(self) -> bool {
+        matches!(self, Validation::Secure | Validation::Insecure)
+    }
+}
+
+/// Whether `answers` carry an RRSIG covering `record`'s RRset (same owner name and type covered,
+/// the same pairing hickory uses when it validates).
+fn covered_by_rrsig(record: &Record, answers: &[Record]) -> bool {
+    answers.iter().any(|sig| {
+        sig.name == record.name
+            && matches!(&sig.data, RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                if rrsig.input().type_covered == record.record_type())
+    })
 }
 
 /// The validation state of a whole answer chain. RRSIGs are only the evidence and carry no
 /// state of their own; every other answer record (the requested type plus the CNAMEs/DNAMEs that
-/// led there) has to be `Secure`, and a single `Bogus` one makes the whole answer bogus.
+/// led there) has to be `Secure`. A bogus record makes the whole answer bogus if its RRSIGs are
+/// there (they failed), and unverifiable if none of the bogus records has any (hickory reports a
+/// stripped RRset in a signed zone as bogus, `RrsigsNotPresent`, but drops the reason).
+///
+/// A followed CNAME/DNAME chain is always bogus when a link is: hickory rebuilds the answers of a
+/// chain resolved through separate queries from the requested type and the CNAMEs only
+/// (`caching_client.rs`, `needs_filtering`), dropping every RRSIG, so missing signatures prove
+/// nothing there. For TLSA, [`tlsa_via_cnames`] then looks at the links one by one.
 fn chain_validation(answers: &[Record], rtype: RecordType) -> Validation {
     let chain = || answers.iter().filter(|r| r.record_type() != RecordType::RRSIG);
     if chain().any(|r| r.proof.is_bogus()) {
-        Validation::Bogus
+        let followed = chain().any(|r| matches!(r.record_type(), RecordType::CNAME | RecordType::DNAME));
+        if followed || chain().filter(|r| r.proof.is_bogus()).any(|r| covered_by_rrsig(r, answers)) {
+            Validation::Bogus
+        } else {
+            Validation::Unverifiable
+        }
     } else if chain().any(|r| r.record_type() == rtype) && chain().all(|r| r.proof.is_secure()) {
         Validation::Secure
     } else {
@@ -333,11 +397,18 @@ async fn query_validating(resolver: &TokioResolver, name: &str, rtype: RecordTyp
             chain_validation(found.answers(), rtype),
         ),
         Err(e) if e.is_no_records_found() => Outcome::Answer(Vec::new(), Validation::Insecure),
-        Err(NetError::Dns(DnsError::Nsec { proof, .. })) if proof.is_bogus() => {
+        Err(NetError::Dns(DnsError::Nsec { proof, response, .. })) if proof.is_bogus() => {
             // A denial of existence that failed validation: the records may well exist and be
             // suppressed by an attacker. Callers decide what that means (see `tlsa_records`).
-            tracing::debug!(%name, ?rtype, "DNSSEC: bogus denial of existence");
-            Outcome::Answer(Vec::new(), Validation::Bogus)
+            // Bogus if signed NSEC/NSEC3 records are there and still don't prove it; unverifiable
+            // if the proof (or its signatures) is simply missing.
+            let authorities = &response.authorities;
+            let signed_denial = authorities.iter().any(|r| {
+                matches!(r.record_type(), RecordType::NSEC | RecordType::NSEC3) && covered_by_rrsig(r, authorities)
+            });
+            let validation = if signed_denial { Validation::Bogus } else { Validation::Unverifiable };
+            tracing::debug!(%name, ?rtype, ?validation, "DNSSEC: denial of existence not validated");
+            Outcome::Answer(Vec::new(), validation)
         }
         Err(e) => {
             let network = matches!(e, NetError::Timeout | NetError::Io(_) | NetError::NoConnections | NetError::Busy);
@@ -349,10 +420,11 @@ async fn query_validating(resolver: &TokioResolver, name: &str, rtype: RecordTyp
 
 /// Ask the name servers one after another until one gives a final answer: `Secure`, or
 /// `Insecure` (hickory reports that only for a zone proven unsigned, which a resolver that
-/// strips DNSSEC data can't fake). A `Bogus` answer - typically a resolver stripping the
-/// signatures of a signed zone - is kept, and the next server is asked; servers known to give
-/// bogus answers are skipped once one is at hand. A bogus answer is never turned into an
-/// insecure one by a server that fails. `None` if no server answered.
+/// strips DNSSEC data can't fake). A `Bogus` or `Unverifiable` answer - typically a resolver
+/// stripping the signatures of a signed zone - is kept, and the next server is asked; servers
+/// known to give such answers are skipped once one is at hand. Of those, `Bogus` wins over
+/// `Unverifiable`, and neither is ever turned into an insecure answer by a server that fails.
+/// `None` if no server answered.
 ///
 /// A server is marked bogus only when another one validated the same query: a zone that is
 /// bogus on every server (forged, or broken) says nothing about the servers. Marking them anyway
@@ -364,17 +436,24 @@ where
     Fut: std::future::Future<Output = Outcome>,
 {
     let order = marks.lock().unwrap().order(servers, Instant::now());
-    let mut bogus = None;
+    let mut bogus: Option<(Vec<Record>, Validation)> = None;
     let mut bogus_servers = Vec::new();
     for ip in order {
         if bogus.is_some() && marks.lock().unwrap().is_marked(ip, Instant::now()) {
             continue;
         }
         match query(ip).await {
-            Outcome::Answer(records, Validation::Bogus) => {
-                tracing::debug!(%ip, "DNSSEC: bogus answer, asking the next name server");
+            Outcome::Answer(records, validation) if !validation.is_final() => {
+                tracing::debug!(%ip, ?validation, "DNSSEC: answer not validated, asking the next name server");
                 bogus_servers.push(ip);
-                bogus.get_or_insert(records);
+                // keep the first answer, but a bogus one outweighs an unverifiable one
+                match &bogus {
+                    None => bogus = Some((records, validation)),
+                    Some((_, Validation::Unverifiable)) if validation == Validation::Bogus => {
+                        bogus = Some((records, validation))
+                    }
+                    Some(_) => {}
+                }
             }
             Outcome::Answer(records, validation) => {
                 if validation == Validation::Secure {
@@ -394,7 +473,7 @@ where
             }
         }
     }
-    bogus.map(|records| (records, Validation::Bogus))
+    bogus
 }
 
 /// Records of `rtype` at `name` and the DNSSEC state of the answer.
@@ -523,60 +602,129 @@ enum Tlsa {
     Validated(Vec<TLSA>),
     /// None, or not validated (unsigned zone, no DNSSEC endpoint): DANE does not apply.
     Unavailable,
-    /// The TLSA answer failed DNSSEC validation: the connection must be aborted.
+    /// Not validated although the zone is signed: signatures or the denial proof are missing
+    /// (stripped, or a forwarding/VPN resolver). DANE does not apply, unless it is enforced (by
+    /// the setting or the account's DANE pin) - then the connection is refused.
+    Unverifiable,
+    /// The TLSA answer failed DNSSEC validation with the evidence present: the connection must
+    /// be aborted, enforced or not.
     Bogus,
 }
 
 /// How often a bogus TLSA answer is looked up again before the connection is refused.
 const BOGUS_TLSA_RETRIES: usize = 2;
 
+/// How many CNAMEs [`tlsa_via_cnames`] follows (Android's `DaneVerifier.MAX_CNAME_CHAIN_LENGTH`).
+const MAX_CNAME_CHAIN_LENGTH: usize = 16;
+
 /// The TLSA records for `host:port`.
 async fn tlsa_records(dns: &Resolvers, host: &str, port: u16) -> Tlsa {
     let name = format!("_{port}._tcp.{host}.");
-    let first = lookup(dns, &name, RecordType::TLSA).await;
+    let first = tlsa_via_cnames(&name, |n, t| async move { lookup(dns, &n, t).await }).await;
     // Each retry gets a fresh resolver: `clear_cache()` would leave hickory's DNSSEC
     // validation cache - and so the bogus verdict - in place.
     let retry = || {
         let name = &name;
         let dot = dns.dot.clone();
-        async move { lookup(&Resolvers::new(dot).await, name, RecordType::TLSA).await }
+        async move {
+            let fresh = Resolvers::new(dot).await;
+            tlsa_via_cnames(name, |n, t| {
+                let fresh = &fresh;
+                async move { lookup(fresh, &n, t).await }
+            })
+            .await
+        }
     };
     settle_tlsa(host, port, first, retry).await
 }
 
-/// Decide what a TLSA lookup means for DANE. A bogus answer is retried (`retry`, at most
+/// The TLSA answer at `name`, following authenticated CNAMEs one link at a time (as Android's
+/// `DaneVerifier` does). hickory drops the RRSIGs of a chain it follows itself, so a chained answer
+/// that isn't validated is bogus by [`chain_validation`] even when only the target zone was
+/// stripped. Then the CNAME at `name` is asked for on its own (not followed, so its signatures stay
+/// checkable): only an authenticated one leads on, and the target's own TLSA answer decides -
+/// unverifiable if it lacks signatures, bogus if they fail. An unauthenticated or bogus CNAME is no
+/// way out (the original verdict stays). A chain longer than [`MAX_CNAME_CHAIN_LENGTH`] gives no
+/// usable records (`Insecure`), like Android's `noUsableTlsaRecords`.
+async fn tlsa_via_cnames<F, Fut>(name: &str, mut query: F) -> (Vec<Record>, Validation)
+where
+    F: FnMut(String, RecordType) -> Fut,
+    Fut: std::future::Future<Output = (Vec<Record>, Validation)>,
+{
+    let mut current = name.to_string();
+    let mut hops = 0;
+    loop {
+        let answer = query(current.clone(), RecordType::TLSA).await;
+        if answer.1.is_final() {
+            return answer;
+        }
+        let (cnames, validation) = query(current.clone(), RecordType::CNAME).await;
+        if validation != Validation::Secure {
+            return answer;
+        }
+        let Ok(owner) = Name::from_ascii(&current) else { return answer };
+        let target = cnames.iter().find_map(|r| match &r.data {
+            RData::CNAME(cname) if r.name == owner => Some(cname.0.to_ascii()),
+            _ => None,
+        });
+        let Some(target) = target else { return answer };
+        hops += 1;
+        if hops > MAX_CNAME_CHAIN_LENGTH {
+            tracing::warn!(%name, "CNAME chain for the TLSA records exceeds {MAX_CNAME_CHAIN_LENGTH} CNAMEs, not using TLSA records");
+            return (Vec::new(), Validation::Insecure);
+        }
+        tracing::debug!(from = %current, to = %target, "TLSA: following an authenticated CNAME");
+        current = target;
+    }
+}
+
+/// Decide what a TLSA lookup means for DANE. A bogus or unverifiable answer is retried (`retry`, at most
 /// [`BOGUS_TLSA_RETRIES`] times) because the system resolvers can disagree: on networks where
 /// one of them strips DNSSEC data, the SRV/A lookups may validate while the TLSA answer happens
 /// to come from the stripping one and is bogus, which would refuse a correctly configured
 /// server. Only an **upgrade** counts: a retry that validates (`Secure`) is used; anything else,
 /// including an `Insecure` plain-DNS fallback, keeps the answer bogus. Otherwise an attacker
 /// could turn a forgery into "DANE does not apply" by also making the validating lookup fail.
-/// A real forgery is bogus on every attempt, so it is still refused.
+/// A real forgery is bogus on every attempt, so it is still refused. Without an upgrade the
+/// result is `Bogus` if any attempt was bogus (never softened to `Unverifiable`), otherwise
+/// `Unverifiable`.
 async fn settle_tlsa<F, Fut>(host: &str, port: u16, first: (Vec<Record>, Validation), mut retry: F) -> Tlsa
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = (Vec<Record>, Validation)>,
 {
-    match first.1 {
+    let mut any_bogus = match first.1 {
         Validation::Secure => return validated_tlsa(&first.0),
         Validation::Insecure => return Tlsa::Unavailable,
-        Validation::Bogus => {}
-    }
+        Validation::Bogus => true,
+        Validation::Unverifiable => false,
+    };
     for attempt in 1..=BOGUS_TLSA_RETRIES {
         let (records, validation) = retry().await;
+        any_bogus |= validation == Validation::Bogus;
         if validation == Validation::Secure {
             tracing::warn!(
                 %host,
                 port,
                 attempt,
-                "DANE: the TLSA answer was bogus on one resolver but validated on retry; a resolver \
-                 on this network may strip DNSSEC data"
+                "DANE: the TLSA answer was not validated on one resolver but was on retry; a \
+                 resolver on this network may strip DNSSEC data"
             );
             return validated_tlsa(&records);
         }
     }
-    tracing::warn!(%host, port, "DANE: the TLSA answer failed DNSSEC validation");
-    Tlsa::Bogus
+    if any_bogus {
+        tracing::warn!(%host, port, "DANE: the TLSA answer failed DNSSEC validation");
+        Tlsa::Bogus
+    } else {
+        tracing::warn!(
+            %host,
+            port,
+            "DANE: the TLSA answer has no signatures or denial proof although its zone is signed \
+             (stripped, or a forwarding/VPN resolver); DANE not verified"
+        );
+        Tlsa::Unverifiable
+    }
 }
 
 fn validated_tlsa(records: &[Record]) -> Tlsa {
@@ -682,7 +830,8 @@ impl ServerCertVerifier for DaneVerifier {
                 ))
             }
             Tlsa::Validated(records) => Some(records.as_slice()),
-            Tlsa::Unavailable => None,
+            // Unverifiable is "not verified via DANE": fatal below only if DANE is enforced.
+            Tlsa::Unavailable | Tlsa::Unverifiable => None,
         };
         match evaluate_dane(end_entity, records) {
             DaneResult::DaneEe => {
@@ -857,7 +1006,7 @@ impl ServerConnector for SecureConnector {
         ns: &'static str,
         timeouts: Timeouts,
     ) -> Result<(PendingFeaturesRecv<Self::Stream>, ChannelBinding), Error> {
-        let policy = TlsPolicy::load(&self.store).await;
+        let policy = self.policy().await;
         let domain = jid.domain().as_str();
         if crate::hidden::is_hidden_service_host(domain) {
             return Err(Error::Io(std::io::Error::new(
@@ -924,6 +1073,25 @@ mod tests {
         answer("_5223._tcp.xmpp.example.", RData::CNAME(hickory_resolver::proto::rr::rdata::CNAME(target)), proof)
     }
 
+    /// An RRSIG (its signature never checked here) covering `covered` at `name`.
+    fn rrsig_answer(name: &str, covered: RecordType) -> Record {
+        use hickory_resolver::proto::dnssec::rdata::{SigInput, RRSIG};
+        use hickory_resolver::proto::dnssec::{Algorithm, Proof};
+        use hickory_resolver::proto::rr::SerialNumber;
+        let owner = hickory_resolver::proto::rr::Name::from_ascii(name).unwrap();
+        let input = SigInput {
+            type_covered: covered,
+            algorithm: Algorithm::ECDSAP256SHA256,
+            num_labels: owner.num_labels(),
+            original_ttl: 300,
+            sig_expiration: SerialNumber::new(0),
+            sig_inception: SerialNumber::new(0),
+            key_tag: 0,
+            signer_name: hickory_resolver::proto::rr::Name::from_ascii("example.").unwrap(),
+        };
+        answer(name, RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::from_sig(input, vec![0; 64]))), Proof::Bogus)
+    }
+
     /// Run `settle_tlsa` with a scripted first answer and scripted retries; returns the
     /// outcome and how many retries were made.
     async fn settle(first: Validation, retries: &[Validation]) -> (Tlsa, usize) {
@@ -932,7 +1100,8 @@ mod tests {
             let proof = match v {
                 Validation::Secure => Proof::Secure,
                 Validation::Insecure => Proof::Insecure,
-                Validation::Bogus => Proof::Bogus,
+                // stripped: bogus records without RRSIGs (settle_tlsa only looks at `v`)
+                Validation::Unverifiable | Validation::Bogus => Proof::Bogus,
             };
             (vec![tlsa_answer(proof)], v)
         };
@@ -974,6 +1143,112 @@ mod tests {
         assert_eq!(retries, 0);
     }
 
+    #[tokio::test]
+    async fn unverifiable_tlsa_is_retried_and_never_outweighs_bogus() {
+        use Validation::*;
+        // Signatures missing on every attempt (a stripping or forwarding resolver): unverifiable.
+        let (tlsa, retries) = settle(Unverifiable, &[Unverifiable, Unverifiable]).await;
+        assert_eq!(tlsa, Tlsa::Unverifiable);
+        assert_eq!(retries, BOGUS_TLSA_RETRIES);
+        // A validating retry still upgrades.
+        let (tlsa, retries) = settle(Unverifiable, &[Secure]).await;
+        assert!(matches!(tlsa, Tlsa::Validated(_)));
+        assert_eq!(retries, 1);
+        // Any bogus attempt keeps it bogus, before or after unverifiable ones.
+        let (tlsa, _) = settle(Unverifiable, &[Bogus, Unverifiable]).await;
+        assert_eq!(tlsa, Tlsa::Bogus);
+        let (tlsa, _) = settle(Bogus, &[Unverifiable, Unverifiable]).await;
+        assert_eq!(tlsa, Tlsa::Bogus);
+        // An insecure retry doesn't soften it to "DANE n/a" either.
+        let (tlsa, _) = settle(Unverifiable, &[Insecure, Insecure]).await;
+        assert_eq!(tlsa, Tlsa::Unverifiable);
+    }
+
+    fn cname_to(owner: &str, target: &str) -> Record {
+        let target = hickory_resolver::proto::rr::Name::from_ascii(target).unwrap();
+        answer(owner, RData::CNAME(hickory_resolver::proto::rr::rdata::CNAME(target)), hickory_resolver::proto::dnssec::Proof::Secure)
+    }
+
+    /// Run `tlsa_via_cnames` on a scripted DNS: `(name, type) -> (records, validation)`; a name
+    /// without an entry answers `Insecure` and empty. Returns the result and every query made.
+    async fn via_cnames(
+        name: &str,
+        script: &[((&str, RecordType), (Vec<Record>, Validation))],
+    ) -> ((Vec<Record>, Validation), Vec<(String, RecordType)>) {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let result = tlsa_via_cnames(name, |n: String, t| {
+            asked.borrow_mut().push((n.clone(), t));
+            let found = script
+                .iter()
+                .find(|((sn, st), _)| *sn == n && *st == t)
+                .map(|(_, a)| a.clone())
+                .unwrap_or((Vec::new(), Validation::Insecure));
+            async move { found }
+        })
+        .await;
+        (result, asked.into_inner())
+    }
+
+    #[tokio::test]
+    async fn tlsa_behind_an_authenticated_cname_is_validated_on_its_own() {
+        use hickory_resolver::proto::dnssec::Proof;
+        use Validation::*;
+        const NAME: &str = "_5223._tcp.xmpp.example.";
+        const TARGET: &str = "_5223._tcp.target.example.";
+        let tlsa = RecordType::TLSA;
+        let cname = RecordType::CNAME;
+        let alias = || (vec![cname_to(NAME, TARGET)], Secure);
+        // The Android case: the chained answer is bogus (hickory dropped the RRSIGs), the CNAME
+        // validates, the target lacks signatures → unverifiable, not bogus.
+        for (target_answer, expected) in [
+            ((vec![], Unverifiable), Unverifiable),
+            ((vec![tlsa_answer(Proof::Secure)], Secure), Secure),
+            ((vec![], Bogus), Bogus),
+            ((vec![], Insecure), Insecure),
+        ] {
+            let script = [((NAME, tlsa), (vec![], Bogus)), ((NAME, cname), alias()), ((TARGET, tlsa), target_answer)];
+            let ((records, validation), _) = via_cnames(NAME, &script).await;
+            assert_eq!(validation, expected);
+            if expected == Secure {
+                assert_eq!(records.len(), 1, "the target's records are used");
+            }
+        }
+        // An unauthenticated CNAME is no way out: the original verdict stays.
+        for cname_validation in [Unverifiable, Bogus, Insecure] {
+            let script = [
+                ((NAME, tlsa), (vec![], Bogus)),
+                ((NAME, cname), (vec![cname_to(NAME, TARGET)], cname_validation)),
+                ((TARGET, tlsa), (vec![tlsa_answer(Proof::Secure)], Secure)),
+            ];
+            assert_eq!(via_cnames(NAME, &script).await.0 .1, Bogus, "{cname_validation:?}");
+        }
+        // No alias at the name (validated NODATA, or a CNAME owned by another name).
+        let script = [((NAME, tlsa), (vec![], Unverifiable)), ((NAME, cname), (vec![], Secure))];
+        assert_eq!(via_cnames(NAME, &script).await.0 .1, Unverifiable);
+        let script = [((NAME, tlsa), (vec![], Bogus)), ((NAME, cname), (vec![cname_to("other.example.", TARGET)], Secure))];
+        assert_eq!(via_cnames(NAME, &script).await.0 .1, Bogus);
+        // Two hops: the last target decides.
+        const SECOND: &str = "_5223._tcp.second.example.";
+        let script = [
+            ((NAME, tlsa), (vec![], Bogus)),
+            ((NAME, cname), alias()),
+            ((TARGET, tlsa), (vec![], Bogus)),
+            ((TARGET, cname), (vec![cname_to(TARGET, SECOND)], Secure)),
+            ((SECOND, tlsa), (vec![], Unverifiable)),
+        ];
+        assert_eq!(via_cnames(NAME, &script).await.0 .1, Unverifiable);
+        // A CNAME loop ends after MAX_CNAME_CHAIN_LENGTH hops with no usable records.
+        let script = [((NAME, tlsa), (vec![], Bogus)), ((NAME, cname), (vec![cname_to(NAME, NAME)], Secure))];
+        let ((records, validation), asked) = via_cnames(NAME, &script).await;
+        assert_eq!(validation, Insecure);
+        assert!(records.is_empty());
+        assert_eq!(asked.len(), 2 * (MAX_CNAME_CHAIN_LENGTH + 1));
+        // A final answer never asks for the CNAME.
+        let script = [((NAME, tlsa), (vec![tlsa_answer(Proof::Secure)], Secure))];
+        let (_, asked) = via_cnames(NAME, &script).await;
+        assert_eq!(asked, vec![(NAME.to_string(), tlsa)]);
+    }
+
     #[test]
     fn chain_validation_requires_the_whole_chain() {
         use hickory_resolver::proto::dnssec::Proof;
@@ -988,12 +1263,56 @@ mod tests {
             chain_validation(&[cname_answer(Proof::Insecure), tlsa_answer(Proof::Secure)], tlsa),
             Validation::Insecure
         );
-        // Any bogus link makes the whole answer bogus.
+        // Any bogus link whose signatures are there (and failed) makes the whole answer bogus.
+        assert_eq!(
+            chain_validation(
+                &[
+                    cname_answer(Proof::Bogus),
+                    rrsig_answer("_5223._tcp.xmpp.example.", RecordType::CNAME),
+                    tlsa_answer(Proof::Secure)
+                ],
+                tlsa
+            ),
+            Validation::Bogus
+        );
+        assert_eq!(
+            chain_validation(&[tlsa_answer(Proof::Bogus), rrsig_answer("_5223._tcp.target.example.", RecordType::TLSA)], tlsa),
+            Validation::Bogus
+        );
+        // Without any signatures for the bogus records (stripped, or a forwarding resolver) the
+        // answer is unverifiable instead: not trusted, but only fatal when DANE is enforced.
+        assert_eq!(chain_validation(&[tlsa_answer(Proof::Bogus)], tlsa), Validation::Unverifiable);
+        // ...but not through a followed CNAME chain: hickory drops the RRSIGs of a chain resolved
+        // through separate queries, so their absence proves nothing and a bogus link stays bogus.
         assert_eq!(
             chain_validation(&[cname_answer(Proof::Bogus), tlsa_answer(Proof::Secure)], tlsa),
             Validation::Bogus
         );
-        assert_eq!(chain_validation(&[tlsa_answer(Proof::Bogus)], tlsa), Validation::Bogus);
+        assert_eq!(
+            chain_validation(&[cname_answer(Proof::Secure), tlsa_answer(Proof::Bogus)], tlsa),
+            Validation::Bogus
+        );
+        // An RRSIG for another name or type doesn't count as the bogus records' signature.
+        assert_eq!(
+            chain_validation(&[tlsa_answer(Proof::Bogus), rrsig_answer("_5223._tcp.target.example.", RecordType::A)], tlsa),
+            Validation::Unverifiable
+        );
+        assert_eq!(
+            chain_validation(&[tlsa_answer(Proof::Bogus), rrsig_answer("other.example.", RecordType::TLSA)], tlsa),
+            Validation::Unverifiable
+        );
+        // One bogus link with its signature outweighs another one without.
+        assert_eq!(
+            chain_validation(
+                &[
+                    cname_answer(Proof::Bogus),
+                    tlsa_answer(Proof::Bogus),
+                    rrsig_answer("_5223._tcp.target.example.", RecordType::TLSA)
+                ],
+                tlsa
+            ),
+            Validation::Bogus
+        );
         assert_eq!(chain_validation(&[tlsa_answer(Proof::Indeterminate)], tlsa), Validation::Insecure);
         // A validated CNAME alone (the target type is missing) is not a validated TLSA answer.
         assert_eq!(chain_validation(&[cname_answer(Proof::Secure)], tlsa), Validation::Insecure);
@@ -1026,6 +1345,27 @@ mod tests {
         let digest = sha2::Sha256::digest(cert.as_ref()).to_vec();
         let matching = Tlsa::Validated(vec![record(CertUsage::DaneEe, Selector::Full, Matching::Sha256, digest)]);
         assert!(verifier(matching, true).verify_server_cert(&cert, &[], &name, &[], now).is_ok());
+    }
+
+    #[test]
+    fn unverifiable_tlsa_is_fatal_only_when_dane_is_enforced() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let verifier = |enforce| DaneVerifier {
+            pkix: pkix_verifier().unwrap(),
+            tlsa: Tlsa::Unverifiable,
+            enforce,
+            verified: Arc::new(AtomicBool::new(false)),
+        };
+        let cert = CertificateDer::from(cert());
+        let name = ServerName::try_from("example.org").unwrap();
+        let now = UnixTime::now();
+        // Not enforced: the CA check decides (and refuses this root as an end-entity certificate
+        // for example.org), not DANE.
+        let err = verifier(false).verify_server_cert(&cert, &[], &name, &[], now).unwrap_err();
+        assert!(!err.to_string().contains("DANE"), "{err}");
+        // Enforced (setting or the account's DANE pin): refused as not DANE-verified.
+        let err = verifier(true).verify_server_cert(&cert, &[], &name, &[], now).unwrap_err();
+        assert!(err.to_string().contains("DANE is enforced"), "{err}");
     }
 
     #[test]
@@ -1106,7 +1446,7 @@ mod tests {
     async fn a_hidden_service_account_domain_fails_fast() {
         for jid in ["user@abcdefghijklmnop.onion", "user@chat.example.i2p"] {
             let store = mxc_store::Store::open_in_memory().await.unwrap();
-            let connector = SecureConnector::new(store, Arc::new(Mutex::new(LinkSecurity::default())));
+            let connector = SecureConnector::new(store, Arc::new(Mutex::new(LinkSecurity::default())), 0);
             let jid: Jid = jid.parse().unwrap();
             let result = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -1195,6 +1535,29 @@ mod tests {
 
     fn ips() -> (IpAddr, IpAddr) {
         ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_unverifiable_answer_asks_on_and_never_outweighs_bogus() {
+        use Validation::*;
+        let (stripping, good) = ips();
+        // a stripping resolver next to a validating one: the validated answer wins, and the
+        // stripping one is asked last from then on
+        let marks = Mutex::new(Marks::default());
+        let servers = [(stripping, Outcome::Answer(vec![], Unverifiable)), (good, Outcome::Answer(vec![], Secure))];
+        assert_eq!(run_select(&marks, &servers).await.0, Some(Secure));
+        assert_eq!(marks.lock().unwrap().order(&[stripping, good], Instant::now()), vec![good, stripping]);
+        // unverifiable + bogus: bogus, whichever comes first
+        let marks = Mutex::new(Marks::default());
+        let servers = [(stripping, Outcome::Answer(vec![], Unverifiable)), (good, Outcome::Answer(vec![], Bogus))];
+        assert_eq!(run_select(&marks, &servers).await.0, Some(Bogus));
+        let marks = Mutex::new(Marks::default());
+        let servers = [(stripping, Outcome::Answer(vec![], Bogus)), (good, Outcome::Answer(vec![], Unverifiable))];
+        assert_eq!(run_select(&marks, &servers).await.0, Some(Bogus));
+        // unverifiable + a dead server: stays unverifiable, never "insecure"
+        let marks = Mutex::new(Marks::default());
+        let servers = [(stripping, Outcome::Answer(vec![], Unverifiable)), (good, Outcome::Failed { network: true })];
+        assert_eq!(run_select(&marks, &servers).await.0, Some(Unverifiable));
     }
 
     #[tokio::test]
@@ -1292,6 +1655,33 @@ mod tests {
 
     /// Live check against real servers (network; run with `cargo test -- --ignored live_`):
     /// DNSSEC/DANE detection, TLS 1.3, and that "Enforce DANE" refuses servers without DANE.
+    /// The Unverifiable/Bogus split relies on hickory handing the RRSIGs of a validated (direct,
+    /// non-CNAME) answer back to us. If a hickory update starts stripping them, every bogus TLSA
+    /// answer would look unverifiable - this catches that.
+    #[tokio::test]
+    #[ignore]
+    async fn live_secure_tlsa_answers_keep_their_rrsigs() {
+        let dns = Resolvers::new(None).await;
+        let (srv, _) = lookup(&dns, "_xmpps-client._tcp.monocles.eu.", RecordType::SRV).await;
+        let Some(RData::SRV(srv)) = srv.first().map(|r| r.data.clone()) else { panic!("no SRV for monocles.eu") };
+        let name = format!("_{}._tcp.{}", srv.port, srv.target.to_ascii());
+        let mut checked = false;
+        for (ip, resolver) in &dns.servers {
+            let Ok(found) = resolver.lookup(name.as_str(), RecordType::TLSA).await else { continue };
+            if chain_validation(found.answers(), RecordType::TLSA) != Validation::Secure {
+                println!("{ip}: not secure (stripping resolver?), skipped");
+                continue;
+            }
+            let tlsa: Vec<&Record> = found.answers().iter().filter(|r| r.record_type() == RecordType::TLSA).collect();
+            assert!(!tlsa.is_empty(), "{ip}: no TLSA records at {name}");
+            for r in tlsa {
+                assert!(covered_by_rrsig(r, found.answers()), "{ip}: TLSA at {name} came back without its RRSIG");
+            }
+            checked = true;
+        }
+        assert!(checked, "no name server validated {name}; use a DNSSEC-capable resolver");
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_link_security() {
@@ -1301,7 +1691,7 @@ mod tests {
             let store = store.clone();
             async move {
                 let report = Arc::new(Mutex::new(LinkSecurity::default()));
-                let connector = SecureConnector::new(store, report.clone());
+                let connector = SecureConnector::new(store, report.clone(), 0);
                 let jid: Jid = format!("probe@{domain}").parse().unwrap();
                 let result = connector.connect(&jid, xmpp_parsers::ns::JABBER_CLIENT, Timeouts::default()).await;
                 let features = match result {
@@ -1342,7 +1732,7 @@ mod tests {
         let store = mxc_store::Store::open_in_memory().await.unwrap();
         let connect = |store: mxc_store::Store| async move {
             let report = Arc::new(Mutex::new(LinkSecurity::default()));
-            let connector = SecureConnector::new(store, report.clone());
+            let connector = SecureConnector::new(store, report.clone(), 0);
             let jid: Jid = "probe@monocles.eu".parse().unwrap();
             let result = connector.connect(&jid, xmpp_parsers::ns::JABBER_CLIENT, Timeouts::default()).await;
             let ok = match result {
@@ -1409,7 +1799,7 @@ mod tests {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let ok = rt.block_on(async {
                 let store = mxc_store::Store::open_in_memory().await.unwrap();
-                let connector = SecureConnector::new(store, Arc::new(Mutex::new(LinkSecurity::default())));
+                let connector = SecureConnector::new(store, Arc::new(Mutex::new(LinkSecurity::default())), 0);
                 let jid: Jid = "probe@monocles.eu".parse().unwrap();
                 tokio::time::timeout(
                     Duration::from_secs(60),

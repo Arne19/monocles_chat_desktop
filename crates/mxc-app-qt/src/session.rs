@@ -1633,6 +1633,9 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
         // list changed legitimately (without downgrade protection) can be used again.
         let _ = store.set_sasl_pin(account_id, -1).await;
     }
+    // DANE pin of this account (set by the core after a DANE-verified login).
+    let pinned = store.dane_pinned(account_id).await.unwrap_or(false);
+    let _ = qt.queue(move |mut backend: Pin<&mut Backend>| backend.as_mut().set_dane_pinned(pinned));
     load_local_state(store, account_id).await;
 
     // Seal the password for next-launch auto-login (idempotent; references used before move).
@@ -1812,6 +1815,10 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                         backend_update(&qt, "Connecting…", false)
                     }
                     ConnectionState::Online { full_jid, security } => {
+                        if security.dane {
+                            // the core pins DANE after a DANE-verified login
+                            let _ = qt.queue(|mut backend: Pin<&mut Backend>| backend.as_mut().set_dane_pinned(true));
+                        }
                         set_link_security(&qt, link_security_text(&security));
                         backend_update(&qt, &format!("Online as {full_jid}"), true)
                     }
@@ -2468,6 +2475,7 @@ pub fn logout() {
             let _ = qt.queue(|mut backend: Pin<&mut Backend>| {
                 backend.as_mut().set_connected(false);
                 backend.as_mut().set_status(QString::from("Disconnected"));
+                backend.as_mut().set_dane_pinned(false);
                 // Emptying the account JID flips QML back to the login page.
                 backend.as_mut().set_account_jid(QString::default());
             });
@@ -2490,6 +2498,19 @@ pub fn set_flag_setting(key: &'static str, value: bool) {
     runtime().spawn(async move {
         let Ok(store) = store().await else { return };
         let _ = store.set_setting(key, if value { "1" } else { "0" }).await;
+    });
+}
+
+/// Clear the logged-in account's DANE pin ("Stop requiring DANE").
+pub fn reset_dane_pin() {
+    let Some((_, account_id, _)) = client_info() else { return };
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        if let Err(e) = store.set_dane_pinned(account_id, false).await {
+            tracing::warn!(error = %e, "clearing the DANE pin");
+        } else {
+            tracing::info!(account_id, "DANE pin cleared by the user");
+        }
     });
 }
 

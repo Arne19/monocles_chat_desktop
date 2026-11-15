@@ -252,6 +252,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dane_pin_defaults_to_false_and_round_trips() {
+        let store = Store::open_in_memory().await.expect("open");
+        let id = store.upsert_account("pin@example.org").await.expect("insert account");
+        assert!(!store.dane_pinned(id).await.unwrap(), "new accounts are not pinned");
+        store.set_dane_pinned(id, true).await.unwrap();
+        assert!(store.dane_pinned(id).await.unwrap());
+        store.set_dane_pinned(id, false).await.unwrap();
+        assert!(!store.dane_pinned(id).await.unwrap());
+        // an unknown account is not pinned (no row)
+        assert!(!store.dane_pinned(id + 1000).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn sqlcipher_encrypts_and_rejects_wrong_key() {
         let dir = std::env::temp_dir().join(format!("mxc-cipher-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

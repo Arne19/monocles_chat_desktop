@@ -49,6 +49,9 @@ pub mod qobject {
         /// enforce DANE (default off). Read from the store on every connection attempt.
         #[qproperty(bool, require_tls13, cxx_name = "requireTls13")]
         #[qproperty(bool, enforce_dane, cxx_name = "enforceDane")]
+        /// Whether DANE is pinned for the logged-in account: its server proved its certificate
+        /// with DANE once, so connections without DANE are refused (as on monocles Android).
+        #[qproperty(bool, dane_pinned, cxx_name = "danePinned")]
         /// DNS-over-TLS server (hostname or IP); empty = the system's name servers.
         #[qproperty(QString, dns_server_dot, cxx_name = "dnsServerDot")]
         /// How the current connection is secured, e.g. "DNSSEC + DANE verified · TLS 1.3"; empty
@@ -150,6 +153,12 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "changeEnforceDane"]
         fn change_enforce_dane(self: Pin<&mut Backend>, value: bool);
+
+        /// Clear the logged-in account's DANE pin ("Stop requiring DANE"; applies to the next
+        /// connection). Android's "Accept" after a DANE failure.
+        #[qinvokable]
+        #[cxx_name = "resetDanePin"]
+        fn reset_dane_pin(self: Pin<&mut Backend>);
 
         /// Set + persist the DNS-over-TLS server ("" = the system's name servers; applies to
         /// the next connection). Returns false, and keeps the old value, for invalid input.
@@ -831,6 +840,7 @@ pub struct BackendRust {
     support_room_visible: bool,
     require_tls13: bool,
     enforce_dane: bool,
+    dane_pinned: bool,
     dns_server_dot: QString,
     link_security: QString,
     chat_bg_mode: QString,
@@ -884,6 +894,8 @@ impl Default for BackendRust {
             // Android's defaults; the startup check applies the saved choice.
             require_tls13: true,
             enforce_dane: false,
+            // the login reads the account's pin
+            dane_pinned: false,
             dns_server_dot: QString::default(),
             link_security: QString::default(),
             // Bundled doodle background by default; the startup check applies the saved choice.
@@ -966,6 +978,12 @@ impl qobject::Backend {
     pub fn change_enforce_dane(mut self: Pin<&mut Self>, value: bool) {
         self.as_mut().set_enforce_dane(value);
         crate::session::set_flag_setting(mxc_proto::connect::SETTING_ENFORCE_DANE, value);
+    }
+
+    /// QML entry point — clear the logged-in account's DANE pin.
+    pub fn reset_dane_pin(mut self: Pin<&mut Self>) {
+        self.as_mut().set_dane_pinned(false);
+        crate::session::reset_dane_pin();
     }
 
     /// QML entry point — set + persist the DNS-over-TLS server, if valid.

@@ -178,7 +178,7 @@ impl CoreActor {
         // DNSSEC-validated resolution, DANE and the TLS 1.3-only setting (see [`crate::connect`]);
         // `link` reports how the current connection was secured.
         let link = std::sync::Arc::new(std::sync::Mutex::new(crate::connect::LinkSecurity::default()));
-        let connector = crate::connect::SecureConnector::new(self.store.clone(), link.clone());
+        let connector = crate::connect::SecureConnector::new(self.store.clone(), link.clone(), cfg.account_id);
         // Bind a stable per-install resource (like Android's `monocles chat.<random>`): a restart
         // then REPLACES the previous session on the server instead of leaving it behind. A stale
         // session lingers as a "ghost" occupant of every joined room under our nick, and with
@@ -279,6 +279,18 @@ impl CoreActor {
                         SessionEvent::Online { bound_jid, resumed } => {
                             info!(%bound_jid, resumed, "online");
                             online.set(true);
+                            // HSTS-style DANE pin, as on Android: once the server proved its
+                            // certificate with DANE (and the login completed), DANE is enforced
+                            // for this account from now on. Only a DANE-EE/PKIX-EE match sets
+                            // `dane`, so an unverified answer can never pin.
+                            // (read first: the std mutex must not be held across the await)
+                            let dane = link.lock().unwrap().dane;
+                            if dane && !self.store.dane_pinned(cfg.account_id).await.unwrap_or(true) {
+                                info!("server proved its certificate with DANE, pinning DANE");
+                                if let Err(e) = self.store.set_dane_pinned(cfg.account_id, true).await {
+                                    warn!(error = %e, "storing the DANE pin");
+                                }
+                            }
                             backoff = std::time::Duration::from_secs(2); // reset on success
                             let _ = self.events.send(Event::Connection(
                                 ConnectionState::Online {

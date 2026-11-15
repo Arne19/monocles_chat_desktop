@@ -97,6 +97,25 @@ impl Store {
         Ok(())
     }
 
+    /// Whether DANE is pinned for the account (its server proved its certificate with DANE once).
+    pub async fn dane_pinned(&self, account_id: i64) -> Result<bool> {
+        let pin: Option<i64> = sqlx::query_scalar("SELECT dane_pin FROM accounts WHERE id = ?1")
+            .bind(account_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(pin.unwrap_or(0) != 0)
+    }
+
+    /// Set or clear the DANE pin (cleared only by the user: "Stop requiring DANE").
+    pub async fn set_dane_pinned(&self, account_id: i64, pinned: bool) -> Result<()> {
+        sqlx::query("UPDATE accounts SET dane_pin = ?1 WHERE id = ?2")
+            .bind(pinned as i64)
+            .bind(account_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     /// The first enabled account that has a stored secret (for auto-login on startup).
     pub async fn autologin_account(&self) -> Result<Option<Account>> {
         let acc = sqlx::query_as::<_, Account>(
