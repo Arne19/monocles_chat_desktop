@@ -385,6 +385,169 @@ fn skip_sub_blocks(input: &[u8], mut pos: usize) -> anyhow::Result<usize> {
     }
 }
 
+// -------------------------------------------------------------------------------- animation
+
+/// At most this much of a file is looked at by [`inspect_animation`] (as on Android).
+const MAX_INSPECT_SIZE: u64 = 64 * 1024 * 1024;
+/// Frames shown for this long or shorter are displayed for 100 ms, as browsers do.
+const MIN_FRAME_DELAY_MS: u64 = 10;
+const DEFAULT_FRAME_DELAY_MS: u64 = 100;
+/// A story shows for this long, and an animated one for one loop within these bounds.
+pub const STORY_DURATION_MS: u64 = 6_000;
+pub const MAX_ANIMATED_STORY_DURATION_MS: u64 = 15_000;
+
+/// An animated GIF or WebP, as found in the file's own bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Animation {
+    /// `image/gif` or `image/webp`, from the file signature.
+    pub mime: &'static str,
+    pub frames: u32,
+    /// Length of one pass through all frames.
+    pub loop_ms: u64,
+}
+
+/// Whether `input` is an animated GIF or WebP (ported from Android's
+/// `MediaMetadataStripper.inspectAnimation`). The type comes from the file signature, never
+/// from a claimed MIME type. The file is read as a stream, never held as a whole (story media
+/// comes from any contact), and at most [`MAX_INSPECT_SIZE`] bytes of it are looked at.
+/// `None` for anything else: still images, other formats, malformed or unreadable files.
+pub fn inspect_animation(input: impl std::io::Read) -> Option<Animation> {
+    use std::io::Read;
+    let mut r = std::io::BufReader::new(input.take(MAX_INSPECT_SIZE));
+    let mut sig = [0u8; 12];
+    r.read_exact(&mut sig).ok()?;
+    if sig.starts_with(b"GIF87a") || sig.starts_with(b"GIF89a") {
+        inspect_gif(&mut r, sig[10]).ok().flatten()
+    } else if &sig[0..4] == b"RIFF" && &sig[8..12] == b"WEBP" {
+        inspect_webp(&mut r, u32::from_le_bytes(sig[4..8].try_into().ok()?) as u64)
+    } else {
+        None
+    }
+}
+
+/// How long a story with this media shows: one loop of an animation, clamped to
+/// [`STORY_DURATION_MS`]..=[`MAX_ANIMATED_STORY_DURATION_MS`]; still images get the default.
+pub fn story_duration_ms(animation: Option<&Animation>) -> u64 {
+    animation.map_or(STORY_DURATION_MS, |a| {
+        a.loop_ms.clamp(STORY_DURATION_MS, MAX_ANIMATED_STORY_DURATION_MS)
+    })
+}
+
+fn frame_delay(ms: u64) -> u64 {
+    if ms <= MIN_FRAME_DELAY_MS { DEFAULT_FRAME_DELAY_MS } else { ms }
+}
+
+fn read_u8(r: &mut impl std::io::Read) -> std::io::Result<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
+/// Skips `n` bytes without buffering them; an early end of file is an error.
+fn skip(r: &mut impl std::io::Read, n: u64) -> std::io::Result<()> {
+    use std::io::Read;
+    let skipped = std::io::copy(&mut r.by_ref().take(n), &mut std::io::sink())?;
+    if skipped == n {
+        Ok(())
+    } else {
+        Err(std::io::ErrorKind::UnexpectedEof.into())
+    }
+}
+
+fn skip_gif_sub_blocks(r: &mut impl std::io::Read) -> std::io::Result<()> {
+    loop {
+        let size = read_u8(r)?;
+        if size == 0 {
+            return Ok(());
+        }
+        skip(r, size as u64)?;
+    }
+}
+
+/// `r` is positioned after the first 12 header bytes; `lsd_flags` are the packed fields of the
+/// logical screen descriptor.
+fn inspect_gif(r: &mut impl std::io::Read, lsd_flags: u8) -> std::io::Result<Option<Animation>> {
+    skip(r, 1)?; // pixel aspect ratio, the rest of the 13 byte header
+    if lsd_flags & 0x80 != 0 {
+        skip(r, 3 * (1u64 << ((lsd_flags & 0x07) + 1)))?;
+    }
+    let (mut frames, mut duration, mut pending_delay) = (0u32, 0u64, 0u64);
+    loop {
+        let mut block = [0u8; 1];
+        if r.read(&mut block)? == 0 {
+            break; // end of file without trailer
+        }
+        match block[0] {
+            0x3B => break, // trailer
+            0x2C => {
+                // Image descriptor.
+                let mut d = [0u8; 9];
+                r.read_exact(&mut d)?;
+                if d[8] & 0x80 != 0 {
+                    skip(r, 3 * (1u64 << ((d[8] & 0x07) + 1)))?;
+                }
+                skip(r, 1)?; // LZW minimum code size
+                skip_gif_sub_blocks(r)?;
+                frames += 1;
+                duration += frame_delay(pending_delay);
+                pending_delay = 0;
+            }
+            0x21 => {
+                // Extension.
+                if read_u8(r)? == 0xF9 {
+                    // Graphic control: delay in hundredths of a second, little endian.
+                    let mut gce = vec![0u8; read_u8(r)? as usize];
+                    r.read_exact(&mut gce)?;
+                    if gce.len() >= 4 {
+                        pending_delay = u16::from_le_bytes([gce[1], gce[2]]) as u64 * 10;
+                    }
+                }
+                skip_gif_sub_blocks(r)?;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok((frames >= 2).then_some(Animation { mime: "image/gif", frames, loop_ms: duration }))
+}
+
+/// `r` is positioned after `RIFF<size>WEBP`; `riff_size` counts the `WEBP` tag. A truncated
+/// file is judged by the chunks that were complete.
+fn inspect_webp(r: &mut impl std::io::Read, riff_size: u64) -> Option<Animation> {
+    let mut remaining = riff_size.saturating_sub(4);
+    let (mut animation_flag, mut frames, mut duration) = (false, 0u32, 0u64);
+    while remaining >= 8 {
+        let mut header = [0u8; 8];
+        if r.read_exact(&mut header).is_err() {
+            break;
+        }
+        let size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+        let padded = size + (size & 1);
+        if padded > remaining - 8 {
+            break;
+        }
+        let mut payload_left = padded;
+        let step = (|| -> std::io::Result<()> {
+            if &header[0..4] == b"VP8X" && size >= 1 {
+                animation_flag = read_u8(r)? & 0x02 != 0;
+                payload_left -= 1;
+            } else if &header[0..4] == b"ANMF" && size >= 16 {
+                // Frame header: X, Y, width, height (3 bytes each), then a 24 bit duration in ms.
+                let mut f = [0u8; 15];
+                r.read_exact(&mut f)?;
+                payload_left -= f.len() as u64;
+                frames += 1;
+                duration += frame_delay(u32::from_le_bytes([f[12], f[13], f[14], 0]) as u64);
+            }
+            skip(r, payload_left)
+        })();
+        if step.is_err() {
+            break;
+        }
+        remaining -= 8 + padded;
+    }
+    (animation_flag && frames >= 2).then_some(Animation { mime: "image/webp", frames, loop_ms: duration })
+}
+
 // ----------------------------------------------------------------------- MP4 / QuickTime
 
 /// One ISO-BMFF box: `start..end` spans the whole box, `body` is where its payload begins.
@@ -865,5 +1028,116 @@ mod tests {
         assert_eq!(sniff(b"\0\0\0\x18ftypmif1\0\0\0\0mif1heic"), Some("image/heic"));
         assert_eq!(sniff(b"\0\0\0\x1cftypavif\0\0\0\0avifmif1"), Some("image/avif"));
         assert_eq!(sniff(b"\0\0\0\x18ftypisom\0\0\0\0isomiso2"), Some("video/mp4"));
+    }
+
+    // ---- animation detection ----
+
+    const GIF_HEADER: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00";
+    const GIF_IMAGE: &[u8] = &[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x4C, 0x01, 0];
+
+    fn gce(hundredths: u16) -> Vec<u8> {
+        let [lo, hi] = hundredths.to_le_bytes();
+        vec![0x21, 0xF9, 4, 0, lo, hi, 0, 0]
+    }
+
+    fn riff_chunk(fourcc: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut c = fourcc.to_vec();
+        c.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        c.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            c.push(0);
+        }
+        c
+    }
+
+    fn webp(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let body = chunks.concat();
+        let mut w = b"RIFF".to_vec();
+        w.extend_from_slice(&(body.len() as u32 + 4).to_le_bytes());
+        w.extend_from_slice(b"WEBP");
+        w.extend_from_slice(&body);
+        w
+    }
+
+    fn anmf(duration_ms: u32) -> Vec<u8> {
+        let mut header = vec![0u8; 16];
+        header[12..15].copy_from_slice(&duration_ms.to_le_bytes()[..3]);
+        header.extend(riff_chunk(b"VP8 ", &[1, 2, 3]));
+        riff_chunk(b"ANMF", &header)
+    }
+
+    fn animated_vp8x(extra_flags: u8) -> Vec<u8> {
+        let mut v = vec![0u8; 10];
+        v[0] = 0x02 | extra_flags;
+        riff_chunk(b"VP8X", &v)
+    }
+
+    #[test]
+    fn gif_with_one_frame_is_not_animated() {
+        let g = [GIF_HEADER, &gce(50), GIF_IMAGE, &[0x3B]].concat();
+        assert_eq!(inspect_animation(&g[..]), None);
+    }
+
+    #[test]
+    fn gif_with_several_frames_is_animated() {
+        let g = [GIF_HEADER, &gce(50), GIF_IMAGE, &gce(0), GIF_IMAGE, &gce(300), GIF_IMAGE, &[0x3B]].concat();
+        let a = inspect_animation(&g[..]).unwrap();
+        assert_eq!((a.mime, a.frames, a.loop_ms), ("image/gif", 3, 500 + 100 + 3000));
+    }
+
+    #[test]
+    fn truncated_gif_is_not_animated() {
+        let g = [GIF_HEADER, &gce(50), GIF_IMAGE, &gce(50), &[0x2C, 0, 0]].concat();
+        assert_eq!(inspect_animation(&g[..]), None);
+        let g = [GIF_HEADER, &gce(50), GIF_IMAGE, &gce(50), GIF_IMAGE, &[0x21, 0x01, 100, 1, 2]].concat();
+        assert_eq!(inspect_animation(&g[..]), None);
+    }
+
+    #[test]
+    fn still_webp_is_not_animated() {
+        assert_eq!(inspect_animation(&webp(&[riff_chunk(b"VP8X", &[0; 10]), riff_chunk(b"VP8 ", &[1, 2, 3])])[..]), None);
+        assert_eq!(inspect_animation(&webp(&[riff_chunk(b"VP8 ", &[1, 2, 3])])[..]), None);
+    }
+
+    #[test]
+    fn animated_webp_is_animated() {
+        let w = webp(&[animated_vp8x(0), riff_chunk(b"ANIM", &[0; 6]), anmf(40), anmf(5), anmf(70_000)]);
+        let a = inspect_animation(&w[..]).unwrap();
+        assert_eq!((a.mime, a.frames, a.loop_ms), ("image/webp", 3, 40 + 100 + 70_000));
+        assert_eq!(story_duration_ms(Some(&a)), MAX_ANIMATED_STORY_DURATION_MS);
+    }
+
+    #[test]
+    fn animated_webp_survives_stripping() {
+        let w = webp(&[animated_vp8x(0x08), riff_chunk(b"ANIM", &[0; 6]), anmf(40), anmf(40), riff_chunk(b"EXIF", b"GPS!")]);
+        let out = strip(&w, "image/webp").unwrap();
+        assert!(!contains(&out, b"GPS!"));
+        assert_eq!(inspect_animation(&out[..]).map(|a| a.frames), Some(2));
+    }
+
+    #[test]
+    fn webp_chunk_claiming_huge_size_is_not_animated() {
+        let mut w = b"RIFF\xFF\xFF\xFF\xFFWEBP".to_vec();
+        w.extend(animated_vp8x(0));
+        w.extend(anmf(40));
+        w.extend_from_slice(b"ANMF\xFF\xFF\xFF\xFF");
+        w.extend_from_slice(&[0; 16]);
+        assert_eq!(inspect_animation(&w[..]), None);
+    }
+
+    #[test]
+    fn other_data_is_not_animated() {
+        assert_eq!(inspect_animation(&[][..]), None);
+        assert_eq!(inspect_animation(&b"GIF89a"[..]), None);
+        assert_eq!(inspect_animation(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..]), None);
+        assert_eq!(story_duration_ms(None), STORY_DURATION_MS);
+    }
+
+    #[test]
+    fn short_animation_shows_for_the_default_duration() {
+        let g = [GIF_HEADER, &gce(10), GIF_IMAGE, &gce(10), GIF_IMAGE, &[0x3B]].concat();
+        let a = inspect_animation(&g[..]).unwrap();
+        assert_eq!(a.loop_ms, 200);
+        assert_eq!(story_duration_ms(Some(&a)), STORY_DURATION_MS);
     }
 }

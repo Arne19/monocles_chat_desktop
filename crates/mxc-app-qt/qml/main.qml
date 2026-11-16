@@ -3704,6 +3704,17 @@ ApplicationWindow {
         }
         contentItem: ColumnLayout {
             spacing: 8
+            // Preview of a picked image; animated GIFs/WebPs are published (and play) as they are.
+            AnimatedImage {
+                readonly property bool isImage: /\.(png|jpe?g|gif|webp)$/i.test(window.pendingStoryPath)
+                Layout.fillWidth: true
+                Layout.preferredHeight: 240
+                visible: isImage && status === Image.Ready
+                fillMode: Image.PreserveAspectFit
+                cache: false
+                playing: postStoryDialog.visible
+                source: (postStoryDialog.visible && isImage) ? "file:" + window.pendingStoryPath : ""
+            }
             Label {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
@@ -3738,7 +3749,8 @@ ApplicationWindow {
         Label { textFormat: Text.PlainText; text: qsTr("It will be removed for all your contacts.") }
     }
     // Story viewer: plays one publisher's stories oldest first (as on Android) with segmented
-    // progress bars and a 6s auto-advance per image. The timer only runs while the image is
+    // progress bars and an auto-advance per image: 6s, or one loop of an animated GIF/WebP
+    // (6–15s). The timer (and the animation) only runs while the image is
     // loaded, the window is active, no dialog is open and the user isn't holding it (press
     // and hold pauses). Videos are downloaded when they come up, then show a Play button (system
     // player; there is no Qt Multimedia here) and wait for a tap.
@@ -3752,7 +3764,8 @@ ApplicationWindow {
         closePolicy: Popup.CloseOnEscape
         background: Rectangle { color: "#000000" }
 
-        readonly property int seconds: 6
+        // How long the current story shows (ms), from StoryModel.durationAt.
+        property int currentDurationMs: 6000
         property real progress: 0
         // The shown story, kept across model resets (a media download reloads the model).
         property string contact: ""
@@ -3819,6 +3832,8 @@ ApplicationWindow {
             currentMime = viewerStories.mimeAt(i)
             currentPath = viewerStories.pathAt(i)
             currentPublished = viewerStories.publishedAt(i)
+            // Known once the media is downloaded, which is before the timer can start.
+            currentDurationMs = viewerStories.durationAt(i)
             if (changed)
                 restartProgress()
             else
@@ -3843,6 +3858,8 @@ ApplicationWindow {
         function restartProgress() {
             progressAnim.stop()
             progress = 0
+            if (pager.currentItem !== null)
+                pager.currentItem.rewind()
             updatePlayback()
         }
         function updatePlayback() {
@@ -3879,7 +3896,7 @@ ApplicationWindow {
             target: storyViewer
             property: "progress"
             from: 0; to: 1
-            duration: storyViewer.seconds * 1000
+            duration: storyViewer.currentDurationMs
             onFinished: if (storyViewer.progress >= 1) storyViewer.goNext()
         }
 
@@ -3906,12 +3923,20 @@ ApplicationWindow {
                     readonly property string storyPath: model.localPath
                     readonly property bool storyLoading: model.downloading
                     readonly property bool storyFailed: model.failed
+                    readonly property bool isCurrent: ListView.isCurrentItem
                     readonly property bool mediaShown: isVideo || storyImage.status === Image.Ready
                     // A contact's story is downloaded when it comes up (only our own are prefetched).
                     readonly property bool wantsFetch: ListView.isCurrentItem && storyViewer.visible
                         && model.localPath.length === 0 && !model.downloading && !model.failed
                     onWantsFetchChanged: if (wantsFetch) viewerStories.fetchMedia(index)
                     Component.onCompleted: if (wantsFetch) viewerStories.fetchMedia(index)
+                    // Back to the first frame of an animated story (restarted in place). Done by
+                    // stopping and starting it: QMovie can't seek back in an uncached GIF.
+                    property bool restarting: false
+                    function rewind() {
+                        restarting = true
+                        restarting = false
+                    }
 
                     AnimatedImage {
                         id: storyImage
@@ -3919,7 +3944,10 @@ ApplicationWindow {
                         anchors.margins: 8
                         fillMode: Image.PreserveAspectFit
                         cache: false
-                        playing: storyViewer.opened
+                        // Only the shown story animates, from its first frame each time it comes
+                        // up; holding it, a dialog or an inactive window pause it in place.
+                        playing: isCurrent && storyViewer.opened && !restarting
+                        paused: !storyViewer.playing
                         visible: !isVideo && model.localPath.length > 0
                         source: (!isVideo && model.localPath.length > 0) ? "file:" + model.localPath : ""
                     }

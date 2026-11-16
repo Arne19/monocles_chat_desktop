@@ -39,6 +39,9 @@ pub struct StoryEntry {
     /// Whether the media is being downloaded / its last download failed.
     pub downloading: bool,
     pub failed: bool,
+    /// How long the viewer shows it (ms): one loop of an animated image, clamped to 6–15 s;
+    /// 6 s for still images; 0 for videos (they wait for the user).
+    pub duration_ms: i64,
 }
 
 #[cxx_qt::bridge]
@@ -108,6 +111,11 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "publishedAt"]
         fn published_at(self: &StoryModel, index: i32) -> i64;
+        /// How long the story at `index` shows (ms): one loop of an animated GIF/WebP (6–15 s),
+        /// else 6 s.
+        #[qinvokable]
+        #[cxx_name = "durationAt"]
+        fn duration_at(self: &StoryModel, index: i32) -> i64;
 
         /// Download the media of the story at `index` (videos are fetched on demand, and a
         /// failed download is retried this way). Up to the manual-download size limit.
@@ -206,6 +214,13 @@ impl qobject::StoryModel {
 
     fn published_at(&self, index: i32) -> i64 {
         self.items.get(index as usize).map_or(0, |s| s.published)
+    }
+
+    fn duration_at(&self, index: i32) -> i64 {
+        let default = mxc_proto::media_strip::STORY_DURATION_MS as i64;
+        self.items
+            .get(index as usize)
+            .map_or(default, |s| if s.duration_ms > 0 { s.duration_ms } else { default })
     }
 
     fn fetch_media(self: Pin<&mut Self>, index: i32) {

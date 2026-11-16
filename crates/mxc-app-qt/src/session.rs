@@ -438,6 +438,11 @@ pub fn load_stories(jid: String, contact: Option<String>, qt: CxxQtThread<StoryM
                 }
             }
             request_avatar(&s.contact, false);
+            let duration_ms = if s.r#type.starts_with("video/") {
+                0
+            } else {
+                story_image_duration_ms(&s.url, &local_path).await
+            };
             items.push(StoryEntry {
                 uuid: s.uuid.clone(),
                 contact: s.contact.clone(),
@@ -450,10 +455,35 @@ pub fn load_stories(jid: String, contact: Option<String>, qt: CxxQtThread<StoryM
                 url: s.url.clone(),
                 downloading: IMAGE_REQUESTED.lock().unwrap().contains(&s.url),
                 failed: STORY_MEDIA_FAILED.lock().unwrap().contains(&s.url),
+                duration_ms,
             });
         }
         let _ = qt.queue(move |model: Pin<&mut StoryModel>| model.reset(items));
     });
+}
+
+/// How long the viewer shows each downloaded story image, by URL (story media doesn't change).
+static STORY_DURATIONS: LazyLock<Mutex<HashMap<String, i64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long the story image at `local_path` shows: one loop of an animated GIF/WebP (clamped),
+/// else the default. The file is inspected once, off the async workers (it can be large).
+async fn story_image_duration_ms(url: &str, local_path: &str) -> i64 {
+    use mxc_proto::media_strip::{inspect_animation, story_duration_ms, STORY_DURATION_MS};
+    if local_path.is_empty() {
+        return STORY_DURATION_MS as i64;
+    }
+    if let Some(&ms) = STORY_DURATIONS.lock().unwrap().get(url) {
+        return ms;
+    }
+    let path = local_path.to_owned();
+    let ms = tokio::task::spawn_blocking(move || {
+        let animation = std::fs::File::open(&path).ok().and_then(inspect_animation);
+        story_duration_ms(animation.as_ref()) as i64
+    })
+    .await
+    .unwrap_or(STORY_DURATION_MS as i64);
+    STORY_DURATIONS.lock().unwrap().insert(url.to_owned(), ms);
+    ms
 }
 
 /// Story media URLs whose last download failed (the viewer offers a retry).
