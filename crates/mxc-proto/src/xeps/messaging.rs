@@ -1277,14 +1277,14 @@ pub async fn download_file(
     tokio::fs::create_dir_all(&dir).await.ok();
     // SECURITY: `filename` can come from the sender (the SFS `<name>`). Joining an absolute
     // or `../` name would write anywhere the user can (e.g. ~/.config/autostart/x.desktop),
-    // so only a sanitized final component is used, and the result must sit in `dir`.
-    let path = unique_path(&dir, &safe_file_name(filename));
-    if path.parent() != Some(dir.as_path()) {
-        anyhow::bail!("refusing to save outside the downloads folder");
-    }
-    tokio::fs::write(&path, &bytes)
+    // so only a sanitized final component is used, and the result must sit in `dir`
+    // (checked again for every candidate in `save_new_file`).
+    let name = safe_file_name(filename);
+    let save_dir = dir.clone();
+    let path = tokio::task::spawn_blocking(move || save_new_file(&save_dir, &name, &bytes))
         .await
-        .map_err(|e| anyhow::anyhow!("save {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("save task failed: {e}"))?
+        .map_err(|e| anyhow::anyhow!("save to {}: {e}", dir.display()))?;
     let _ = events
         .send(Event::FileSaved {
             account_id: cfg.account_id,
@@ -1340,10 +1340,59 @@ fn safe_file_name(name: &str) -> String {
     }
 }
 
+/// Save `bytes` as a new file named after `filename` in `dir` and return its path. The data is
+/// written to a hidden temporary file first and only then given its name, so the downloads
+/// folder never shows a half-written file (crash, full disk). Publishing uses a hard link,
+/// which fails instead of replacing: an existing file - also one another download just
+/// created under the same name - is never overwritten, and the next free ` (n)` name is taken.
+/// On file systems without hard links it falls back to a rename after an existence check.
+fn save_new_file(dir: &std::path::Path, filename: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{filename}.part-{:016x}", rand::random::<u64>()));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        for _ in 0..1000 {
+            let candidate = unique_path(dir, filename);
+            if name_taken(&candidate) {
+                break; // unique_path found no free name at all
+            }
+            if candidate.parent() != Some(dir) {
+                return Err(std::io::Error::other("refusing to save outside the downloads folder"));
+            }
+            match std::fs::hard_link(&tmp, &candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    if name_taken(&candidate) {
+                        continue;
+                    }
+                    std::fs::rename(&tmp, &candidate)?;
+                    return Ok(candidate);
+                }
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free file name"))
+    })();
+    // after a hard link (or on failure) the temporary name goes; after a rename it's gone already
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// Whether a directory entry named `p` exists. Unlike `Path::exists` this doesn't follow
+/// symlinks, so a broken symlink counts as taken (linking or renaming onto it would fail or
+/// replace it).
+fn name_taken(p: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok()
+}
+
 /// A non-colliding path in `dir` for `filename` (appends ` (n)` before the extension).
 fn unique_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
     let candidate = dir.join(filename);
-    if !candidate.exists() {
+    if !name_taken(&candidate) {
         return candidate;
     }
     let (stem, ext) = match filename.rsplit_once('.') {
@@ -1352,7 +1401,7 @@ fn unique_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
     };
     for n in 1..1000 {
         let p = dir.join(format!("{stem} ({n}){ext}"));
-        if !p.exists() {
+        if !name_taken(&p) {
             return p;
         }
     }
@@ -3479,7 +3528,90 @@ mod file_caption_tests {
 
 #[cfg(test)]
 mod download_name_tests {
-    use super::{safe_file_name, unique_path};
+    use super::{safe_file_name, save_new_file, unique_path};
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mxc-save-test-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".part-"))
+            .collect()
+    }
+
+    #[test]
+    fn saves_under_the_name_without_leftovers() {
+        let dir = scratch_dir();
+        let path = save_new_file(&dir, "report.pdf", b"content").unwrap();
+        assert_eq!(path, dir.join("report.pdf"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"content");
+        assert!(leftovers(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn never_overwrites_an_existing_file() {
+        let dir = scratch_dir();
+        std::fs::write(dir.join("a.txt"), b"old").unwrap();
+        let path = save_new_file(&dir, "a.txt", b"new").unwrap();
+        assert_eq!(path, dir.join("a (1).txt"));
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(leftovers(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_symlink_takes_the_name_and_is_left_alone() {
+        let dir = scratch_dir();
+        let link = dir.join("d.txt");
+        std::os::unix::fs::symlink("/nonexistent/mxc-save-test", &link).unwrap();
+        let path = save_new_file(&dir, "d.txt", b"data").unwrap();
+        assert_eq!(path, dir.join("d (1).txt"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"data");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(leftovers(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gives_up_at_once_when_no_name_is_free() {
+        let dir = scratch_dir();
+        std::fs::write(dir.join("z.txt"), b"").unwrap();
+        for n in 1..1000 {
+            std::fs::write(dir.join(format!("z ({n}).txt")), b"").unwrap();
+        }
+        let err = save_new_file(&dir, "z.txt", b"data").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(leftovers(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_saves_with_the_same_name_keep_both() {
+        let dir = scratch_dir();
+        let handles: Vec<_> = (0..8u8)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || (i, save_new_file(&dir, "x.bin", &[i; 64]).unwrap()))
+            })
+            .collect();
+        let mut paths = std::collections::HashSet::new();
+        for h in handles {
+            let (i, path) = h.join().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), vec![i; 64]);
+            assert!(paths.insert(path));
+        }
+        assert!(leftovers(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn sender_file_names_cannot_escape_the_downloads_folder() {
