@@ -62,6 +62,7 @@ pub mod feeds;
 pub mod roster;
 pub mod messages;
 pub mod omemo;
+pub mod pins;
 pub mod secrets;
 pub mod settings;
 pub mod stories;
@@ -120,6 +121,9 @@ impl Store {
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .pragma("temp_store", "memory")
+            // Zero what a delete frees: otherwise the text of a disappeared, retracted or deleted
+            // message stays in free pages (readable with the key) until they are reused.
+            .pragma("secure_delete", "ON")
             .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
@@ -297,6 +301,40 @@ mod tests {
         let wrong = "b".repeat(64);
         assert!(Store::open_with_key(&path, &wrong).await.is_err(), "wrong key opened the DB");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod secure_delete_tests {
+    use super::Store;
+
+    /// Every pooled connection of a real (file, SQLCipher) store zeroes freed pages.
+    #[tokio::test]
+    async fn deleted_content_is_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "mxc-store-secure-delete-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        let store = Store::open_with_key(&path, &"ab".repeat(32)).await.unwrap();
+        // held at the same time, so these are four different connections (max_connections(4));
+        // one query after the other would just get the same idle connection back each time
+        let mut connections = Vec::new();
+        for _ in 0..4 {
+            connections.push(store.pool().acquire().await.unwrap());
+        }
+        for connection in connections.iter_mut() {
+            let on: i64 = sqlx::query_scalar("PRAGMA secure_delete")
+                .fetch_one(&mut **connection)
+                .await
+                .unwrap();
+            assert_eq!(on, 1);
+        }
+        drop(connections);
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

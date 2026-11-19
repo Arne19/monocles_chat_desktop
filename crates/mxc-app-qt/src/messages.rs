@@ -975,6 +975,22 @@ pub mod qobject {
             marker: &QString,
         );
 
+        /// Pin a message of the open chat (local only, as on monocles Android).
+        #[qinvokable]
+        #[cxx_name = "pinMessage"]
+        fn pin_message(self: Pin<&mut MessageModel>, message_id: i64);
+
+        /// Remove a pin of the open chat.
+        #[qinvokable]
+        #[cxx_name = "unpinMessage"]
+        fn unpin_message(self: Pin<&mut MessageModel>, message_id: i64);
+
+        /// Scroll to a pinned message: at once when it is loaded, otherwise after loading
+        /// enough history to include it. Both end in `jumpReady(marker)`.
+        #[qinvokable]
+        #[cxx_name = "jumpToPin"]
+        fn jump_to_pin(self: Pin<&mut MessageModel>, message_id: i64, marker: &QString);
+
         /// Open (resolving/creating) the 1:1 chat for a contact's bare JID.
         #[qinvokable]
         #[cxx_name = "openPeer"]
@@ -1057,6 +1073,12 @@ pub mod qobject {
         #[qsignal]
         #[cxx_name = "jumpReady"]
         fn jump_ready(self: Pin<&mut MessageModel>, marker: QString);
+
+        /// The open chat's pinned messages changed: a JSON list, newest pin first, of
+        /// `{id, marker, previewText, previewImage, outgoing, sender}` (see `session::emit_pins`).
+        #[qsignal]
+        #[cxx_name = "pinsChanged"]
+        fn pins_changed(self: Pin<&mut MessageModel>, pins: QString);
 
         /// One of our own messages (sent here or from another device) was added at the end of
         /// the open chat - the view scrolls to it, wherever it was scrolled to.
@@ -1203,6 +1225,40 @@ impl qobject::MessageModel {
         let cid = self.conversation_id;
         if cid > 0 {
             crate::session::set_conversation_encryption(cid, encrypted);
+        }
+    }
+
+    pub fn pin_message(self: Pin<&mut Self>, message_id: i64) {
+        let cid = self.conversation_id;
+        if cid > 0 {
+            crate::session::set_pinned(cid, message_id, true, self.qt_thread());
+        }
+    }
+
+    pub fn unpin_message(self: Pin<&mut Self>, message_id: i64) {
+        let cid = self.conversation_id;
+        if cid > 0 {
+            crate::session::set_pinned(cid, message_id, false, self.qt_thread());
+        }
+    }
+
+    pub fn jump_to_pin(mut self: Pin<&mut Self>, message_id: i64, marker: &QString) {
+        let cid = self.conversation_id;
+        if cid <= 0 {
+            return;
+        }
+        if self.items.iter().any(|i| i.id == message_id) {
+            self.as_mut().jump_ready(marker.clone());
+        } else {
+            crate::session::load_messages_around(cid, message_id, marker.to_string(), self.qt_thread());
+        }
+    }
+
+    /// The pins `session::emit_pins` read for `conversation_id`; dropped when another chat was
+    /// opened in the meantime (its own load brings its pins).
+    pub fn deliver_pins(mut self: Pin<&mut Self>, conversation_id: i64, pins: QString) {
+        if self.conversation_id == conversation_id {
+            self.as_mut().pins_changed(pins);
         }
     }
 

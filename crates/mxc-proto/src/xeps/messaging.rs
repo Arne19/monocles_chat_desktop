@@ -480,7 +480,15 @@ pub async fn send_correction(
     {
         anyhow::bail!("This group doesn't support editing messages (no occupant ids)");
     }
-    let replace = Element::builder("replace", NS_CORRECT).attr(crate::ncname("id"), target_id).build();
+    // Named by the id it was sent with (XEP-0308), which is what other clients match; the UI's
+    // marker may be the room's stanza-id, which Conversations doesn't (see correction_wire_id).
+    let wire_id = store
+        .correction_wire_id(conversation_id, target_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| target_id.to_string());
+    let replace = Element::builder("replace", NS_CORRECT).attr(crate::ncname("id"), &wire_id).build();
     let body = Element::builder("body", NS_CLIENT).append(new_body).build();
     send_meta(w, store, cfg, to, vec![replace, body], true).await?;
 
@@ -1356,10 +1364,12 @@ fn save_new_file(dir: &std::path::Path, filename: &str, bytes: &[u8]) -> std::io
         f.sync_all()?;
         drop(f);
         for _ in 0..1000 {
-            let candidate = unique_path(dir, filename);
-            if name_taken(&candidate) {
-                break; // unique_path found no free name at all
-            }
+            // None: the name and all its numbered variants are taken. (Not decided by checking
+            // the returned name afterwards: another save can take a free name in between, and
+            // that is no reason to give up - the link below just fails and the next name is tried.)
+            let Some(candidate) = unique_path(dir, filename) else {
+                break;
+            };
             if candidate.parent() != Some(dir) {
                 return Err(std::io::Error::other("refusing to save outside the downloads folder"));
             }
@@ -1389,23 +1399,18 @@ fn name_taken(p: &std::path::Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
 }
 
-/// A non-colliding path in `dir` for `filename` (appends ` (n)` before the extension).
-fn unique_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+/// A path in `dir` for `filename` that is free right now (appends ` (n)` before the extension),
+/// or `None` when the name and every numbered variant up to ` (999)` are taken.
+fn unique_path(dir: &std::path::Path, filename: &str) -> Option<std::path::PathBuf> {
     let candidate = dir.join(filename);
     if !name_taken(&candidate) {
-        return candidate;
+        return Some(candidate);
     }
     let (stem, ext) = match filename.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
         None => (filename.to_string(), String::new()),
     };
-    for n in 1..1000 {
-        let p = dir.join(format!("{stem} ({n}){ext}"));
-        if !name_taken(&p) {
-            return p;
-        }
-    }
-    candidate
+    (1..1000).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !name_taken(p))
 }
 
 // ============================ incoming =====================================
@@ -2071,7 +2076,9 @@ async fn process_payload(
         let with_content = !is_timer_change_only(&content);
         let wants_out = content.get_child("i-want-out", NS_EPHEMERAL).is_some();
         if let Some(seconds) = timer_setting_change(encryption == "omemo2", with_content, message_timer, wants_out) {
-            if store.set_conversation_ephemeral_timer(conv, seconds, unix_seconds(&ts)).await.unwrap_or(false) {
+            // `ts` is the sender's or the server's clock; the store never lets it lie ahead of ours.
+            let now = chrono::Utc::now().timestamp();
+            if store.set_conversation_ephemeral_timer(conv, seconds, unix_seconds(&ts), now).await.unwrap_or(false) {
                 let _ = events.send(Event::EphemeralTimerChanged {
                     account_id: cfg.account_id, conversation_id: conv, seconds,
                 }).await;
@@ -2397,11 +2404,13 @@ async fn process_payload(
     }
 
     let origin_id = msg.get_child("origin-id", NS_SID).and_then(|e| e.attr("id").map(str::to_string));
-    // The sender's stanza `id` (1:1 / MUC-PM), when it isn't the origin-id: monocles Android and
-    // Conversations address corrections/retractions to it, and Android sends no origin-id on a
-    // MUC private message. Kept apart from origin_id, which is a dedup key - stanza ids need not
-    // be unique. Not in rooms: there edits address the room stanza-id.
-    let remote_id = if kind == "muc" { None } else { msg.attr("id") }
+    // The sender's stanza `id`, when it isn't the origin-id: monocles Android and Conversations
+    // address corrections/retractions to it (XEP-0308: the original message's id), and send no
+    // origin-id on a MUC private message or in a room that keeps message ids (muc#stable_id).
+    // Kept apart from origin_id, which is a dedup key - stanza ids need not be unique. Only ever
+    // an edit target, always matched under `sender_filter` (in a room: the same occupant id), so
+    // a reused id never reaches someone else's message.
+    let remote_id = msg.attr("id")
         .filter(|id| !id.is_empty() && Some(*id) != origin_id.as_deref())
         .map(str::to_string);
     let reply_to = content.get_child("reply", NS_REPLY).and_then(|e| e.attr("id").map(str::to_string));
@@ -2941,12 +2950,13 @@ pub async fn set_ephemeral_timer(
     if store.conversation_kind(cfg.account_id, to).await?.as_deref() != Some("chat") {
         anyhow::bail!("Disappearing messages are only available in direct chats");
     }
-    if !store
-        .set_conversation_ephemeral_timer(conversation_id, seconds, chrono::Utc::now().timestamp())
-        .await?
-    {
-        return Ok(());
-    }
+    // The user's choice always applies and is always announced, even when our value already
+    // matches: another of our devices or the contact may hold a different one (a change it
+    // missed), and only an explicit change brings them back in line. In a PQ OMEMO2 chat
+    // send_meta encrypts it, so repeating it reveals nothing.
+    store
+        .set_conversation_ephemeral_timer_local(conversation_id, seconds, chrono::Utc::now().timestamp())
+        .await?;
     let control = if seconds > 0 {
         ephemeral_element(seconds)
     } else {
@@ -3595,6 +3605,22 @@ mod download_name_tests {
     }
 
     #[test]
+    fn the_next_free_name_is_found_and_only_a_full_folder_gives_none() {
+        let dir = scratch_dir();
+        std::fs::write(dir.join("x.bin"), b"").unwrap();
+        for n in 1..=500 {
+            std::fs::write(dir.join(format!("x ({n}).bin")), b"").unwrap();
+        }
+        assert_eq!(unique_path(&dir, "x.bin"), Some(dir.join("x (501).bin")));
+        for n in 501..1000 {
+            std::fs::write(dir.join(format!("x ({n}).bin")), b"").unwrap();
+        }
+        assert_eq!(unique_path(&dir, "x.bin"), None);
+        assert_eq!(unique_path(&dir, "other.bin"), Some(dir.join("other.bin")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn concurrent_saves_with_the_same_name_keep_both() {
         let dir = scratch_dir();
         let handles: Vec<_> = (0..8u8)
@@ -3627,7 +3653,7 @@ mod download_name_tests {
         assert!(s.len() <= 200 && s.ends_with(".pdf"));
         let dir = std::env::temp_dir().join("mxc-dl-test");
         for name in ["/etc/passwd", "../../x", "..", "a/../../b"] {
-            let p = unique_path(&dir, &safe_file_name(name));
+            let p = unique_path(&dir, &safe_file_name(name)).unwrap();
             assert_eq!(p.parent(), Some(dir.as_path()), "{name}");
         }
     }
@@ -3987,6 +4013,59 @@ mod retraction_tests {
         let row = h.store.message_by_marker(room, "s1").await.unwrap().unwrap();
         assert!(row.retracted);
         assert_eq!(row.direction, "out");
+    }
+
+    /// A room that keeps message ids (muc#stable_id): monocles Android and Conversations send no
+    /// origin-id there, and a correction names the message by its stanza `id`. It edits the
+    /// message of the same occupant, and never one of someone else.
+    #[tokio::test]
+    async fn muc_correction_by_message_id_without_origin_id() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        h.store.set_muc_self_occupant(room, "occ-me").await.unwrap();
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/alice' to='me@example.org/desk' type='groupchat' id='m1'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-a'/><body>helo</body></message>",
+            Direction::In, Some("s1"),
+        ).await;
+        // someone else cannot correct it
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/bob' to='me@example.org/desk' type='groupchat' id='c0'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-b'/>\
+               <replace xmlns='urn:xmpp:message-correct:0' id='m1'/><body>forged</body></message>",
+            Direction::In, Some("s2"),
+        ).await;
+        assert_eq!(h.store.message_by_marker(room, "s1").await.unwrap().unwrap().body.as_deref(), Some("helo"));
+        // its author can, and no second message appears
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/alice' to='me@example.org/desk' type='groupchat' id='c1'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-a'/>\
+               <replace xmlns='urn:xmpp:message-correct:0' id='m1'/><body>hello</body></message>",
+            Direction::In, Some("s3"),
+        ).await;
+        assert_eq!(h.store.message_by_marker(room, "s1").await.unwrap().unwrap().body.as_deref(), Some("hello"));
+        assert!(h.store.message_by_marker(room, "s3").await.unwrap().is_none());
+    }
+
+    /// Our own room message sent from the phone and corrected there: edited here too.
+    #[tokio::test]
+    async fn own_muc_message_from_another_device_can_be_corrected() {
+        let h = harness().await;
+        let room = h.store.upsert_muc(h.cfg.account_id, "room@muc.example.org", None, Some("me"), true).await.unwrap();
+        h.store.set_muc_self_occupant(room, "occ-me").await.unwrap();
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='m1'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/><body>tpyo</body></message>",
+            Direction::In, Some("s1"),
+        ).await;
+        h.feed(
+            "<message xmlns='jabber:client' from='room@muc.example.org/me' to='me@example.org/desk' type='groupchat' id='c1'>\
+               <occupant-id xmlns='urn:xmpp:occupant-id:0' id='occ-me'/>\
+               <replace xmlns='urn:xmpp:message-correct:0' id='m1'/><body>typo</body></message>",
+            Direction::In, Some("s2"),
+        ).await;
+        assert_eq!(h.store.message_by_marker(room, "s1").await.unwrap().unwrap().body.as_deref(), Some("typo"));
+        assert!(h.store.message_by_marker(room, "s2").await.unwrap().is_none());
     }
 
     /// Our own message from another device arrives already sent - no "waiting" clock.

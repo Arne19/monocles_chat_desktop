@@ -53,22 +53,57 @@ impl Store {
         Ok(timer.unwrap_or(0))
     }
 
-    /// Set the chat's timer as of `at` (unix seconds). A change older than the last one applied
-    /// is ignored - that is one met while paging back through history. Returns whether the
-    /// timer value changed.
-    pub async fn set_conversation_ephemeral_timer(&self, conversation_id: i64, seconds: i64, at: i64) -> Result<bool> {
+    /// A timer change that arrived from the network, as of `at` (unix seconds, from the stanza),
+    /// with `now` the local clock. A change older than the last one applied is ignored - that is
+    /// one met while paging back through history.
+    ///
+    /// `at` is somebody else's clock (the sender's or the server's), so it is never taken to lie
+    /// in the future: a stamp ahead of ours would otherwise outrank every later change, the
+    /// user's own included, and a contact could freeze our setting with a forged `<delay/>`. A
+    /// future value already stored (written before this rule) counts as `now` for the same
+    /// reason. Returns whether the timer value changed.
+    pub async fn set_conversation_ephemeral_timer(
+        &self,
+        conversation_id: i64,
+        seconds: i64,
+        at: i64,
+        now: i64,
+    ) -> Result<bool> {
         let seconds = sane_timer(seconds).unwrap_or(0);
+        let at = at.min(now);
         let before = self.conversation_ephemeral_timer(conversation_id).await?;
         let done = sqlx::query(
             r#"UPDATE conversations SET ephemeral_timer = ?2, ephemeral_changed_at = ?3
-               WHERE id = ?1 AND ephemeral_changed_at <= ?3"#,
+               WHERE id = ?1 AND MIN(ephemeral_changed_at, ?4) <= ?3"#,
         )
         .bind(conversation_id)
         .bind(seconds)
         .bind(at)
+        .bind(now)
         .execute(self.pool())
         .await?;
         Ok(done.rows_affected() > 0 && before != seconds)
+    }
+
+    /// The user changed the chat's timer here, at `now`. Always applied: the user's own choice
+    /// is never outranked by an earlier stamp. Returns whether the timer value changed.
+    pub async fn set_conversation_ephemeral_timer_local(
+        &self,
+        conversation_id: i64,
+        seconds: i64,
+        now: i64,
+    ) -> Result<bool> {
+        let seconds = sane_timer(seconds).unwrap_or(0);
+        let before = self.conversation_ephemeral_timer(conversation_id).await?;
+        sqlx::query(
+            "UPDATE conversations SET ephemeral_timer = ?2, ephemeral_changed_at = ?3 WHERE id = ?1",
+        )
+        .bind(conversation_id)
+        .bind(seconds)
+        .bind(now)
+        .execute(self.pool())
+        .await?;
+        Ok(before != seconds)
     }
 
     /// Record the timer a message carries and, if its countdown already runs, when it ends.
@@ -219,12 +254,12 @@ mod tests {
         let acc = store.upsert_account("me@example.org").await.unwrap();
         let conv = store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
         assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 0);
-        assert!(store.set_conversation_ephemeral_timer(conv, 3600, 100).await.unwrap());
-        assert!(!store.set_conversation_ephemeral_timer(conv, 3600, 101).await.unwrap(), "unchanged");
+        assert!(store.set_conversation_ephemeral_timer(conv, 3600, 100, 10_000).await.unwrap());
+        assert!(!store.set_conversation_ephemeral_timer(conv, 3600, 101, 10_000).await.unwrap(), "unchanged");
         assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 3600);
         assert_eq!(store.conversation_ephemeral_timer_by_jid(acc, "bob@example.org").await.unwrap(), 3600);
         assert_eq!(store.conversation_ephemeral_timer_by_jid(acc, "nobody@example.org").await.unwrap(), 0);
-        assert!(store.set_conversation_ephemeral_timer(conv, -5, 102).await.unwrap(), "nonsense turns it off");
+        assert!(store.set_conversation_ephemeral_timer(conv, -5, 102, 10_000).await.unwrap(), "nonsense turns it off");
         assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 0);
     }
 
@@ -233,12 +268,57 @@ mod tests {
         let store = Store::open_in_memory().await.unwrap();
         let acc = store.upsert_account("me@example.org").await.unwrap();
         let conv = store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
-        assert!(store.set_conversation_ephemeral_timer(conv, 60, 2_000).await.unwrap());
+        assert!(store.set_conversation_ephemeral_timer(conv, 60, 2_000, 10_000).await.unwrap());
         // met later while paging back through the archive
-        assert!(!store.set_conversation_ephemeral_timer(conv, 0, 1_000).await.unwrap());
+        assert!(!store.set_conversation_ephemeral_timer(conv, 0, 1_000, 10_000).await.unwrap());
         assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 60);
-        assert!(store.set_conversation_ephemeral_timer(conv, 0, 3_000).await.unwrap());
+        assert!(store.set_conversation_ephemeral_timer(conv, 0, 3_000, 10_000).await.unwrap());
         assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_future_stamp_does_not_freeze_the_timer() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let conv = store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
+        // a change stamped far ahead of our clock (skew, or a forged <delay/>) counts as "now"
+        assert!(store.set_conversation_ephemeral_timer(conv, 60, 9_999_999, 1_000).await.unwrap());
+        // so a genuine later one still applies
+        assert!(store.set_conversation_ephemeral_timer(conv, 0, 1_001, 1_001).await.unwrap());
+        assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 0);
+        // and an older one is still ignored
+        assert!(!store.set_conversation_ephemeral_timer(conv, 300, 900, 1_002).await.unwrap());
+        assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_future_stamp_stored_before_the_fix_is_healed() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let conv = store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
+        sqlx::query("UPDATE conversations SET ephemeral_timer = 60, ephemeral_changed_at = 9999999 WHERE id = ?1")
+            .bind(conv)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(store.set_conversation_ephemeral_timer(conv, 0, 1_000, 1_000).await.unwrap());
+        assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_users_own_change_always_applies() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let conv = store.conversation_id(acc, "bob@example.org", "chat").await.unwrap();
+        assert!(store.set_conversation_ephemeral_timer(conv, 60, 5_000, 5_000).await.unwrap());
+        // our clock behind the stamp of the last incoming change: the user still wins
+        assert!(store.set_conversation_ephemeral_timer_local(conv, 0, 4_000).await.unwrap());
+        assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 0);
+        // the same value again: applied, reported as unchanged
+        assert!(!store.set_conversation_ephemeral_timer_local(conv, 0, 4_001).await.unwrap());
+        // a later incoming change is ordered after the local one
+        assert!(store.set_conversation_ephemeral_timer(conv, 300, 4_002, 4_002).await.unwrap());
+        assert_eq!(store.conversation_ephemeral_timer(conv).await.unwrap(), 300);
     }
 
     #[tokio::test]

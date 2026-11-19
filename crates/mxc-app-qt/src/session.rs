@@ -1504,7 +1504,15 @@ fn prefetch_images(rows: &[mxc_store::MessageRow], qt: &CxxQtThread<MessageModel
             .await;
             IMAGE_REQUESTED.lock().unwrap().remove(&url);
             if let Ok(bytes) = result {
+                if !still_wanted(&url).await {
+                    return;
+                }
                 if mxc_store::cache::write(&path, &bytes).is_ok() {
+                    if !still_wanted(&url).await {
+                        // its message went while we wrote (see `still_wanted`)
+                        mxc_store::cache::remove(&path);
+                        return;
+                    }
                     // Reload the open conversation so `from_row` now resolves the cached file.
                     let _ = qt.queue(|model: Pin<&mut MessageModel>| model.reload_current());
                 }
@@ -1537,11 +1545,31 @@ pub fn fetch_media(url: String, qt: CxxQtThread<MessageModel>) {
         .await;
         IMAGE_REQUESTED.lock().unwrap().remove(&url);
         if let Ok(bytes) = result {
+            if !still_wanted(&url).await {
+                return;
+            }
             if mxc_store::cache::write(&path, &bytes).is_ok() {
+                if !still_wanted(&url).await {
+                    mxc_store::cache::remove(&path);
+                    return;
+                }
                 let _ = qt.queue(|model: Pin<&mut MessageModel>| model.reload_current());
             }
         }
     });
+}
+
+/// Whether a media download that just finished still belongs to a message. Its message may
+/// have been retracted or have expired while it ran: that message's cache cleanup is over by
+/// then, so a file written now would stay in the cache with nothing pointing at it.
+/// Asked before the write and again after it: the cleanup runs once the row is tombstoned or
+/// deleted, so it either comes after our write (and removes the file) or our second check
+/// already sees the row gone (and we remove it).
+async fn still_wanted(url: &str) -> bool {
+    match store().await {
+        Ok(store) => store.media_url_in_use(url).await.unwrap_or(true),
+        Err(_) => true,
+    }
 }
 
 /// Ask the server for `jid`'s avatar once (deduped), if connected.
@@ -3079,6 +3107,9 @@ pub fn load_messages(conversation_id: i64, limit: i64, qt: CxxQtThread<MessageMo
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
             model.reset(items);
         });
+        // every (re)load of the open chat - opening it, a new, edited, retracted or expired
+        // message - also refreshes its pins
+        emit_pins(store, conversation_id, &qt).await;
     });
 }
 
@@ -3132,6 +3163,52 @@ pub fn load_messages_around(
             model.as_mut().set_open(conversation_id, limit, items);
             model.as_mut().jump_ready(QString::from(marker.as_str()));
         });
+        emit_pins(store, conversation_id, &qt).await;
+    });
+}
+
+/// Pin (or unpin) a message of the open chat. Pins are local only, as on monocles Android:
+/// nothing is sent, so this works offline too. The model then gets the new list.
+pub fn set_pinned(conversation_id: i64, message_id: i64, pinned: bool, qt: CxxQtThread<MessageModel>) {
+    runtime().spawn(async move {
+        let Ok(store) = store().await else { return };
+        let result = if pinned {
+            store.pin_message(conversation_id, message_id, chrono::Utc::now().timestamp()).await
+        } else {
+            store.unpin_message(message_id).await
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "pinning a message failed");
+        }
+        emit_pins(store, conversation_id, &qt).await;
+    });
+}
+
+/// Hand the open chat's pins to the model: newest first, each as its message is now (the same
+/// one-line preview and thumbnail a reply to it shows). The store holds no copy of the content.
+async fn emit_pins(store: &Store, conversation_id: i64, qt: &CxxQtThread<MessageModel>) {
+    let rows = store
+        .pinned_messages(conversation_id, chrono::Utc::now().timestamp())
+        .await
+        .unwrap_or_default();
+    let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
+    let items = build_items(store, conversation_id, &rows, auto_download).await;
+    let pins: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "marker": item.marker,
+                "previewText": item.preview_text,
+                "previewImage": item.preview_image,
+                "outgoing": item.outgoing,
+                "sender": item.sender,
+            })
+        })
+        .collect();
+    let json = serde_json::Value::Array(pins).to_string();
+    let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
+        model.deliver_pins(conversation_id, QString::from(json.as_str()));
     });
 }
 
@@ -3196,6 +3273,8 @@ pub fn open_peer_kind(jid: String, kind: String, qt: CxxQtThread<MessageModel>) 
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
             model.set_open(conversation_id, crate::messages::INITIAL_LIMIT, items);
         });
+        // like the other loaders: a chat opened from the contact or group list gets its pins
+        emit_pins(store, conversation_id, &qt).await;
     });
 }
 

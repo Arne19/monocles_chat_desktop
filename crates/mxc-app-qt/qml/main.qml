@@ -45,16 +45,47 @@ ApplicationWindow {
     property bool currentPeerIsDirect: false
     property int currentEphemeralTimer: 0
     readonly property var ephemeralDurations: [30, 60, 300, 1800, 3600, 21600, 43200, 86400, 604800, 2592000]
+    // A timer in the largest unit that divides it exactly ("90 seconds", never "2 minutes"):
+    // one set by another client is shown as what it is (as on Android).
     function ephemeralLabel(seconds) {
         if (seconds <= 0) return qsTr("Off")
-        if (seconds < 60) return qsTr("%n second(s)", "", seconds)
-        if (seconds < 3600) return qsTr("%n minute(s)", "", Math.round(seconds / 60))
-        if (seconds < 86400) return qsTr("%n hour(s)", "", Math.round(seconds / 3600))
-        return qsTr("%n day(s)", "", Math.round(seconds / 86400))
+        if (seconds % 86400 === 0) return qsTr("%n day(s)", "", seconds / 86400)
+        if (seconds % 3600 === 0) return qsTr("%n hour(s)", "", seconds / 3600)
+        if (seconds % 60 === 0) return qsTr("%n minute(s)", "", seconds / 60)
+        return qsTr("%n second(s)", "", seconds)
     }
+    // The same, short, for the header badge ("30s", "5m", "1h", "1d", "1w").
+    function ephemeralShort(seconds) {
+        if (seconds <= 0) return ""
+        if (seconds % 604800 === 0) return qsTr("%1w").arg(seconds / 604800)
+        if (seconds % 86400 === 0) return qsTr("%1d").arg(seconds / 86400)
+        if (seconds % 3600 === 0) return qsTr("%1h").arg(seconds / 3600)
+        if (seconds % 60 === 0) return qsTr("%1m").arg(seconds / 60)
+        return qsTr("%1s").arg(seconds)
+    }
+    // The usual durations, plus `current` when it is on and none of them (set elsewhere), so
+    // the menu always shows the setting in force as checked.
+    function ephemeralChoices(current) {
+        if (current <= 0 || ephemeralDurations.indexOf(current) >= 0) return ephemeralDurations
+        return ephemeralDurations.concat([current]).sort(function (a, b) { return a - b })
+    }
+    readonly property bool ephemeralActive: currentPeerIsDirect && currentEphemeralTimer > 0
+    // The chat whose timer is known (set after its first answer): only a change there animates
+    // the band, not opening a chat that already has one.
+    property string ephemeralTimerFor: ""
+    // "Dusk": the one hue for everything timed - apart from the accent blue (links, own
+    // bubbles) and the pin bar's light blue.
+    readonly property bool darkTheme: Material.theme === Material.Dark
+    readonly property color duskInk: darkTheme ? "#B9A9F0" : "#5B4BA8"
+    readonly property color duskWash: darkTheme ? Qt.rgba(0.725, 0.663, 0.941, 0.18)
+                                                : Qt.rgba(0.357, 0.294, 0.659, 0.12)
+    readonly property color duskEdge: darkTheme ? Qt.rgba(0.725, 0.663, 0.941, 0.55)
+                                                : Qt.rgba(0.357, 0.294, 0.659, 0.55)
     // Call after currentPeerJid is set: `direct` = a 1:1 chat (not a room or room PM).
     function noteOpenedChat(direct) {
+        window.currentPins = []   // the new chat's load brings its own
         window.currentPeerIsDirect = direct
+        window.ephemeralTimerFor = ""
         window.currentEphemeralTimer = 0
         if (direct)
             backend.requestEphemeralTimer(window.currentPeerJid)
@@ -82,6 +113,20 @@ ApplicationWindow {
     property string replyToImage: ""
     // Pending edit (XEP-0308): the target message's marker + its text before editing.
     property string editTargetMarker: ""
+    // Pinned messages of the open chat (local only, as on monocles Android), newest pin first:
+    // [{id, marker, previewText, previewImage, outgoing, sender}] - each shown as its message is
+    // now; a pin goes when its message expires, is retracted or deleted.
+    property var currentPins: []
+    function isPinned(messageId) {
+        for (var i = 0; i < currentPins.length; i++) {
+            if (currentPins[i].id === messageId)
+                return true
+        }
+        return false
+    }
+    function jumpToPin(pin) {
+        msgModel.jumpToPin(pin.id, pin.marker)
+    }
     property string editOriginalText: ""
     // Message search scope (Signal-style): empty JID = search every conversation; a set JID
     // scopes the chats-list search to that one chat, shown as an avatar chip in the search box.
@@ -465,8 +510,10 @@ ApplicationWindow {
             msgModel.noteStored(conversationId)
         }
         function onEphemeralTimerChanged(jid, seconds) {
-            if (window.currentPeerIsDirect && jid === window.currentPeerJid)
+            if (window.currentPeerIsDirect && jid === window.currentPeerJid) {
                 window.currentEphemeralTimer = seconds
+                window.ephemeralTimerFor = jid
+            }
         }
         function onRefreshOpen() {
             msgModel.reloadCurrent()
@@ -2010,20 +2057,45 @@ ApplicationWindow {
                                 // stay. Highlighted while a timer is set.
                                 ToolButton {
                                     id: ephemeralButton
-                                    implicitWidth: 32
                                     implicitHeight: 32
                                     visible: window.currentPeerIsDirect
-                                    opacity: window.currentEphemeralTimer > 0 ? 1.0 : 0.55
+                                    implicitWidth: window.ephemeralActive ? ephemeralRow.implicitWidth + 12 : 32
+                                    opacity: window.ephemeralActive ? 1.0 : 0.55
+                                    Accessible.name: ToolTip.text
                                     ToolTip.text: window.currentEphemeralTimer > 0
                                         ? qsTr("Disappearing messages: %1").arg(window.ephemeralLabel(window.currentEphemeralTimer))
                                         : qsTr("Disappearing messages: off")
                                     ToolTip.visible: hovered
                                     onClicked: ephemeralMenu.popup(ephemeralButton, 0, ephemeralButton.height)
-                                    contentItem: ColorIcon {
-                                        implicitWidth: 17
-                                        implicitHeight: 17
-                                        source: window.iconBase + "timer.svg"
-                                        color: "white"
+                                    // While on, the stopwatch carries the duration as a badge;
+                                    // the header is dark in both themes, so the light dusk.
+                                    contentItem: RowLayout {
+                                        id: ephemeralRow
+                                        spacing: 4
+                                        ColorIcon {
+                                            Layout.alignment: Qt.AlignVCenter
+                                            implicitWidth: 17
+                                            implicitHeight: 17
+                                            source: window.iconBase + "timer.svg"
+                                            color: window.ephemeralActive ? "#B9A9F0" : "white"
+                                        }
+                                        Rectangle {
+                                            visible: window.ephemeralActive
+                                            Layout.alignment: Qt.AlignVCenter
+                                            implicitWidth: badgeText.implicitWidth + 10
+                                            implicitHeight: badgeText.implicitHeight + 2
+                                            radius: height / 2
+                                            color: "#B9A9F0"
+                                            Label {
+                                                id: badgeText
+                                                anchors.centerIn: parent
+                                                textFormat: Text.PlainText
+                                                text: window.ephemeralShort(window.currentEphemeralTimer)
+                                                font.pixelSize: 11
+                                                font.weight: Font.DemiBold
+                                                color: "#1F2A4D"
+                                            }
+                                        }
                                     }
                                     Menu {
                                         id: ephemeralMenu
@@ -2034,7 +2106,7 @@ ApplicationWindow {
                                             onTriggered: backend.setEphemeralTimer(window.currentPeerJid, 0)
                                         }
                                         Repeater {
-                                            model: window.ephemeralDurations
+                                            model: window.ephemeralChoices(window.currentEphemeralTimer)
                                             MenuItem {
                                                 required property int modelData
                                                 text: window.ephemeralLabel(modelData)
@@ -2269,6 +2341,212 @@ ApplicationWindow {
                             }
                         }
 
+                        // Disappearing messages are on: said at the top of the chat, in the pin
+                        // bar's shape but in dusk. Slides open when a timer is set (here or on
+                        // another device) and closes when it goes off; click to change it.
+                        Pane {
+                            id: ephemeralBand
+                            Layout.fillWidth: true
+                            readonly property bool shown: window.ephemeralActive
+                            visible: Layout.preferredHeight > 0
+                            Layout.preferredHeight: shown ? implicitHeight : 0
+                            Behavior on Layout.preferredHeight {
+                                enabled: window.ephemeralTimerFor !== "" && window.ephemeralTimerFor === window.currentPeerJid
+                                NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
+                            }
+                            clip: true
+                            padding: 4
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: bandText.text
+                            contentItem: Rectangle {
+                                implicitHeight: Math.max(bandText.implicitHeight, changeButton.implicitHeight - 8) + 12
+                                radius: 6
+                                color: window.duskWash
+                                Rectangle {
+                                    x: 5
+                                    y: 5
+                                    width: 3
+                                    height: parent.height - 10
+                                    radius: 1.5
+                                    color: window.duskInk
+                                }
+                                MouseArea {
+                                    id: bandMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: ephemeralMenu.popup(changeButton, 0, changeButton.height)
+                                }
+                                ToolTip.visible: bandMouse.containsMouse
+                                ToolTip.delay: 600
+                                ToolTip.text: qsTr("Your messages count down from sending, your contact's from when you read them.")
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 16
+                                    anchors.rightMargin: 4
+                                    spacing: 8
+                                    ColorIcon {
+                                        Layout.alignment: Qt.AlignVCenter
+                                        implicitWidth: 16
+                                        implicitHeight: 16
+                                        source: window.iconBase + "timer.svg"
+                                        color: window.duskInk
+                                    }
+                                    Label {
+                                        id: bandText
+                                        Layout.fillWidth: true
+                                        Layout.alignment: Qt.AlignVCenter
+                                        textFormat: Text.PlainText
+                                        text: qsTr("New messages here disappear after %1")
+                                                .arg(window.ephemeralLabel(window.currentEphemeralTimer))
+                                        font.weight: Font.Medium
+                                        color: window.duskInk
+                                        elide: Text.ElideRight
+                                        maximumLineCount: 1
+                                    }
+                                    ToolButton {
+                                        id: changeButton
+                                        Layout.alignment: Qt.AlignVCenter
+                                        flat: true
+                                        text: qsTr("Change")
+                                        Accessible.name: qsTr("Change disappearing messages")
+                                        onClicked: ephemeralMenu.popup(changeButton, 0, changeButton.height)
+                                        contentItem: Label {
+                                            textFormat: Text.PlainText
+                                            text: changeButton.text
+                                            color: window.duskInk
+                                            font.weight: Font.DemiBold
+                                            font.underline: changeButton.hovered || changeButton.visualFocus
+                                            horizontalAlignment: Text.AlignHCenter
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Pinned messages: the newest pin, as its message is now. Click jumps to
+                        // it (loading older history if needed), ✕ unpins, ☰ lists every pin.
+                        Pane {
+                            id: pinBar
+                            Layout.fillWidth: true
+                            visible: window.currentPins.length > 0
+                            // the last pin went (expired, retracted, unpinned) with the list open
+                            onVisibleChanged: if (!visible) pinListPopup.close()
+                            padding: 4
+                            property var pin: window.currentPins.length > 0 ? window.currentPins[0] : null
+                            contentItem: RowLayout {
+                                spacing: 6
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    property bool hasThumb: pinBar.pin !== null && pinBar.pin.previewImage.length > 0
+                                    property int thumbSpace: hasThumb ? 34 : 0
+                                    implicitHeight: Math.max(pinText.implicitHeight, hasThumb ? 28 : 0) + 12
+                                    radius: 6
+                                    color: Material.theme === Material.Dark ? Qt.rgba(1, 1, 1, 0.08)
+                                                                            : Qt.rgba(0, 0, 0, 0.05)
+                                    Rectangle {
+                                        x: 5
+                                        y: 5
+                                        width: 3
+                                        height: parent.height - 10
+                                        radius: 1.5
+                                        color: "#a8c7ff"
+                                    }
+                                    Image {
+                                        visible: parent.hasThumb
+                                        x: 14
+                                        y: 6
+                                        width: 28
+                                        height: 28
+                                        source: parent.hasThumb ? "file:" + pinBar.pin.previewImage : ""
+                                        sourceSize: Qt.size(56, 56)
+                                        fillMode: Image.PreserveAspectCrop
+                                        asynchronous: true
+                                        clip: true
+                                    }
+                                    Label {
+                                        id: pinText
+                                        textFormat: Text.PlainText
+                                        x: 14 + parent.thumbSpace
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: parent.width - 22 - parent.thumbSpace
+                                        text: pinBar.pin === null ? ""
+                                              : (window.currentPins.length > 1
+                                                 ? qsTr("📌 %1 of %2 · %3").arg(1).arg(window.currentPins.length).arg(pinBar.pin.previewText)
+                                                 : qsTr("📌 %1").arg(pinBar.pin.previewText))
+                                        elide: Text.ElideRight
+                                        maximumLineCount: 1
+                                        opacity: 0.8
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: if (pinBar.pin !== null) window.jumpToPin(pinBar.pin)
+                                    }
+                                }
+                                ToolButton {
+                                    text: "☰"
+                                    visible: window.currentPins.length > 1
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: qsTr("All pinned messages")
+                                    onClicked: pinListPopup.open()
+                                }
+                                ToolButton {
+                                    text: "✕"
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: qsTr("Unpin")
+                                    onClicked: if (pinBar.pin !== null) msgModel.unpinMessage(pinBar.pin.id)
+                                }
+                            }
+                            Popup {
+                                id: pinListPopup
+                                y: pinBar.height
+                                width: pinBar.width
+                                padding: 4
+                                modal: false
+                                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                                contentItem: ListView {
+                                    implicitHeight: Math.min(contentHeight, 320)
+                                    clip: true
+                                    model: window.currentPins
+                                    delegate: ItemDelegate {
+                                        width: ListView.view.width
+                                        onClicked: {
+                                            pinListPopup.close()
+                                            window.jumpToPin(modelData)
+                                        }
+                                        contentItem: RowLayout {
+                                            spacing: 8
+                                            Image {
+                                                visible: modelData.previewImage.length > 0
+                                                Layout.preferredWidth: 28
+                                                Layout.preferredHeight: 28
+                                                source: visible ? "file:" + modelData.previewImage : ""
+                                                sourceSize: Qt.size(56, 56)
+                                                fillMode: Image.PreserveAspectCrop
+                                                asynchronous: true
+                                                clip: true
+                                            }
+                                            Label {
+                                                textFormat: Text.PlainText
+                                                Layout.fillWidth: true
+                                                text: modelData.previewText
+                                                elide: Text.ElideRight
+                                                maximumLineCount: 1
+                                            }
+                                            ToolButton {
+                                                text: "✕"
+                                                ToolTip.visible: hovered
+                                                ToolTip.text: qsTr("Unpin")
+                                                onClicked: msgModel.unpinMessage(modelData.id)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         ListView {
                             FastScroll { onScrolled: messageList.userScrolled() }
                             id: messageList
@@ -2419,6 +2697,13 @@ ApplicationWindow {
                             // centred position is accurate.
                             Connections {
                                 target: msgModel
+                                function onPinsChanged(pins) {
+                                    try {
+                                        window.currentPins = JSON.parse(pins)
+                                    } catch (e) {
+                                        window.currentPins = []
+                                    }
+                                }
                                 function onJumpReady(marker) {
                                     messageList.pendingJumpMarker = marker
                                     jumpTimer.restart()
@@ -2618,6 +2903,16 @@ ApplicationWindow {
                                             visible: model.body.length > 0 && !model.retracted
                                             height: visible ? implicitHeight : 0
                                             onTriggered: window.copyText(model.body)
+                                        }
+                                        // Local only, as on monocles Android; the pin goes with
+                                        // the message (expiry, retraction, deletion).
+                                        MenuItem {
+                                            text: window.isPinned(model.messageId) ? qsTr("Unpin") : qsTr("Pin")
+                                            visible: !model.retracted
+                                            height: visible ? implicitHeight : 0
+                                            onTriggered: window.isPinned(model.messageId)
+                                                         ? msgModel.unpinMessage(model.messageId)
+                                                         : msgModel.pinMessage(model.messageId)
                                         }
                                         // Own plain-text messages can be corrected (XEP-0308).
                                         MenuItem {
@@ -3278,6 +3573,9 @@ ApplicationWindow {
                                     radius: Math.min(height / 2, 17)
                                     color: Material.theme === Material.Dark ? Qt.rgba(1, 1, 1, 0.07)
                                                                             : Qt.rgba(0, 0, 0, 0.06)
+                                    // what is written here will disappear: a dusk outline
+                                    border.width: window.ephemeralActive ? 1 : 0
+                                    border.color: window.duskEdge
 
                                     // Clicking anywhere on the pill focuses the text field.
                                     TapHandler { onTapped: composer.forceActiveFocus() }
@@ -3288,6 +3586,21 @@ ApplicationWindow {
                                         anchors.leftMargin: 4
                                         anchors.rightMargin: 4
                                         spacing: 0
+
+                                // Disappearing messages are on (see ephemeralBand).
+                                ColorIcon {
+                                    visible: window.ephemeralActive
+                                    Layout.alignment: Qt.AlignVCenter
+                                    Layout.leftMargin: 6
+                                    implicitWidth: 14
+                                    implicitHeight: 14
+                                    source: window.iconBase + "timer.svg"
+                                    color: window.duskInk
+                                    HoverHandler { id: pillTimerHover }
+                                    ToolTip.visible: pillTimerHover.hovered
+                                    ToolTip.text: qsTr("Disappearing messages: %1")
+                                        .arg(window.ephemeralLabel(window.currentEphemeralTimer))
+                                }
 
                                 // Emoji & sticker picker.
                                 ToolButton {
@@ -3460,7 +3773,8 @@ ApplicationWindow {
 
                                             TextArea {
                                                 id: composer
-                                                placeholderText: qsTr("Message…")
+                                                placeholderText: window.ephemeralActive ? qsTr("Disappearing message…")
+                                                                                        : qsTr("Message…")
                                                 wrapMode: TextArea.Wrap
                                                 // Render typed emoji in colour (see bubbleText / main.rs).
                                                 renderType: Text.NativeRendering

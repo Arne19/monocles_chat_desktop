@@ -594,6 +594,25 @@ impl Store {
         Ok(row)
     }
 
+    /// The id a correction of our own message `marker_id` names it by (XEP-0308: the id the
+    /// original was sent with): its origin-id, else the sender's stanza `id` (our message from
+    /// monocles Android or Conversations in a room that keeps message ids carries no origin-id),
+    /// and the room's stanza-id only as a last resort - Conversations doesn't match that one.
+    /// `None` if `marker_id` names no message of ours.
+    pub async fn correction_wire_id(&self, conversation_id: i64, marker_id: &str) -> Result<Option<String>> {
+        let id: Option<Option<String>> = sqlx::query_scalar(
+            r#"SELECT COALESCE(origin_id, remote_id, stanza_id) FROM messages
+               WHERE conversation_id = ?1 AND (origin_id = ?2 OR stanza_id = ?2)
+                 AND direction = 'out'
+               ORDER BY id DESC LIMIT 1"#,
+        )
+        .bind(conversation_id)
+        .bind(marker_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(id.flatten())
+    }
+
     /// XEP-0308: replace the body of the message targeted by `target_marker`, recording
     /// the edit pointer. No sender check — only for edits *we* make locally; incoming
     /// corrections go through [`Self::find_from_sender`] + [`Self::correct_message`].
@@ -642,6 +661,7 @@ impl Store {
         sqlx::query!("DELETE FROM reactions WHERE message_id = ?1", orig.id)
             .execute(self.pool())
             .await?;
+        self.drop_pin(orig.id).await?;
         Ok(Some((orig.id, Tombstone { body: orig.body, attachment: orig.attachment })))
     }
 
@@ -1019,6 +1039,7 @@ impl Store {
             .bind(message_id)
             .execute(self.pool())
             .await?;
+        self.drop_pin(message_id).await?;
         let (body, attachment) = old.unwrap_or_default();
         Ok(Tombstone { body, attachment })
     }
@@ -2075,6 +2096,35 @@ mod sender_auth_tests {
         let b = NewMessage { counterpart: "peer@example.org/laptop".into(), ..msg(chat, "o1", Direction::In, None) };
         assert!(store.insert_message(&a).await.unwrap().is_some());
         assert!(store.insert_message(&b).await.unwrap().is_none());
+    }
+
+    /// A correction names our message by the id it was sent with, not by the room's stanza-id.
+    #[tokio::test]
+    async fn correction_wire_id_prefers_the_sent_id() {
+        let store = Store::open_in_memory().await.unwrap();
+        let acc = store.upsert_account("me@example.org").await.unwrap();
+        let room = store.conversation_id(acc, "room@muc.example.org", "muc").await.unwrap();
+        let no_origin = |sid: &str| NewMessage {
+            origin_id: None,
+            stanza_id: Some(sid.into()),
+            ..msg(room, "unused", Direction::Out, Some("occ-me"))
+        };
+        // sent from the phone in a room that keeps ids: no origin-id, the stanza `id` was kept
+        let a = store.insert_message(&no_origin("s1")).await.unwrap().unwrap();
+        store.set_remote_id(a, "phone-1").await.unwrap();
+        assert_eq!(store.correction_wire_id(room, "s1").await.unwrap().as_deref(), Some("phone-1"));
+        // with an origin-id, that one
+        store.insert_message(&NewMessage { stanza_id: Some("s2".into()), ..msg(room, "o2", Direction::Out, None) })
+            .await.unwrap().unwrap();
+        assert_eq!(store.correction_wire_id(room, "s2").await.unwrap().as_deref(), Some("o2"));
+        assert_eq!(store.correction_wire_id(room, "o2").await.unwrap().as_deref(), Some("o2"));
+        // only the room's stanza-id known: that one, as a last resort
+        store.insert_message(&no_origin("s3")).await.unwrap().unwrap();
+        assert_eq!(store.correction_wire_id(room, "s3").await.unwrap().as_deref(), Some("s3"));
+        // never someone else's message
+        store.insert_message(&NewMessage { stanza_id: Some("s4".into()), ..msg(room, "o4", Direction::In, Some("occ-a")) })
+            .await.unwrap().unwrap();
+        assert_eq!(store.correction_wire_id(room, "s4").await.unwrap(), None);
     }
 
     #[tokio::test]
