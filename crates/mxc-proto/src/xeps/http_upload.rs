@@ -29,35 +29,169 @@ pub const AUTO_DOWNLOAD_LIMIT: u64 = 16 * 1024 * 1024;
 /// Size cap for a file the user explicitly chose to download.
 pub const MANUAL_DOWNLOAD_LIMIT: u64 = 256 * 1024 * 1024;
 
+/// The client for uploads (PUT to the account's own upload slot).
 fn http_client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| {
-        let builder = reqwest::Client::builder();
-        // The system's roots minus the refused ones (tls_roots). If they can't be read, keep
-        // reqwest's default platform verifier as before.
-        let builder = match crate::tls_roots::http_roots() {
-            Some(roots) => builder.tls_certs_only(roots),
-            None => builder,
-        };
+    C.get_or_init(|| build_client(false))
+}
+
+/// The client for downloads from sender-chosen URLs: like [`http_client`], but every host name
+/// (also of each redirect hop) goes through [`PublicOnlyResolver`].
+fn download_client() -> &'static reqwest::Client {
+    static C: OnceLock<reqwest::Client> = OnceLock::new();
+    C.get_or_init(|| build_client(true))
+}
+
+fn build_client(public_only: bool) -> reqwest::Client {
+    let builder = reqwest::Client::builder();
+    let builder = if public_only {
+        builder.dns_resolver(std::sync::Arc::new(PublicOnlyResolver {
+            // Not std::env::vars(): it panics on any non-UTF-8 variable. Such ones are skipped
+            // (hyper-util ignores a non-UTF-8 proxy value as well).
+            proxy_hosts: env_proxy_hosts_from(
+                std::env::vars_os()
+                    .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+            ),
+        }))
+    } else {
         builder
-            // A sender-chosen server must not be able to hang a download forever.
-            .connect_timeout(std::time::Duration::from_secs(20))
-            .read_timeout(std::time::Duration::from_secs(60))
-            // Redirects stay on HTTPS and off our own machine/LAN (see checked_url).
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 {
-                    attempt.error("too many redirects")
-                } else if attempt.url().scheme() != "https" || is_local_target(attempt.url()) {
-                    attempt.error("refusing redirect to a non-https or local address")
-                } else if is_hidden_target(attempt.url()) {
-                    attempt.error("refusing redirect to a Tor/I2P hidden service (not supported)")
-                } else {
-                    attempt.follow()
+    };
+    // The system's roots minus the refused ones (tls_roots). If they can't be read, keep
+    // reqwest's default platform verifier as before.
+    let builder = match crate::tls_roots::http_roots() {
+        Some(roots) => builder.tls_certs_only(roots),
+        None => builder,
+    };
+    builder
+        // A sender-chosen server must not be able to hang a download forever.
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(std::time::Duration::from_secs(60))
+        // Redirects stay on HTTPS and off our own machine/LAN (see checked_url).
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if attempt.url().scheme() != "https" || is_local_target(attempt.url()) {
+                attempt.error("refusing redirect to a non-https or local address")
+            } else if is_hidden_target(attempt.url()) {
+                attempt.error("refusing redirect to a Tor/I2P hidden service (not supported)")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .expect("reqwest client")
+}
+
+/// Resolves download hosts with the system resolver (as reqwest's default does) and refuses a
+/// name if any of its addresses is local ([`is_local_ip`]): a public name pointing at (or
+/// rebinding to) a LAN or loopback address must not turn a sender's file URL into a request to
+/// a local service. reqwest connects to exactly the addresses returned here, so a second lookup
+/// can't swap them.
+///
+/// reqwest also honours the `HTTP(S)_PROXY`/`ALL_PROXY` environment variables, and then resolves
+/// the proxy's name here, while the proxy resolves the target. The proxy's own name (often
+/// `localhost` or a LAN host) is therefore let through, or every download would fail; the
+/// local-address check thus applies to direct connections, as on Android.
+struct PublicOnlyResolver {
+    /// Host names of the environment's HTTP(S) proxies, lower-case.
+    proxy_hosts: Vec<String>,
+}
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        let is_proxy = self.proxy_hosts.contains(&normalize_host(&host));
+        Box::pin(async move {
+            let addrs = resolve_public(&host, is_proxy).await?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The host names of the proxies configured in the environment (as reqwest reads them). IP
+/// literals are left out: reqwest never resolves those.
+fn env_proxy_hosts_from(vars: impl IntoIterator<Item = (String, String)>) -> Vec<String> {
+    const KEYS: [&str; 6] =
+        ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+    let mut hosts = Vec::new();
+    for (key, value) in vars {
+        let value = value.trim();
+        if !KEYS.contains(&key.as_str()) || value.is_empty() {
+            continue;
+        }
+        let with_scheme =
+            if value.contains("://") { value.to_string() } else { format!("http://{value}") };
+        if let Ok(url) = url::Url::parse(&with_scheme) {
+            // Non-special schemes (socks5://) give even an IP literal as an opaque "domain".
+            if let Some(url::Host::Domain(host)) = url.host() {
+                let host = normalize_host(host);
+                let literal = host.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>().is_ok();
+                if !literal && !hosts.contains(&host) {
+                    hosts.push(host);
                 }
-            }))
-            .build()
-            .expect("reqwest client")
-    })
+            }
+        }
+    }
+    hosts
+}
+
+async fn resolve_public(
+    host: &str,
+    is_proxy: bool,
+) -> Result<Vec<std::net::SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    // Never reached for them (checked_url and the redirect policy refuse first), but a hidden
+    // service name must never go to the system resolver.
+    if crate::hidden::is_hidden_service_host(host) {
+        return Err(format!("not resolving Tor/I2P hidden-service name {host}").into());
+    }
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, 0)).await?.collect();
+    if is_proxy {
+        // the user's own proxy, which carries all their traffic anyway
+        return Ok(addrs);
+    }
+    refuse_local(host, addrs)
+}
+
+fn refuse_local(
+    host: &str,
+    addrs: Vec<std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    if addrs.iter().any(|a| is_local_ip(a.ip())) {
+        return Err(format!("refusing download from {host}: resolves to a local address").into());
+    }
+    Ok(addrs)
+}
+
+/// Loopback, private (RFC 1918, ULA, CGNAT), link-local, unspecified, broadcast and multicast
+/// addresses, including IPv4-mapped IPv6 forms (as Android's `HttpConnectionManager.isLocalAddress`).
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    fn v4_local(ip: Ipv4Addr) -> bool {
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_multicast()
+            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
+    }
+    fn v6_local(ip: Ipv6Addr) -> bool {
+        let seg0 = ip.segments()[0];
+        ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
+            || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
+            || ip.to_ipv4_mapped().is_some_and(v4_local)
+    }
+    match ip {
+        IpAddr::V4(ip) => v4_local(ip),
+        IpAddr::V6(ip) => v6_local(ip),
+    }
 }
 
 /// Whether `url`'s host is a `.onion`/`.i2p` name: unreachable without Tor/I2P, and resolving it
@@ -69,32 +203,16 @@ fn is_hidden_target(url: &url::Url) -> bool {
 /// Whether `url` points at this machine or a private/link-local network. File URLs come from
 /// message senders; fetching them (often automatically) must not turn us into a client for
 /// probing or poking services on our LAN (router admin pages, local daemons, ...). Literal
-/// addresses and local names only - a public name resolving to a private address isn't caught.
+/// addresses and local names here; a public name resolving to a local address is refused when it
+/// is resolved (download_client's [`PublicOnlyResolver`]).
 fn is_local_target(url: &url::Url) -> bool {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-    fn v4_local(ip: Ipv4Addr) -> bool {
-        ip.is_loopback()
-            || ip.is_private()
-            || ip.is_link_local()
-            || ip.is_unspecified()
-            || ip.is_broadcast()
-            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64) // 100.64.0.0/10 (CGNAT)
-    }
-    fn v6_local(ip: Ipv6Addr) -> bool {
-        let seg0 = ip.segments()[0];
-        ip.is_loopback()
-            || ip.is_unspecified()
-            || (seg0 & 0xfe00) == 0xfc00 // unique local fc00::/7
-            || (seg0 & 0xffc0) == 0xfe80 // link-local fe80::/10
-            || ip.to_ipv4_mapped().is_some_and(v4_local)
-    }
     match url.host() {
         Some(url::Host::Domain(d)) => {
             let d = d.trim_end_matches('.').to_ascii_lowercase();
             d == "localhost" || d.ends_with(".localhost") || d.ends_with(".local")
         }
-        Some(url::Host::Ipv4(ip)) => v4_local(ip),
-        Some(url::Host::Ipv6(ip)) => v6_local(ip),
+        Some(url::Host::Ipv4(ip)) => is_local_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => is_local_ip(ip.into()),
         None => true,
     }
 }
@@ -118,7 +236,7 @@ fn checked_url(raw: &str) -> anyhow::Result<url::Url> {
 /// GET `url` into memory, refusing anything larger than `max` bytes - checked against the
 /// announced Content-Length and again while streaming, since a server may lie or send none.
 async fn fetch_capped(url: url::Url, max: u64) -> anyhow::Result<Vec<u8>> {
-    let mut resp = http_client().get(url).send().await?;
+    let mut resp = download_client().get(url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("download GET failed: HTTP {}", resp.status());
     }
@@ -483,6 +601,61 @@ mod download_tests {
         ] {
             assert!(checked_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn local_ip_classification() {
+        for local in [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1",
+            "0.0.0.0", "255.255.255.255", "224.0.0.1", "::1", "::", "fe80::1", "fd00::1", "ff02::1",
+            "::ffff:192.168.0.1",
+        ] {
+            assert!(is_local_ip(local.parse().unwrap()), "{local}");
+        }
+        for public in ["93.184.216.34", "2606:4700::1111", "100.128.0.1"] {
+            assert!(!is_local_ip(public.parse().unwrap()), "{public}");
+        }
+    }
+
+    #[test]
+    fn any_local_address_refuses_the_name() {
+        let public: std::net::SocketAddr = "93.184.216.34:0".parse().unwrap();
+        let lan: std::net::SocketAddr = "192.168.1.1:0".parse().unwrap();
+        assert!(refuse_local("files.example.org", vec![public]).is_ok());
+        assert!(refuse_local("files.example.org", vec![public, lan]).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolver_refuses_names_resolving_locally() {
+        // localhost resolves offline (hosts file) to loopback.
+        assert!(resolve_public("localhost", false).await.is_err());
+        // a hidden service name is refused before any lookup, even as a "proxy"
+        assert!(resolve_public("abcdef.onion", false).await.is_err());
+        assert!(resolve_public("abcdef.onion", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_environment_proxy_may_be_local() {
+        use reqwest::dns::Resolve;
+        let with_proxy = PublicOnlyResolver { proxy_hosts: vec!["localhost".to_string()] };
+        assert!(with_proxy.resolve("localhost".parse().unwrap()).await.is_ok());
+        let without = PublicOnlyResolver { proxy_hosts: Vec::new() };
+        assert!(without.resolve("localhost".parse().unwrap()).await.is_err());
+    }
+
+    #[test]
+    fn proxy_hosts_from_environment() {
+        let vars = [
+            ("HTTPS_PROXY", "localhost:3128"),
+            ("http_proxy", "http://Proxy.Corp.:8080/"),
+            ("ALL_PROXY", "socks5://127.0.0.1:1080"),
+            ("all_proxy", "  "),
+            ("HTTP_PROXY", "::not a url::"),
+            ("NO_PROXY", "intranet.example"),
+            ("PATH", "/usr/bin"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(env_proxy_hosts_from(vars), vec!["localhost".to_string(), "proxy.corp".to_string()]);
     }
 
     #[test]
