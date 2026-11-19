@@ -26,6 +26,7 @@ pub const FEATURES: &[&str] = &[
     "urn:monocles:omemo-pq:1:pqxdh",                // PQXDH capability (diagnostics, §11.3)
     "urn:monocles:omemo-pq:1:spqr",                 // SPQR capability (diagnostics, §11.3)
     "urn:xmpp:chat-markers:0",                      // XEP-0333
+    "urn:xmpp:ephemeral:0",                         // XEP-0466 disappearing messages
     // Jingle A/V calling (XEP-0166/0167/0176/0320/0353). Android gates the in-call
     // "switch to video" button on the peer advertising `…:apps:rtp:video`, so all of these
     // must be present for the audio→video upgrade to be offered. Keep sorted (caps hash).
