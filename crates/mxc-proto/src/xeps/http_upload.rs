@@ -598,6 +598,15 @@ mod download_tests {
             "https://abcdef.onion/x",
             "https://upload.example.i2p/x",
             "https://ABCDEF.ONION./x",
+            // Shorthand numeric IPv4 forms: the url crate (WHATWG) canonicalises them to the
+            // real address, so they must still be seen as local. Android's OkHttp does not, and
+            // needed an explicit rule for them (2026-11-20).
+            "https://127.1/x",
+            "https://127.0.1/x",
+            "https://2130706433/x",
+            "https://0x7f.1/x",
+            "https://0177.0.0.1/x",
+            "https://10.1/x",
         ] {
             assert!(checked_url(bad).is_err(), "{bad}");
         }
