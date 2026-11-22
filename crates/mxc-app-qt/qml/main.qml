@@ -5215,11 +5215,32 @@ ApplicationWindow {
                         onToggled: backend.changeEnforceDane(checked)
                     }
                 }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 1
+                        Label { textFormat: Text.PlainText; text: qsTr("DANE pinning"); font.pixelSize: 13 }
+                        Label {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: qsTr("Once a server proved its certificate with DANE, always require DANE for that account. Turning this off allows falling back to the CA check, e.g. on networks that strip DNSSEC.")
+                            wrapMode: Text.Wrap
+                            opacity: 0.6
+                            font.pixelSize: 11
+                        }
+                    }
+                    Switch {
+                        checked: backend.danePinning
+                        onToggled: backend.changeDanePinning(checked)
+                    }
+                }
                 // Per-account DANE pin (as on Android): shown once the server proved DANE.
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 10
-                    visible: backend.danePinned
+                    visible: backend.danePinned && backend.danePinning
                     ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 1

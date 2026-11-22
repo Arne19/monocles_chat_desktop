@@ -1827,6 +1827,7 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
                 let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                     backend.as_mut().set_require_tls13(policy.require_tls13);
                     backend.as_mut().set_enforce_dane(policy.enforce_dane);
+                    backend.as_mut().set_dane_pinning(policy.dane_pinning);
                     backend.as_mut().set_dns_server_dot(QString::from(&dot.unwrap_or_default()));
                     backend.as_mut().set_show_maps_inside(show_maps);
                     backend.as_mut().set_map_tile_server_url(QString::from(&tile_server));

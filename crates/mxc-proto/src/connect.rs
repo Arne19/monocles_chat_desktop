@@ -65,6 +65,8 @@ use tokio_xmpp::Error;
 /// `settings` keys (app-wide, read on every connection attempt).
 pub const SETTING_REQUIRE_TLS13: &str = "require_tls_v1_3";
 pub const SETTING_ENFORCE_DANE: &str = "enforce_dane";
+/// Whether an account's DANE pin enforces DANE (default on, as on Android).
+pub const SETTING_DANE_PINNING: &str = "dane_pinning";
 /// DNS-over-TLS server (hostname or IP); empty = the system's name servers.
 pub const SETTING_DNS_SERVER_DOT: &str = "dns_server_dot";
 
@@ -82,11 +84,14 @@ pub struct LinkSecurity {
 pub struct TlsPolicy {
     pub require_tls13: bool,
     pub enforce_dane: bool,
+    /// Whether an account's DANE pin enforces DANE. When off, pins are still recorded (so
+    /// turning it back on restores the protection), but only `enforce_dane` enforces DANE.
+    pub dane_pinning: bool,
 }
 
 impl Default for TlsPolicy {
     fn default() -> Self {
-        Self { require_tls13: true, enforce_dane: false }
+        Self { require_tls13: true, enforce_dane: false, dane_pinning: true }
     }
 }
 
@@ -98,6 +103,7 @@ impl TlsPolicy {
         Self {
             require_tls13: flag(store.setting(SETTING_REQUIRE_TLS13).await.ok().flatten(), d.require_tls13),
             enforce_dane: flag(store.setting(SETTING_ENFORCE_DANE).await.ok().flatten(), d.enforce_dane),
+            dane_pinning: flag(store.setting(SETTING_DANE_PINNING).await.ok().flatten(), d.dane_pinning),
         }
     }
 }
@@ -125,6 +131,7 @@ impl SecureConnector {
     /// The policy for this account: the settings, with DANE also enforced once the account is
     /// DANE-pinned (HSTS-style, as on Android: set after the first DANE-verified login, so a
     /// network that later strips DNSSEC can't quietly downgrade the server to the CA check).
+    /// The pin only counts while the "DANE pinning" setting is on.
     async fn policy(&self) -> TlsPolicy {
         let mut policy = TlsPolicy::load(&self.store).await;
         let pinned = match self.store.dane_pinned(self.account_id).await {
@@ -134,10 +141,12 @@ impl SecureConnector {
                 false
             }
         };
-        if pinned && !policy.enforce_dane {
+        if pinned && !policy.dane_pinning {
+            tracing::debug!(account = self.account_id, "DANE pin ignored: DANE pinning is turned off");
+        } else if pinned && !policy.enforce_dane {
             tracing::debug!(account = self.account_id, "DANE enforced by the account's DANE pin");
         }
-        policy.enforce_dane |= pinned;
+        policy.enforce_dane |= pinned && policy.dane_pinning;
         policy
     }
 
@@ -1420,15 +1429,15 @@ mod tests {
 
     #[test]
     fn policy_defaults_match_android() {
-        assert_eq!(TlsPolicy::default(), TlsPolicy { require_tls13: true, enforce_dane: false });
+        assert_eq!(TlsPolicy::default(), TlsPolicy { require_tls13: true, enforce_dane: false, dane_pinning: true });
     }
 
     #[test]
     fn tls13_only_policy_offers_only_tls13() {
-        let only = protocol_versions(TlsPolicy { require_tls13: true, enforce_dane: false });
+        let only = protocol_versions(TlsPolicy { require_tls13: true, ..TlsPolicy::default() });
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].version, rustls::ProtocolVersion::TLSv1_3);
-        let both = protocol_versions(TlsPolicy { require_tls13: false, enforce_dane: false });
+        let both = protocol_versions(TlsPolicy { require_tls13: false, ..TlsPolicy::default() });
         assert!(both.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_2));
         let verifier = || DaneVerifier {
             pkix: pkix_verifier().unwrap(),
@@ -1437,7 +1446,7 @@ mod tests {
             verified: Arc::new(AtomicBool::new(false)),
         };
         assert!(tls_config(TlsPolicy::default(), verifier()).is_ok());
-        assert!(tls_config(TlsPolicy { require_tls13: false, enforce_dane: false }, verifier()).is_ok());
+        assert!(tls_config(TlsPolicy { require_tls13: false, ..TlsPolicy::default() }, verifier()).is_ok());
     }
 
     /// A .onion/.i2p account domain is refused before any resolver is built: no DNS query, no
@@ -1468,7 +1477,28 @@ mod tests {
         assert_eq!(TlsPolicy::load(&store).await, TlsPolicy::default());
         store.set_setting(SETTING_REQUIRE_TLS13, "0").await.unwrap();
         store.set_setting(SETTING_ENFORCE_DANE, "1").await.unwrap();
-        assert_eq!(TlsPolicy::load(&store).await, TlsPolicy { require_tls13: false, enforce_dane: true });
+        assert_eq!(
+            TlsPolicy::load(&store).await,
+            TlsPolicy { require_tls13: false, enforce_dane: true, dane_pinning: true }
+        );
+        store.set_setting(SETTING_DANE_PINNING, "0").await.unwrap();
+        assert!(!TlsPolicy::load(&store).await.dane_pinning);
+    }
+
+    #[tokio::test]
+    async fn dane_pin_enforces_only_while_pinning_is_on() {
+        let store = mxc_store::Store::open_in_memory().await.unwrap();
+        let id = store.upsert_account("pin@example.org").await.unwrap();
+        let connector =
+            SecureConnector::new(store.clone(), Arc::new(Mutex::new(LinkSecurity::default())), id);
+        assert!(!connector.policy().await.enforce_dane, "not pinned yet");
+        store.set_dane_pinned(id, true).await.unwrap();
+        assert!(connector.policy().await.enforce_dane, "the pin enforces DANE by default");
+        store.set_setting(SETTING_DANE_PINNING, "0").await.unwrap();
+        assert!(!connector.policy().await.enforce_dane, "pinning off: the pin is ignored");
+        assert!(store.dane_pinned(id).await.unwrap(), "the pin itself is kept");
+        store.set_setting(SETTING_ENFORCE_DANE, "1").await.unwrap();
+        assert!(connector.policy().await.enforce_dane, "Enforce DANE still applies");
     }
 
     #[test]
@@ -1774,7 +1804,7 @@ mod tests {
                 enforce: false,
                 verified: Arc::new(AtomicBool::new(false)),
             };
-            let policy = TlsPolicy { require_tls13, enforce_dane: false };
+            let policy = TlsPolicy { require_tls13, ..TlsPolicy::default() };
             let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config(policy, verifier).unwrap()));
             let tcp = TcpStream::connect("127.0.0.1:18443").await.map_err(|e| e.to_string())?;
             let name = ServerName::try_from("localhost").unwrap();

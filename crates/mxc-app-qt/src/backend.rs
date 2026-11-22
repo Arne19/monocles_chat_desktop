@@ -49,6 +49,8 @@ pub mod qobject {
         /// enforce DANE (default off). Read from the store on every connection attempt.
         #[qproperty(bool, require_tls13, cxx_name = "requireTls13")]
         #[qproperty(bool, enforce_dane, cxx_name = "enforceDane")]
+        /// "DANE pinning" (default on): whether an account's DANE pin enforces DANE.
+        #[qproperty(bool, dane_pinning, cxx_name = "danePinning")]
         /// Whether DANE is pinned for the logged-in account: its server proved its certificate
         /// with DANE once, so connections without DANE are refused (as on monocles Android).
         #[qproperty(bool, dane_pinned, cxx_name = "danePinned")]
@@ -157,6 +159,11 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "changeEnforceDane"]
         fn change_enforce_dane(self: Pin<&mut Backend>, value: bool);
+
+        /// Set + persist "DANE pinning" (applies to the next connection).
+        #[qinvokable]
+        #[cxx_name = "changeDanePinning"]
+        fn change_dane_pinning(self: Pin<&mut Backend>, value: bool);
 
         /// Clear the logged-in account's DANE pin ("Stop requiring DANE"; applies to the next
         /// connection). Android's "Accept" after a DANE failure.
@@ -855,6 +862,7 @@ pub struct BackendRust {
     support_room_visible: bool,
     require_tls13: bool,
     enforce_dane: bool,
+    dane_pinning: bool,
     dane_pinned: bool,
     dns_server_dot: QString,
     show_maps_inside: bool,
@@ -911,6 +919,7 @@ impl Default for BackendRust {
             // Android's defaults; the startup check applies the saved choice.
             require_tls13: true,
             enforce_dane: false,
+            dane_pinning: true,
             // the login reads the account's pin
             dane_pinned: false,
             dns_server_dot: QString::default(),
@@ -998,6 +1007,12 @@ impl qobject::Backend {
     pub fn change_enforce_dane(mut self: Pin<&mut Self>, value: bool) {
         self.as_mut().set_enforce_dane(value);
         crate::session::set_flag_setting(mxc_proto::connect::SETTING_ENFORCE_DANE, value);
+    }
+
+    /// QML entry point — set + persist "DANE pinning".
+    pub fn change_dane_pinning(mut self: Pin<&mut Self>, value: bool) {
+        self.as_mut().set_dane_pinning(value);
+        crate::session::set_flag_setting(mxc_proto::connect::SETTING_DANE_PINNING, value);
     }
 
     /// QML entry point — clear the logged-in account's DANE pin.
