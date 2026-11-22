@@ -54,6 +54,10 @@ pub mod qobject {
         #[qproperty(bool, dane_pinned, cxx_name = "danePinned")]
         /// DNS-over-TLS server (hostname or IP); empty = the system's name servers.
         #[qproperty(QString, dns_server_dot, cxx_name = "dnsServerDot")]
+        /// Show map previews of shared locations (tiles from the chosen server; off by default).
+        #[qproperty(bool, show_maps_inside, cxx_name = "showMapsInside")]
+        /// Custom map tile URL template; empty = OpenStreetMap.
+        #[qproperty(QString, map_tile_server_url, cxx_name = "mapTileServerUrl")]
         /// How the current connection is secured, e.g. "DNSSEC + DANE verified · TLS 1.3"; empty
         /// while offline.
         #[qproperty(QString, link_security, cxx_name = "linkSecurity")]
@@ -165,6 +169,17 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "changeDnsServerDot"]
         fn change_dns_server_dot(self: Pin<&mut Backend>, value: &QString) -> bool;
+
+        /// Set + persist "Show map previews" (the open chat is reloaded by QML).
+        #[qinvokable]
+        #[cxx_name = "changeShowMapsInside"]
+        fn change_show_maps_inside(self: Pin<&mut Backend>, value: bool);
+
+        /// Set + persist the custom map tile URL template ("" = OpenStreetMap). Returns false,
+        /// and keeps the old value, for an invalid template.
+        #[qinvokable]
+        #[cxx_name = "changeMapTileServerUrl"]
+        fn change_map_tile_server_url(self: Pin<&mut Backend>, value: &QString) -> bool;
 
         /// Set + persist the chat-background mode ("default" | "none" | "custom").
         #[qinvokable]
@@ -842,6 +857,8 @@ pub struct BackendRust {
     enforce_dane: bool,
     dane_pinned: bool,
     dns_server_dot: QString,
+    show_maps_inside: bool,
+    map_tile_server_url: QString,
     link_security: QString,
     chat_bg_mode: QString,
     chat_bg_custom_path: QString,
@@ -897,6 +914,9 @@ impl Default for BackendRust {
             // the login reads the account's pin
             dane_pinned: false,
             dns_server_dot: QString::default(),
+            // Off, as on Android; the startup check applies the saved choice.
+            show_maps_inside: false,
+            map_tile_server_url: QString::default(),
             link_security: QString::default(),
             // Bundled doodle background by default; the startup check applies the saved choice.
             chat_bg_mode: QString::from("default"),
@@ -999,6 +1019,24 @@ impl qobject::Backend {
         };
         self.as_mut().set_dns_server_dot(QString::from(&server));
         crate::session::set_text_setting(mxc_proto::connect::SETTING_DNS_SERVER_DOT, server);
+        true
+    }
+
+    /// QML entry point — set + persist "Show map previews".
+    pub fn change_show_maps_inside(mut self: Pin<&mut Self>, value: bool) {
+        self.as_mut().set_show_maps_inside(value);
+        crate::map_preview::set_enabled(value);
+        crate::session::set_flag_setting(crate::map_preview::SETTING_SHOW_MAPS, value);
+    }
+
+    /// QML entry point — set + persist the custom map tile URL template, if valid.
+    pub fn change_map_tile_server_url(mut self: Pin<&mut Self>, value: &QString) -> bool {
+        let input = value.to_string().trim().to_string();
+        if !crate::map_preview::set_template(&input) {
+            return false;
+        }
+        self.as_mut().set_map_tile_server_url(QString::from(&input));
+        crate::session::set_text_setting(crate::map_preview::SETTING_TILE_SERVER_URL, input);
         true
     }
 

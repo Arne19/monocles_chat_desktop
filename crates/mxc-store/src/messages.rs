@@ -662,6 +662,7 @@ impl Store {
             .execute(self.pool())
             .await?;
         self.drop_pin(orig.id).await?;
+        self.drop_live_location(orig.id).await?;
         Ok(Some((orig.id, Tombstone { body: orig.body, attachment: orig.attachment })))
     }
 
@@ -1040,6 +1041,7 @@ impl Store {
             .execute(self.pool())
             .await?;
         self.drop_pin(message_id).await?;
+        self.drop_live_location(message_id).await?;
         let (body, attachment) = old.unwrap_or_default();
         Ok(Tombstone { body, attachment })
     }

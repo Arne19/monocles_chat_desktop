@@ -34,6 +34,7 @@ pub mod http_upload;
 pub mod iq;
 pub mod jingle;
 pub mod jingle_sdp;
+pub mod live_location;
 pub mod mam;
 pub mod messaging;
 pub mod microblog;

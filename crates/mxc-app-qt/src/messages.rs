@@ -46,6 +46,11 @@ const ROLE_PREVIEW_TEXT: i32 = 281;
 const ROLE_PREVIEW_IMAGE: i32 = 282;
 const ROLE_REPLY_QUOTE_IMAGE: i32 = 283;
 const ROLE_EDIT_MARKER: i32 = 284;
+const ROLE_MAP_PREVIEW: i32 = 285;
+const ROLE_MAP_ATTRIBUTION: i32 = 286;
+const ROLE_GEO_URI: i32 = 287;
+const ROLE_LIVE_STATE: i32 = 288;
+const ROLE_LIVE_EXPIRES: i32 = 289;
 
 /// One message row, resolved for display.
 #[derive(Clone, Default, PartialEq)]
@@ -121,6 +126,19 @@ pub struct MessageItem {
     /// XEP-0393 styled `body` as escaped Qt rich text, or empty when nothing is styled (or the
     /// sender sent `<unstyled/>`): then `body` renders as plain text.
     pub body_html: String,
+    /// A shared location's map, rendered on this machine (`data:` URL, never on disk), or
+    /// empty; see [`crate::map_preview`].
+    pub map_preview: String,
+    /// The credit line drawn on [`Self::map_preview`] ("© OpenStreetMap", "Map: <host>").
+    pub map_attribution: String,
+    /// The `geo:` URI of a location message while map previews are on (opened in the system's
+    /// maps app), or empty.
+    pub geo_uri: String,
+    /// A live location shared from monocles Android: "active", "ended", or empty.
+    pub live_state: String,
+    /// When an active live location ends on its own (unix milliseconds), else 0; lets the view
+    /// switch it to "ended" without a reload.
+    pub live_expires_ms: i64,
 }
 
 /// How a reloaded message list lines up with the shown one: `old[old_start..][..overlap]` are
@@ -705,6 +723,23 @@ impl MessageItem {
         let mime_of = |url: &str| described(url).map(|f| f.mime.clone()).unwrap_or_default();
         let view = |url: &str| crate::session::media_view_typed(url, &mime_of(url));
         let mut attachments = String::new();
+        // A message that is just a `geo:` URI, with map previews on: a map instead of the text.
+        let location = if m.retracted || m.moderated || att_url.is_some() || !shared_files.is_empty() {
+            crate::map_preview::Preview::None
+        } else {
+            crate::map_preview::preview(&raw)
+        };
+        let (map_preview, map_attribution) = match &location {
+            crate::map_preview::Preview::Ready { data_url, attribution } => {
+                (data_url.clone(), attribution.clone())
+            }
+            _ => (String::new(), String::new()),
+        };
+        // Rebuilt from the parsed coordinates: only this canonical form is handed to the system.
+        let geo_uri = match (&location, mxc_proto::map_tiles::parse_geo(&raw)) {
+            (crate::map_preview::Preview::None, _) | (_, None) => String::new(),
+            (_, Some((lat, lon))) => format!("geo:{lat},{lon}"),
+        };
         // The first already-cached photo of a multi-file message, for its preview.
         let mut first_photo = String::new();
         if shared_files.len() > 1 {
@@ -739,6 +774,11 @@ impl MessageItem {
                 Some(p) => (String::new(), p, String::new()),
                 None => ("🙂 Sticker".to_string(), String::new(), String::new()),
             }
+        } else if !geo_uri.is_empty() {
+            // The map shows once rendered (map_preview::prefetch); until then, or if it can't be
+            // rendered, a label (QML makes it open the location too).
+            let label = if map_preview.is_empty() { "📍 Location" } else { "" };
+            (label.to_string(), String::new(), String::new())
         } else if !auto_download {
             // No automatic download here (not a roster contact, a public group or a room PM):
             // never auto-fetch remote media (no IP leak to untrusted senders).
@@ -825,6 +865,8 @@ impl MessageItem {
             (format!("🧩 {name}"), String::new())
         } else if is_sticker_cid(&raw) {
             ("🙂 Sticker".to_string(), image_path.clone())
+        } else if !geo_uri.is_empty() {
+            ("📍 Location".to_string(), map_preview.clone())
         } else if is_image(media) {
             (format!("🖼 {}", caption_or("Photo")), image_path.clone())
         } else if is_audio(media) {
@@ -881,7 +923,52 @@ impl MessageItem {
             file_name,
             attachments,
             stanza_id: m.stanza_id.clone().unwrap_or_default(),
+            map_preview,
+            map_attribution,
+            geo_uri,
+            live_state: String::new(),
+            live_expires_ms: 0,
         }
+    }
+
+    /// Turns this location message into the live share `share` it started: its newest position
+    /// (switched at most once a minute, see [`crate::map_preview::displayed_point`]) and whether
+    /// it still runs at `now` (unix seconds).
+    pub fn apply_live_location(
+        &mut self,
+        row: &MessageRow,
+        share: &mxc_store::live_locations::LiveLocation,
+        live: &HashMap<i64, mxc_store::live_locations::LiveLocation>,
+        now: i64,
+    ) {
+        if self.retracted || row.moderated {
+            return;
+        }
+        let active = share.active(now);
+        self.live_state = if active { "active" } else { "ended" }.to_string();
+        self.live_expires_ms = if active { share.expires.saturating_mul(1000) } else { 0 };
+        if self.geo_uri.is_empty() {
+            // map previews are off: the text stays
+            return;
+        }
+        let Some((lat, lon)) = crate::map_preview::point_of(row, live) else { return };
+        let label = if active { "📍 Live location" } else { "📍 Live location ended" };
+        self.geo_uri = format!("geo:{lat},{lon}");
+        match crate::map_preview::preview_at(Some(row.id), lat, lon) {
+            crate::map_preview::Preview::Ready { data_url, attribution } => {
+                self.map_preview = data_url;
+                self.map_attribution = attribution;
+                self.body = String::new();
+            }
+            _ => {
+                self.map_preview = String::new();
+                self.map_attribution = String::new();
+                self.body = label.to_string();
+            }
+        }
+        self.body_html = String::new();
+        self.preview_text = label.to_string();
+        self.preview_image = self.map_preview.clone();
     }
 
     /// Build display rows, resolving each message's reply quote against the loaded page
@@ -1420,6 +1507,11 @@ impl qobject::MessageModel {
             ROLE_PREVIEW_IMAGE => QVariant::from(&QString::from(item.preview_image.as_str())),
             ROLE_REPLY_QUOTE_IMAGE => QVariant::from(&QString::from(item.reply_quote_image.as_str())),
             ROLE_EDIT_MARKER => QVariant::from(&QString::from(item.edit_marker.as_str())),
+            ROLE_MAP_PREVIEW => QVariant::from(&QString::from(item.map_preview.as_str())),
+            ROLE_MAP_ATTRIBUTION => QVariant::from(&QString::from(item.map_attribution.as_str())),
+            ROLE_GEO_URI => QVariant::from(&QString::from(item.geo_uri.as_str())),
+            ROLE_LIVE_STATE => QVariant::from(&QString::from(item.live_state.as_str())),
+            ROLE_LIVE_EXPIRES => QVariant::from(&(item.live_expires_ms as f64)),
             _ => QVariant::default(),
         }
     }
@@ -1476,6 +1568,11 @@ impl qobject::MessageModel {
         roles.insert(ROLE_PREVIEW_IMAGE, QByteArray::from("previewImage"));
         roles.insert(ROLE_REPLY_QUOTE_IMAGE, QByteArray::from("replyQuoteImage"));
         roles.insert(ROLE_EDIT_MARKER, QByteArray::from("editMarker"));
+        roles.insert(ROLE_MAP_PREVIEW, QByteArray::from("mapPreview"));
+        roles.insert(ROLE_MAP_ATTRIBUTION, QByteArray::from("mapAttribution"));
+        roles.insert(ROLE_GEO_URI, QByteArray::from("geoUri"));
+        roles.insert(ROLE_LIVE_STATE, QByteArray::from("liveState"));
+        roles.insert(ROLE_LIVE_EXPIRES, QByteArray::from("liveExpires"));
         roles
     }
 }

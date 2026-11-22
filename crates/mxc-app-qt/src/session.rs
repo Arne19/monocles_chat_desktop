@@ -1814,16 +1814,22 @@ async fn run_session(jid: String, password: String, qt: CxxQtThread<Backend>, ma
             let qt = qt.clone();
             runtime().spawn(async move {
                 let (policy, dot) = match crate::session::store().await {
-                    Ok(s) => (
-                        mxc_proto::connect::TlsPolicy::load(&s).await,
-                        mxc_proto::connect::dns_over_tls_server(&s).await,
-                    ),
+                    Ok(s) => {
+                        crate::map_preview::load(s).await;
+                        (
+                            mxc_proto::connect::TlsPolicy::load(&s).await,
+                            mxc_proto::connect::dns_over_tls_server(&s).await,
+                        )
+                    }
                     Err(_) => (mxc_proto::connect::TlsPolicy::default(), None),
                 };
+                let (show_maps, tile_server) = crate::map_preview::current();
                 let _ = qt.queue(move |mut backend: Pin<&mut Backend>| {
                     backend.as_mut().set_require_tls13(policy.require_tls13);
                     backend.as_mut().set_enforce_dane(policy.enforce_dane);
                     backend.as_mut().set_dns_server_dot(QString::from(&dot.unwrap_or_default()));
+                    backend.as_mut().set_show_maps_inside(show_maps);
+                    backend.as_mut().set_map_tile_server_url(QString::from(&tile_server));
                 });
             });
         }
@@ -2779,6 +2785,16 @@ async fn build_items(
 ) -> Vec<MessageItem> {
     let is_muc = store.conversation_kind_by_id(conversation_id).await.ok().flatten().as_deref() == Some("muc");
     let mut items = MessageItem::from_rows(rows, auto_download, is_muc);
+    // Live shares (monocles Android): their newest position and whether they still run.
+    let live = store.live_locations(conversation_id).await.unwrap_or_default();
+    if !live.is_empty() {
+        let now = chrono::Utc::now().timestamp();
+        for (item, row) in items.iter_mut().zip(rows.iter()) {
+            if let Some(share) = live.get(&row.id) {
+                item.apply_live_location(row, share, &live, now);
+            }
+        }
+    }
     // Per-message sender avatar for incoming MUC messages (counterpart = room@host/nick).
     for (item, row) in items.iter_mut().zip(rows.iter()) {
         if row.direction == "in" {
@@ -3103,6 +3119,8 @@ pub fn load_messages(conversation_id: i64, limit: i64, qt: CxxQtThread<MessageMo
         mark_displayed(conversation_id, &rows);
         let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
+        let live = store.live_locations(conversation_id).await.unwrap_or_default();
+        crate::map_preview::prefetch(&rows, &live, &qt);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
             model.reset(items);
@@ -3134,6 +3152,8 @@ pub fn load_older(conversation_id: i64, limit: i64, qt: CxxQtThread<MessageModel
         }
         let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
+        let live = store.live_locations(conversation_id).await.unwrap_or_default();
+        crate::map_preview::prefetch(&rows, &live, &qt);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
             model.reset(items);
@@ -3158,6 +3178,8 @@ pub fn load_messages_around(
         mark_displayed(conversation_id, &rows);
         let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
+        let live = store.live_locations(conversation_id).await.unwrap_or_default();
+        crate::map_preview::prefetch(&rows, &live, &qt);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |mut model: Pin<&mut MessageModel>| {
             model.as_mut().set_open(conversation_id, limit, items);
@@ -3269,6 +3291,8 @@ pub fn open_peer_kind(jid: String, kind: String, qt: CxxQtThread<MessageModel>) 
         mark_displayed(conversation_id, &rows);
         let auto_download = store.auto_download_allowed(conversation_id).await.unwrap_or(false);
         prefetch_images(&rows, &qt, auto_download);
+        let live = store.live_locations(conversation_id).await.unwrap_or_default();
+        crate::map_preview::prefetch(&rows, &live, &qt);
         let items = build_items(store, conversation_id, &rows, auto_download).await;
         let _ = qt.queue(move |model: Pin<&mut MessageModel>| {
             model.set_open(conversation_id, crate::messages::INITIAL_LIMIT, items);

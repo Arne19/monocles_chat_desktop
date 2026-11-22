@@ -9,6 +9,7 @@ mod calls;
 mod conference;
 mod devices;
 mod feeds;
+mod map_preview;
 mod media;
 mod messages;
 mod model;

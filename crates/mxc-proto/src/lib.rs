@@ -11,6 +11,7 @@ pub mod command;
 pub mod connect;
 pub mod event;
 pub mod hidden;
+pub mod map_tiles;
 pub mod media_strip;
 pub mod sasl_auth;
 pub mod session;

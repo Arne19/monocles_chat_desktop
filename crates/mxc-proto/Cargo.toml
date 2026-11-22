@@ -65,6 +65,8 @@ x509-parser = "0.18"
 # Wipe the in-memory password on drop.
 zeroize = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
+# On-device location previews (map_tiles): decode and stitch map tiles. Same version as mxc-app-qt.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [dev-dependencies]
 # SCRAM server signature for the end-to-end login tests (src/sasl_auth.rs).

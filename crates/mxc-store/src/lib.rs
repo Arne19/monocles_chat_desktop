@@ -59,6 +59,7 @@ pub mod cache;
 pub mod calls;
 pub mod ephemeral;
 pub mod feeds;
+pub mod live_locations;
 pub mod roster;
 pub mod messages;
 pub mod omemo;

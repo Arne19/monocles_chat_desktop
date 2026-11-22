@@ -297,6 +297,31 @@ ApplicationWindow {
             Qt.openUrlExternally(u)
     }
 
+    // Wall clock for live-location badges: an active share turns "ended" when its time is up,
+    // without a reload. Half a minute is precise enough for that.
+    property double nowMs: Date.now()
+    Timer {
+        interval: 30000
+        running: true
+        repeat: true
+        onTriggered: window.nowMs = Date.now()
+    }
+
+    // A shared location in the system's maps app. Only the canonical "geo:lat,lon" the backend
+    // rebuilds from the parsed coordinates is handed over.
+    function openGeo(uri) {
+        var u = String(uri)
+        if (/^geo:-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(u))
+            Qt.openUrlExternally(u)
+    }
+
+    // An image path from the backend as a QML source: map previews are in-memory data: URLs,
+    // everything else a local file.
+    function imageSource(path) {
+        var p = String(path)
+        return p.length === 0 ? "" : (p.startsWith("data:") ? p : "file:" + p)
+    }
+
     // Copy `text` to the clipboard (via an off-screen editor; QML has no clipboard API).
     TextEdit { id: clipboardHelper; visible: false }
     function copyText(text) {
@@ -2459,7 +2484,7 @@ ApplicationWindow {
                                         y: 6
                                         width: 28
                                         height: 28
-                                        source: parent.hasThumb ? "file:" + pinBar.pin.previewImage : ""
+                                        source: parent.hasThumb ? window.imageSource(pinBar.pin.previewImage) : ""
                                         sourceSize: Qt.size(56, 56)
                                         fillMode: Image.PreserveAspectCrop
                                         asynchronous: true
@@ -2522,7 +2547,7 @@ ApplicationWindow {
                                                 visible: modelData.previewImage.length > 0
                                                 Layout.preferredWidth: 28
                                                 Layout.preferredHeight: 28
-                                                source: visible ? "file:" + modelData.previewImage : ""
+                                                source: visible ? window.imageSource(modelData.previewImage) : ""
                                                 sourceSize: Qt.size(56, 56)
                                                 fillMode: Image.PreserveAspectCrop
                                                 asynchronous: true
@@ -2899,10 +2924,10 @@ ApplicationWindow {
                                             onTriggered: window.startReply(model.marker, model.previewText, model.previewImage)
                                         }
                                         MenuItem {
-                                            text: qsTr("Copy text")
-                                            visible: model.body.length > 0 && !model.retracted
+                                            text: model.geoUri.length > 0 ? qsTr("Copy location") : qsTr("Copy text")
+                                            visible: (model.body.length > 0 || model.geoUri.length > 0) && !model.retracted
                                             height: visible ? implicitHeight : 0
-                                            onTriggered: window.copyText(model.body)
+                                            onTriggered: window.copyText(model.geoUri.length > 0 ? model.geoUri : model.body)
                                         }
                                         // Local only, as on monocles Android; the pin goes with
                                         // the message (expiry, retraction, deletion).
@@ -2920,6 +2945,7 @@ ApplicationWindow {
                                             visible: window.currentChatCanCorrect
                                                      && model.outgoing && !model.retracted
                                                      && model.body.length > 0
+                                                     && model.geoUri.length === 0
                                                      && model.imagePath.length === 0
                                                      && model.audioPath.length === 0
                                             height: visible ? implicitHeight : 0
@@ -2981,7 +3007,7 @@ ApplicationWindow {
                                                 y: 6
                                                 width: 32
                                                 height: 32
-                                                source: model.replyQuoteImage.length > 0 ? "file:" + model.replyQuoteImage : ""
+                                                source: window.imageSource(model.replyQuoteImage)
                                                 sourceSize: Qt.size(64, 64)
                                                 fillMode: Image.PreserveAspectCrop
                                                 asynchronous: true
@@ -3144,6 +3170,93 @@ ApplicationWindow {
                                                 anchors.fill: parent
                                                 cursorShape: Qt.PointingHandCursor
                                                 onClicked: { imageViewer.path = model.imagePath; imageViewer.open() }
+                                            }
+                                        }
+
+                                        // Shared location: the map rendered on this machine (an
+                                        // in-memory data: URL), the pin at its centre and the tile
+                                        // server's credit. Click opens the system's maps app.
+                                        Item {
+                                            id: mapPreview
+                                            visible: model.mapPreview.length > 0
+                                            readonly property real side: Math.min(260, msgDelegate.maxw)
+                                            width: visible ? side : 0
+                                            height: visible ? side : 0
+                                            Image {
+                                                anchors.fill: parent
+                                                source: model.mapPreview
+                                                fillMode: Image.PreserveAspectCrop
+                                                cache: false
+                                                smooth: true
+                                            }
+                                            // The pin's tip marks the location (the image centre).
+                                            Image {
+                                                source: window.iconBase + "location-pin.svg"
+                                                sourceSize: Qt.size(68, 68)
+                                                width: 34
+                                                height: 34
+                                                x: (parent.width - width) / 2
+                                                y: parent.height / 2 - height
+                                            }
+                                            // Live share (monocles Android): "Live" with a red
+                                            // dot while it runs, a grey "ended" chip after.
+                                            Rectangle {
+                                                id: liveChip
+                                                readonly property bool live: model.liveState === "active"
+                                                                             && window.nowMs < model.liveExpires
+                                                visible: model.liveState.length > 0
+                                                anchors.left: parent.left
+                                                anchors.top: parent.top
+                                                anchors.margins: 6
+                                                width: liveRow.implicitWidth + 14
+                                                height: liveRow.implicitHeight + 6
+                                                radius: height / 2
+                                                color: live ? Qt.rgba(1, 1, 1, 0.9) : Qt.rgba(0.25, 0.25, 0.25, 0.75)
+                                                Row {
+                                                    id: liveRow
+                                                    anchors.centerIn: parent
+                                                    spacing: 5
+                                                    Rectangle {
+                                                        visible: liveChip.live
+                                                        width: 7
+                                                        height: 7
+                                                        radius: 3.5
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        color: "#d93025"
+                                                    }
+                                                    Label {
+                                                        textFormat: Text.PlainText
+                                                        text: liveChip.live ? qsTr("Live") : qsTr("Live location ended")
+                                                        color: liveChip.live ? "#202020" : "white"
+                                                        font.pixelSize: 11
+                                                        font.weight: Font.DemiBold
+                                                    }
+                                                }
+                                            }
+                                            Rectangle {
+                                                anchors.right: parent.right
+                                                anchors.bottom: parent.bottom
+                                                anchors.margins: 4
+                                                width: Math.min(creditLabel.implicitWidth + 10, parent.width * 0.7)
+                                                height: creditLabel.implicitHeight + 2
+                                                radius: height / 2
+                                                color: Qt.rgba(1, 1, 1, 0.75)
+                                                Label {
+                                                    id: creditLabel
+                                                    anchors.centerIn: parent
+                                                    width: parent.width - 10
+                                                    horizontalAlignment: Text.AlignHCenter
+                                                    textFormat: Text.PlainText
+                                                    text: model.mapAttribution
+                                                    elide: Text.ElideRight
+                                                    color: "#333333"
+                                                    font.pixelSize: 9
+                                                }
+                                            }
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: window.openGeo(model.geoUri)
                                             }
                                         }
 
@@ -3318,8 +3431,13 @@ ApplicationWindow {
                                             linkColor: "#cfe0ff"
                                             onLinkActivated: (url) => window.openSafeUrl(url)
                                             HoverHandler {
-                                                cursorShape: bubbleText.hoveredLink.length > 0
+                                                cursorShape: bubbleText.hoveredLink.length > 0 || model.geoUri.length > 0
                                                              ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                            }
+                                            // "📍 Location" while its map isn't rendered (yet)
+                                            TapHandler {
+                                                enabled: model.geoUri.length > 0
+                                                onTapped: window.openGeo(model.geoUri)
                                             }
                                         }
 
@@ -3439,7 +3557,7 @@ ApplicationWindow {
                                         y: 6
                                         width: 28
                                         height: 28
-                                        source: window.replyToImage.length > 0 ? "file:" + window.replyToImage : ""
+                                        source: window.imageSource(window.replyToImage)
                                         sourceSize: Qt.size(56, 56)
                                         fillMode: Image.PreserveAspectCrop
                                         asynchronous: true
@@ -5161,6 +5279,81 @@ ApplicationWindow {
                     wrapMode: Text.Wrap
                     opacity: 0.6
                     font.pixelSize: 11
+                }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 6
+                    implicitHeight: 1
+                    color: Qt.rgba(0.5, 0.5, 0.5, 0.18)
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    text: qsTr("Map previews")
+                    font.bold: true
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 1
+                        Label { textFormat: Text.PlainText; text: qsTr("Show map previews"); font.pixelSize: 13 }
+                        Label {
+                            textFormat: Text.PlainText
+                            Layout.fillWidth: true
+                            text: qsTr("Show a map for shared locations. Map tiles are loaded from the selected tile server, which can see the area. Nothing is stored on disk.")
+                            wrapMode: Text.Wrap
+                            opacity: 0.6
+                            font.pixelSize: 11
+                        }
+                    }
+                    Switch {
+                        checked: backend.showMapsInside
+                        onToggled: {
+                            backend.changeShowMapsInside(checked)
+                            msgModel.reloadCurrent()
+                        }
+                    }
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+                    Label { textFormat: Text.PlainText; text: qsTr("Tile server"); font.pixelSize: 13 }
+                    Label {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        text: qsTr("XYZ tile URL with {z}, {x} and {y}, for example https://tiles.example.org/{z}/{x}/{y}.png. Leave empty to use OpenStreetMap.")
+                        wrapMode: Text.Wrap
+                        opacity: 0.6
+                        font.pixelSize: 11
+                    }
+                    TextField {
+                        id: tileServerField
+                        Layout.fillWidth: true
+                        text: backend.mapTileServerUrl
+                        placeholderText: "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+                        inputMethodHints: Qt.ImhNoAutoUppercase | Qt.ImhNoPredictiveText | Qt.ImhUrlCharactersOnly
+                        property bool invalid: false
+                        onEditingFinished: {
+                            if (text.trim() === backend.mapTileServerUrl)
+                                return
+                            invalid = !backend.changeMapTileServerUrl(text)
+                            if (!invalid) {
+                                text = backend.mapTileServerUrl
+                                msgModel.reloadCurrent()
+                            }
+                        }
+                        onTextEdited: invalid = false
+                    }
+                    Label {
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        visible: tileServerField.invalid
+                        text: qsTr("Enter an https:// address that contains {z}, {x} and {y} once each. .onion and .i2p servers can't be used.")
+                        wrapMode: Text.Wrap
+                        color: "#d32f2f"
+                        font.pixelSize: 11
+                    }
                 }
                 Rectangle {
                     Layout.fillWidth: true

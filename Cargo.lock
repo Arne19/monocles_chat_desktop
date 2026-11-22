@@ -2922,6 +2922,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac 0.12.1",
+ "image",
  "jid",
  "minidom",
  "mxc-media",

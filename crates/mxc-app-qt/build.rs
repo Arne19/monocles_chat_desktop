@@ -46,6 +46,7 @@ fn main() {
         "icons/reaction-smile-symbolic.svg",
         "icons/lock-omemo2.svg",
         "icons/bookmark.svg",
+        "icons/location-pin.svg",
         "icons/lock-open.svg",
         "icons/timer.svg",
         "icons/members.svg",

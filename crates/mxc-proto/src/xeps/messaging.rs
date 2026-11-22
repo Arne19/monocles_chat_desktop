@@ -2239,6 +2239,35 @@ async fn process_payload(
         return Ok(());
     }
 
+    // Live location update/stop (monocles Android): an invisible message. Believed only inside
+    // PQ OMEMO2, as on Android (anyone can put it into a plaintext stanza), and it can only
+    // move or end a share of the same sender in this conversation (Store::update_live_location).
+    if super::live_location::is_control(&content) {
+        if encryption != "omemo2" {
+            tracing::debug!(%from, "ignoring a live-location update outside OMEMO2");
+            return Ok(());
+        }
+        let moved = match super::live_location::parse_control(&content) {
+            Some(super::live_location::LiveControl::Update { session_id, lat, lon }) => {
+                let now = chrono::Utc::now().timestamp();
+                store.update_live_location(conv, &session_id, &omemo_sender_bare, lat, lon, now).await?
+            }
+            Some(super::live_location::LiveControl::Stop { session_id }) => {
+                store.stop_live_location(conv, &session_id, &omemo_sender_bare).await?
+            }
+            None => None,
+        };
+        if let Some(mid) = moved {
+            // shown again with the new position / as ended
+            if let Some(row) = fetch_row(store, conv, mid).await {
+                let _ = events
+                    .send(Event::MessageEdited { account_id: cfg.account_id, conversation_id: conv, message: row })
+                    .await;
+            }
+        }
+        return Ok(());
+    }
+
     // WebXDC (urn:xmpp:webxdc:0) status update / realtime data — an *invisible* message tied to a
     // `.xdc` app instance by its `<thread>`. Stored (or forwarded for realtime) and pushed to an
     // open app view; never shown as a chat bubble.
@@ -2524,10 +2553,17 @@ async fn process_payload(
         return Ok(());
     }
 
+    // A location message that starts a live share (monocles Android; PQ OMEMO2 only).
+    let live_start = new_msg
+        .body
+        .as_deref()
+        .and_then(|b| super::live_location::start_for(encryption, &content, b, unix_seconds(&new_msg.timestamp)))
+        .map(|start| (start, omemo_sender_bare.clone()));
     persist_and_emit_with_remote_id(
         store, cfg, events, conv,
         new_msg,
         remote_id.as_deref(),
+        live_start,
         /*bump_unread=*/ direction == Direction::In && live,
         live,
         mentioned,
@@ -2910,6 +2946,7 @@ fn is_unauthenticated_metadata(el: &Element) -> bool {
         || el.ns() == NS_REACTIONS
         || el.ns() == NS_EPHEMERAL
         || (el.name() == "x" && el.ns() == super::webxdc::NS_WEBXDC)
+        || el.ns() == super::live_location::NS_LIVE_LOCATION
 }
 
 /// `content` without the elements of [`is_unauthenticated_metadata`].
@@ -3002,7 +3039,7 @@ async fn persist_and_emit(
     mentioned: bool,
     reply_to_me: bool,
 ) -> anyhow::Result<()> {
-    persist_and_emit_with_remote_id(store, cfg, events, conv, msg, None, bump_unread, live, mentioned, reply_to_me)
+    persist_and_emit_with_remote_id(store, cfg, events, conv, msg, None, None, bump_unread, live, mentioned, reply_to_me)
         .await
 }
 
@@ -3016,6 +3053,8 @@ async fn persist_and_emit_with_remote_id(
     conv: i64,
     msg: NewMessage,
     remote_id: Option<&str>,
+    // the live share this message starts, and its sender (crypto sender's bare JID)
+    live_start: Option<(super::live_location::LiveStart, String)>,
     bump_unread: bool,
     live: bool,
     mentioned: bool,
@@ -3045,6 +3084,10 @@ async fn persist_and_emit_with_remote_id(
         }
         if bump_unread {
             store.bump_unread(conv).await.ok();
+        }
+        // before MessageStored, so the first render already shows it as live
+        if let Some((start, sender)) = &live_start {
+            store.start_live_location(id, conv, &start.session_id, sender, start.expires).await.ok();
         }
         if let Some(row) = fetch_row(store, conv, id).await {
             let _ = events.send(Event::MessageStored {
@@ -4236,6 +4279,8 @@ mod ephemeral_tests {
                <ephemeral xmlns='urn:xmpp:ephemeral:0' timer='5'/>\
                <i-want-out xmlns='urn:xmpp:ephemeral:0'/>\
                <x xmlns='urn:xmpp:webxdc:0'/>\
+               <live-location xmlns='urn:xmpp:live-location:0' id='s' expires='2030-01-01T00:00:00Z'/>\
+               <live-location-update xmlns='urn:xmpp:live-location:0' id='s' lat='1' lon='2'/>\
                <request xmlns='urn:xmpp:receipts'/>\
                <markable xmlns='urn:xmpp:chat-markers:0'/>\
                <origin-id xmlns='urn:xmpp:sid:0' id='m1'/>\
