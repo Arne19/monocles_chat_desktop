@@ -1935,10 +1935,15 @@ async fn process_payload(
                 Ok(dec) => {
                     // A key-exchange message consumed one of our one-time pre-keys; top up
                     // + republish the bundle so we don't run out / advertise consumed keys.
+                    // In its own task: the publish can take minutes on a server that throttles
+                    // client input, and this message must not wait for it to be shown.
                     if dec.was_kex {
-                        if let Err(e) = omemo::maintain_and_republish(w, store, cfg).await {
-                            tracing::warn!(error = %e, "omemo prekey replenish");
-                        }
+                        let (w, store, cfg) = (w.clone(), store.clone(), cfg.clone());
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = omemo::maintain_and_republish(&w, &store, &cfg).await {
+                                tracing::warn!(error = %e, "omemo prekey replenish");
+                            }
+                        });
                     }
                     // XEP-0384 heartbeat: a long one-directional chain reached the ratchet-counter
                     // threshold, so reply with an empty OMEMO message to force a DH-ratchet step

@@ -66,6 +66,30 @@ pub fn session_lock(account_id: i64) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// The lock that serialises maintenance and publishing of this account's own bundle.
+///
+/// Every key exchange triggers a top-up + republish from its own `spawn_local` task, and
+/// bootstrap does the same in parallel. Unserialised, two top-ups read the same maximum pre-key
+/// id, generate keys under the same ids, and the pre-key stores upsert — so one task can publish
+/// a key whose private half the other has already replaced, and handshakes against it fail.
+///
+/// Identity regeneration holds it for its whole run, so no top-up still working with the old
+/// identity can publish or store keys after the wipe.
+///
+/// Lock order: outermost. Unlike [`session_lock`] it may be held across network awaits (the
+/// bundle publish); it must never be taken while holding [`session_lock`].
+pub fn bundle_lock(account_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(account_id)
+        .or_default()
+        .clone()
+}
+
 /// Holder that vends the five per-account store views.
 #[derive(Clone)]
 pub struct OmemoStores {

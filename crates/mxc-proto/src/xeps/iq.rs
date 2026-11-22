@@ -84,12 +84,24 @@ pub fn try_resolve(iq: &Element, our_bare: &str) -> bool {
     true
 }
 
+/// Reply timeout of [`request`].
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Send an iq (which MUST carry an `id`) and await its reply (30s timeout).
 /// Returns `Err` if the reply is `type='error'`.
 ///
 /// Safe to call only from a task *other* than the reader loop (e.g. spawned command or
 /// bootstrap tasks), since it awaits a reply the reader loop must deliver.
 pub async fn request(w: &crate::client::Writer, iq: Element) -> anyhow::Result<Element> {
+    request_with_timeout(w, iq, DEFAULT_TIMEOUT).await
+}
+
+/// [`request`] with a custom reply timeout.
+pub async fn request_with_timeout(
+    w: &crate::client::Writer,
+    iq: Element,
+    timeout: Duration,
+) -> anyhow::Result<Element> {
     let id = iq
         .attr("id")
         .ok_or_else(|| anyhow::anyhow!("iq request missing id"))?
@@ -97,7 +109,7 @@ pub async fn request(w: &crate::client::Writer, iq: Element) -> anyhow::Result<E
     let rx = register(&id, iq.attr("to"));
     let _guard = Guard(id.clone());
     w.send(iq)?;
-    let reply = tokio::time::timeout(Duration::from_secs(30), rx)
+    let reply = tokio::time::timeout(timeout, rx)
         .await
         .map_err(|_| anyhow::anyhow!("iq {id} timed out"))??;
     if reply.attr("type") == Some("error") {

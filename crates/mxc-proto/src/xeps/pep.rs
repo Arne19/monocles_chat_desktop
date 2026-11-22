@@ -24,6 +24,19 @@ pub async fn publish(
     payload: Element,
     publish_options: Option<Element>,
 ) -> anyhow::Result<Element> {
+    publish_with_timeout(w, node, item_id, payload, publish_options, iq::DEFAULT_TIMEOUT).await
+}
+
+/// [`publish`] with a custom reply timeout, for large items (the OMEMO2 bundle) that a server
+/// throttling client input may take longer than the default to read.
+pub async fn publish_with_timeout(
+    w: &Writer,
+    node: &str,
+    item_id: Option<&str>,
+    payload: Element,
+    publish_options: Option<Element>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Element> {
     let mut item = Element::builder("item", NS_PUBSUB);
     if let Some(id) = item_id {
         item = item.attr(crate::ncname("id"), id);
@@ -45,7 +58,7 @@ pub async fn publish(
         .attr(crate::ncname("id"), new_id("pep-pub"))
         .append(pubsub.build())
         .build();
-    iq::request(w, req).await
+    iq::request_with_timeout(w, req, timeout).await
 }
 
 /// Retract (delete) a single item from a PEP node on our own account.

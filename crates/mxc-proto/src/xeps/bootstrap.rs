@@ -77,14 +77,16 @@ pub async fn run(w: &Writer, store: &Store, cfg: &AccountConfig, events: &Sender
         tracing::warn!(error = %e, "account mam catch-up");
     }
 
+    // Before the OMEMO init: its bundle publish may take minutes on a server that throttles
+    // client input, and the caught-up conversation list should not wait for it.
+    if let Ok(items) = store.conversations(cfg.account_id).await {
+        let _ = events.send(Event::ConversationsUpdated { account_id: cfg.account_id, items }).await;
+    }
+
     // PQ OMEMO2: ensure our identity exists, publish our bundle (incl. <kem-spk>/
     // <kem-prekeys>) under urn:monocles:omemo-pq:1:bundles, and add our device id to the list.
     if let Err(e) = omemo::ensure_initialized(w, store, cfg, events).await {
         tracing::warn!(error = %e, "omemo2 init");
-    }
-
-    if let Ok(items) = store.conversations(cfg.account_id).await {
-        let _ = events.send(Event::ConversationsUpdated { account_id: cfg.account_id, items }).await;
     }
 
     // Feeds: comments nodes used to be created open; give them the feed's audience (once).

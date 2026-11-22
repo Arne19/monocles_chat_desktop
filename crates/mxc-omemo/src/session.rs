@@ -569,6 +569,22 @@ pub async fn generate_and_store_prekeys(
     first_prekey_id: u32,
     count: u32,
 ) -> Result<Bundle> {
+    generate_and_store_prekeys_with(stores, signed_prekey_id, kem_signed_id, first_prekey_id, count, count)
+        .await
+}
+
+/// [`generate_and_store_prekeys`] with separate batch sizes: `count` one-time EC pre-keys and
+/// `kem_count` one-time KEM pre-keys. The KEM batch is kept smaller (proto-XEP §4.5.1): each
+/// ML-KEM-1024 key is ~2.2 KB on the wire and PEP has no per-key consumption, so every fetch
+/// downloads, and every republish re-uploads, the whole set.
+pub async fn generate_and_store_prekeys_with(
+    stores: &OmemoStores,
+    signed_prekey_id: u32,
+    kem_signed_id: u32,
+    first_prekey_id: u32,
+    count: u32,
+    kem_count: u32,
+) -> Result<Bundle> {
     let mut rng = rand::rng();
     let acc = stores.account_id;
     let ik_priv = stores.identity().private_key();
@@ -613,7 +629,7 @@ pub async fn generate_and_store_prekeys(
 
     // One-time KEM pre-keys (kem-prekeys).
     let mut kem_prekeys = Vec::new();
-    for i in 0..count {
+    for i in 0..kem_count {
         let id = kem_signed_id + 1 + i;
         let rec =
             KyberPreKeyRecord::generate(kem::KeyType::MLKEM1024, KyberPreKeyId::from(id), ik_priv)?;
@@ -653,8 +669,10 @@ pub async fn generate_and_store_prekeys(
 }
 
 /// Maintain the published bundle (proto-XEP §4.5): on first use generate the full key set;
-/// otherwise top up one-time EC/KEM pre-keys when stock falls below `low_water` and rebuild
-/// the bundle from the keys we currently hold (so we never advertise a consumed pre-key).
+/// otherwise top up one-time EC pre-keys when stock falls below `low_water` (KEM pre-keys:
+/// `kem_low_water`) and rebuild the bundle from the keys we currently hold (so we never
+/// advertise a consumed pre-key). At most `kem_target` one-time KEM pre-keys are published.
+#[allow(clippy::too_many_arguments)]
 pub async fn maintain_bundle(
     stores: &OmemoStores,
     signed_prekey_id: u32,
@@ -662,6 +680,8 @@ pub async fn maintain_bundle(
     first_prekey_id: u32,
     target: u32,
     low_water: u32,
+    kem_target: u32,
+    kem_low_water: u32,
 ) -> Result<Bundle> {
     let fresh = stores
         .store
@@ -669,19 +689,26 @@ pub async fn maintain_bundle(
         .await?
         .is_none();
     if fresh {
-        return generate_and_store_prekeys(stores, signed_prekey_id, kem_signed_id, first_prekey_id, target)
-            .await;
+        return generate_and_store_prekeys_with(
+            stores,
+            signed_prekey_id,
+            kem_signed_id,
+            first_prekey_id,
+            target,
+            kem_target,
+        )
+        .await;
     }
     // Upgrade path: discard retained Round-3 Kyber prekeys first, so `replenish` sees the real
     // ML-KEM count and `rotate_last_resort_if_due` does not keep a Round-3 signed prekey.
     purge_non_ml_kem_prekeys(stores).await?;
-    replenish(stores, target, low_water).await?;
+    replenish(stores, target, low_water, kem_target, kem_low_water).await?;
     rotate_last_resort_if_due(stores).await?;
     // The EC signed pre-key rotates on the same schedule as the KEM one; publish whichever id
     // that leaves current (the caller's `signed_prekey_id` is only the id of the very first).
     let current_spk_id = rotate_signed_prekey_if_due(stores, signed_prekey_id).await?;
     prune_stale_kyber_prekeys(stores).await?;
-    rebuild_bundle(stores, current_spk_id).await
+    rebuild_bundle(stores, current_spk_id, kem_target).await
 }
 
 /// Delete stored KEM prekeys that are not FIPS 203 ML-KEM-1024.
@@ -823,9 +850,16 @@ async fn prune_stale_kyber_prekeys(stores: &OmemoStores) -> Result<()> {
     Ok(())
 }
 
-/// Generate fresh one-time EC/KEM pre-keys to bring each set back up to `target` when it
-/// has dropped below `low_water`. New ids continue past the current maximum.
-async fn replenish(stores: &OmemoStores, target: u32, low_water: u32) -> Result<()> {
+/// Generate fresh one-time EC pre-keys back up to `target` when below `low_water`, and KEM
+/// pre-keys back up to `kem_target` when below `kem_low_water`. New ids continue past the
+/// current maximum.
+async fn replenish(
+    stores: &OmemoStores,
+    target: u32,
+    low_water: u32,
+    kem_target: u32,
+    kem_low_water: u32,
+) -> Result<()> {
     let acc = stores.account_id;
     let mut rng = rand::rng();
     let ik_priv = stores.identity().private_key();
@@ -842,9 +876,9 @@ async fn replenish(stores: &OmemoStores, target: u32, low_water: u32) -> Result<
     }
 
     let kem_count = stores.store.available_kyber_prekeys(acc).await?.len() as u32;
-    if kem_count < low_water {
+    if kem_count < kem_low_water {
         let mut next = stores.store.max_kyber_prekey_id(acc).await? as u32 + 1;
-        for _ in kem_count..target {
+        for _ in kem_count..kem_target {
             let rec =
                 KyberPreKeyRecord::generate(kem::KeyType::MLKEM1024, KyberPreKeyId::from(next), ik_priv)?;
             stores.store.store_kyber_prekey(acc, next as i64, &rec.serialize()?, false).await?;
@@ -855,8 +889,14 @@ async fn replenish(stores: &OmemoStores, target: u32, low_water: u32) -> Result<
 }
 
 /// Build a publishable [`Bundle`] from the keys currently in the store (signed pre-key,
-/// last-resort KEM pre-key, and all available one-time EC/KEM pre-keys).
-async fn rebuild_bundle(stores: &OmemoStores, signed_prekey_id: u32) -> Result<Bundle> {
+/// last-resort KEM pre-key, all available one-time EC pre-keys, and the newest `kem_limit`
+/// available one-time KEM pre-keys).
+///
+/// The KEM cap shrinks a bundle published by an older build (100 KEM pre-keys, ~230 KB) on the
+/// next republish. The keys left out stay in the store, unused, so a handshake a peer started
+/// against the old bundle still completes; they are published later as the newer ones are
+/// consumed, and only once the whole stock runs low are new ones generated.
+async fn rebuild_bundle(stores: &OmemoStores, signed_prekey_id: u32, kem_limit: u32) -> Result<Bundle> {
     let acc = stores.account_id;
 
     let spk_bytes = stores
@@ -879,8 +919,13 @@ async fn rebuild_bundle(stores: &OmemoStores, signed_prekey_id: u32) -> Result<B
         prekeys.push((id as u32, ec_raw(&rec.public_key()?.serialize())));
     }
 
+    let mut available_kem = stores.store.available_kyber_prekeys(acc).await?;
+    // Newest `kem_limit` (highest ids), published in ascending id order as before.
+    available_kem.sort_by_key(|(id, _)| std::cmp::Reverse(*id));
+    available_kem.truncate(kem_limit as usize);
+    available_kem.sort_by_key(|(id, _)| *id);
     let mut kem_prekeys = Vec::new();
-    for (id, bytes) in stores.store.available_kyber_prekeys(acc).await? {
+    for (id, bytes) in available_kem {
         let rec = KyberPreKeyRecord::deserialize(&bytes)?;
         kem_prekeys.push(KemPreKey {
             id: id as u32,
@@ -1347,6 +1392,68 @@ mod tests {
         );
     }
 
+    /// The KEM batch is sized separately from the EC one, and an older, larger KEM pool is
+    /// published only up to the cap (newest keys first) without deleting the rest — they stay
+    /// usable for handshakes against the old bundle and are published as newer ones are used.
+    #[tokio::test]
+    async fn kem_batch_is_capped_and_refilled_separately() {
+        let (alice, _dev) = party("alice@example.com").await;
+        let acc = alice.account_id;
+
+        // An older build's larger pool: 6 EC and 8 KEM one-time keys (ids 101..=108).
+        let bundle = generate_and_store_prekeys_with(&alice, 1, 100, 200, 6, 8).await.unwrap();
+        assert_eq!(bundle.prekeys.len(), 6);
+        assert_eq!(bundle.kem_prekeys.len(), 8);
+
+        // KEM cap 3: the newest three are published, all eight stay in the store.
+        let bundle = maintain_bundle(&alice, 1, 100, 200, 6, 3, 3, 2).await.unwrap();
+        assert_eq!(bundle.prekeys.len(), 6, "EC batch is unaffected by the KEM cap");
+        let ids: Vec<u32> = bundle.kem_prekeys.iter().map(|k| k.id).collect();
+        assert_eq!(ids, vec![106, 107, 108], "newest three, ascending");
+        assert_eq!(alice.store.available_kyber_prekeys(acc).await.unwrap().len(), 8);
+
+        // Consume all but one: stock 1 is below the KEM low water 2 → refill back up to 3.
+        for id in 101..=107i64 {
+            alice.store.mark_kyber_prekey_used(acc, id).await.unwrap();
+        }
+        let bundle = maintain_bundle(&alice, 1, 100, 200, 6, 3, 3, 2).await.unwrap();
+        let ids: Vec<u32> = bundle.kem_prekeys.iter().map(|k| k.id).collect();
+        assert_eq!(ids, vec![108, 109, 110], "the survivor plus two fresh keys");
+    }
+
+    /// Two top-ups at once (two key exchanges, or one during bootstrap) are serialised by the
+    /// bundle lock, so neither mints keys under ids the other already published: every KEM key
+    /// in either resulting bundle is still the one held in the store under its id.
+    #[tokio::test]
+    async fn concurrent_maintenance_under_bundle_lock_keeps_published_keys_intact() {
+        let (alice, _dev) = party("alice@example.com").await;
+        let acc = alice.account_id;
+        generate_and_store_prekeys_with(&alice, 1, 100, 200, 4, 4).await.unwrap();
+        // Use up the one-time KEM keys so both passes have to replenish.
+        for id in 101..=104i64 {
+            alice.store.mark_kyber_prekey_used(acc, id).await.unwrap();
+        }
+
+        let run = || async {
+            let lock = crate::store::bundle_lock(acc);
+            let _guard = lock.lock().await;
+            maintain_bundle(&alice, 1, 100, 200, 4, 3, 4, 3).await.unwrap()
+        };
+        let (first, second) = tokio::join!(run(), run());
+
+        let held: std::collections::HashMap<i64, Vec<u8>> =
+            alice.store.available_kyber_prekeys(acc).await.unwrap().into_iter().collect();
+        for bundle in [&first, &second] {
+            assert_eq!(bundle.kem_prekeys.len(), 4);
+            for k in &bundle.kem_prekeys {
+                let rec = KyberPreKeyRecord::deserialize(&held[&(k.id as i64)]).unwrap();
+                assert_eq!(rec.public_key().unwrap().serialize().to_vec(), k.key, "key {} replaced", k.id);
+            }
+        }
+        // The second pass found a full stock and generated nothing new.
+        assert_eq!(held.len(), 4);
+    }
+
     /// Retained Round-3 Kyber prekeys from before the ML-KEM switch must be discarded on the
     /// next maintenance pass, not republished.
     ///
@@ -1383,7 +1490,7 @@ mod tests {
         let bundle = generate_and_store_prekeys(&alice, 1, 100, 200, 2).await.unwrap();
         assert!(!bundle.kem_spk.is_empty());
 
-        let bundle = maintain_bundle(&alice, 1, 100, 200, 2, 2).await.unwrap();
+        let bundle = maintain_bundle(&alice, 1, 100, 200, 2, 2, 2, 2).await.unwrap();
 
         assert_eq!(
             bundle.kem_spk[0], 0x0A,

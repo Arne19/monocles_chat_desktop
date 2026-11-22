@@ -46,6 +46,19 @@ const KEM_SIGNED_ID: u32 = 1;
 const FIRST_PREKEY_ID: u32 = 100;
 /// Replenish one-time pre-keys once the available count drops below this (proto-XEP §4.5).
 const PREKEY_LOW_WATER: u32 = 50;
+/// One-time ML-KEM-1024 pre-keys published in the bundle (proto-XEP §4.5.1, v0.0.15). Kept well
+/// below the EC count: each is ~2.2 KB on the wire and PEP has no per-key consumption, so every
+/// peer fetch downloads, and every republish re-uploads, the whole set (100 made a ~230 KB item
+/// that throttling servers took minutes to accept). The count doesn't change the cryptography —
+/// each key is still single-use and the transcript binds the whole published set.
+/// MUST stay in step with Android (AxolotlService.NUM_KEM_KEYS_TO_PUBLISH).
+const KEM_PREKEY_COUNT: u32 = 32;
+/// Top the KEM pre-keys up once a quarter of the batch is consumed (Android: MIN_KEM_PREKEYS).
+const KEM_PREKEY_LOW_WATER: u32 = 24;
+/// Reply timeout for the bundle publish. The item is still tens of KB, and servers that throttle
+/// client input can take well over the default 30 s to read it; timing out there would abort
+/// bootstrap before our device list is published.
+const BUNDLE_PUBLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// What `decrypt_message` recovers.
 pub struct Decrypted {
@@ -426,6 +439,13 @@ pub async fn regenerate_own_identity(
     store: &Store,
     cfg: &AccountConfig,
 ) -> anyhow::Result<()> {
+    // Held for the whole regeneration (see mxc_omemo::store::bundle_lock): a republish already
+    // in flight finishes first, and none can start until the new identity is published. Without
+    // it, a top-up triggered by an incoming key exchange — still holding the old stores — could
+    // republish the old identity's bundle after the retract below, or write pre-keys signed by
+    // the old identity into the freshly wiped tables. Taken before session_lock (lock order).
+    let bundle_lock = mxc_omemo::store::bundle_lock(cfg.account_id);
+    let _bundle_guard = bundle_lock.lock().await;
     let old_device = store
         .omemo_own_device_id(cfg.account_id)
         .await?
@@ -459,7 +479,7 @@ pub async fn regenerate_own_identity(
     }
     // Mint + publish the new identity, and swap the old device id for the new one in the
     // device list (other devices on the account are preserved).
-    let device_id = maintain_and_republish(w, store, cfg).await?;
+    let device_id = maintain_and_republish_locked(w, store, cfg).await?;
     publish_device_list_replacing(w, cfg, device_id, old_device).await?;
     set_retired_device(store, cfg.account_id, None).await?;
     Ok(())
@@ -473,6 +493,20 @@ pub async fn maintain_and_republish(
     store: &Store,
     cfg: &AccountConfig,
 ) -> anyhow::Result<u32> {
+    // One maintenance + publish at a time per account (see mxc_omemo::store::bundle_lock):
+    // concurrent top-ups would mint keys under the same ids and overwrite published ones.
+    let bundle_lock = mxc_omemo::store::bundle_lock(cfg.account_id);
+    let _bundle_guard = bundle_lock.lock().await;
+    maintain_and_republish_locked(w, store, cfg).await
+}
+
+/// [`maintain_and_republish`] for a caller that already holds the account's bundle lock (the
+/// lock is not re-entrant).
+async fn maintain_and_republish_locked(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+) -> anyhow::Result<u32> {
     let stores = stores(store, cfg).await?;
     let device_id = stores.registration_id();
     let bundle = session::maintain_bundle(
@@ -482,6 +516,8 @@ pub async fn maintain_and_republish(
         FIRST_PREKEY_ID,
         PREKEY_COUNT,
         PREKEY_LOW_WATER,
+        KEM_PREKEY_COUNT,
+        KEM_PREKEY_LOW_WATER,
     )
     .await
     .map_err(|e| anyhow::anyhow!("maintain bundle: {e}"))?;
@@ -490,6 +526,7 @@ pub async fn maintain_and_republish(
         has_pq_identity = bundle.has_pq_identity(),
         pq_ik_len = bundle.pq_ik.len(),
         ec_prekeys = bundle.prekeys.len(),
+        kem_prekeys = bundle.kem_prekeys.len(),
         "omemo: (re)publishing own bundle"
     );
     store.set_omemo_bundle_xml(cfg.account_id, &bundle.to_xml()).await?;
@@ -503,12 +540,13 @@ async fn publish_bundle(w: &Writer, device_id: u32, bundle: &Bundle) -> anyhow::
 
 async fn publish_bundle_xml(w: &Writer, device_id: u32, xml: &str) -> anyhow::Result<()> {
     let payload: Element = xml.parse().map_err(|e| anyhow::anyhow!("serialize bundle: {e}"))?;
-    pep::publish(
+    pep::publish_with_timeout(
         w,
         NODE_BUNDLES,
         Some(&device_id.to_string()),
         payload,
         Some(pep::publish_options("open")),
+        BUNDLE_PUBLISH_TIMEOUT,
     )
     .await?;
     Ok(())
