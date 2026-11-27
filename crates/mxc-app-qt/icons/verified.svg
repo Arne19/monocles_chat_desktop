@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Verified-user / key-verification icon, from monocles chat Android ic_verified_user_24dp.
-     White → tinted via ColorIcon. -->
+<!-- Verified key icon for PQ OMEMO2 (shield with a star cut out), from monocles chat Android
+     ic_shield_omemo2_verified_24dp. The star matches the keyhole of lock-omemo2.svg, so
+     star = PQ OMEMO2 and shield = verified, and it stays distinct from the legacy check-mark
+     shield. White → tinted via ColorIcon. -->
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 960 960">
-  <path fill="#ffffff" d="M438,622L664,396L607,339L438,508L354,424L297,481L438,622ZM480,880Q341,845 250.5,720.5Q160,596 160,444L160,200L480,80L800,200L800,444Q800,596 709.5,720.5Q619,845 480,880Z"/>
+  <path fill="#ffffff" fill-rule="evenodd" d="M480,880Q341,845 250.5,720.5Q160,596 160,444L160,200L480,80L800,200L800,444Q800,596 709.5,720.5Q619,845 480,880ZM480,310L521.7,428.3L640,470L521.7,511.7L480,630L438.3,511.7L320,470L438.3,428.3Z"/>
 </svg>
