@@ -15,6 +15,7 @@ fn main() {
         "qml/ThinScrollBar.qml",
         "qml/FastScroll.qml",
         "qml/WebxdcWindow.qml",
+        "qml/QuoteThumb.qml",
     ]))
     .files([
         "src/backend.rs",

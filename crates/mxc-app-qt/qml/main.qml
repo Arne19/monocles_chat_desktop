@@ -2921,7 +2921,7 @@ ApplicationWindow {
                                         MenuItem {
                                             text: qsTr("Reply")
                                             enabled: !model.retracted
-                                            onTriggered: window.startReply(model.marker, model.previewText, model.previewImage)
+                                            onTriggered: window.startReply(model.marker, model.previewCaption, model.previewImage)
                                         }
                                         MenuItem {
                                             text: model.geoUri.length > 0 ? qsTr("Copy location") : qsTr("Copy text")
@@ -2987,31 +2987,38 @@ ApplicationWindow {
                                             elide: Text.ElideRight
                                         }
 
-                                        // Quoted message this one replies to (XEP-0461): a lighter
-                                        // block with a blue bar at the left (Android-style); click
-                                        // jumps to (and flashes) the quoted message.
+                                        // Quoted message this one replies to (XEP-0461), laid out like
+                                        // Android: blue bar | name + text | photo on the right.
+                                        // Click jumps to (and flashes) the quoted message.
                                         Rectangle {
                                             visible: model.replyQuote.length > 0
-                                            // Room for the quoted photo's thumbnail, if any.
-                                            property int thumbSpace: model.replyQuoteImage.length > 0 ? 38 : 0
-                                            width: thumbSpace + quoteText.width + 22
-                                            height: Math.max(quoteText.height, thumbSpace > 0 ? 32 : 0) + 12
+                                            // The quoted photo's thumbnail, if any, and the room
+                                            // it takes at the trailing edge (plus its margin).
+                                            property int thumbSize: model.replyQuoteImage.length > 0 ? 36 : 0
+                                            property int thumbSpace: thumbSize > 0 ? thumbSize + 6 : 0
+                                            // Who wrote the quoted message: "You", the room
+                                            // nick, or the chat partner.
+                                            property string author: model.replyQuoteOutgoing
+                                                ? qsTr("You")
+                                                : (window.currentPeerIsMuc ? model.replyQuoteSender
+                                                                           : window.currentPeerName)
+                                            property int textWidth: Math.max(quoteText.width,
+                                                                             quoteAuthor.visible ? quoteAuthor.width : 0)
+                                            property int textHeight: quoteText.height
+                                                + (quoteAuthor.visible ? quoteAuthor.height + 1 : 0)
+                                            width: 14 + textWidth + 8 + thumbSpace
+                                            height: Math.max(textHeight + 12, thumbSize > 0 ? thumbSize + 12 : 0)
                                             radius: 6
                                             color: Qt.rgba(1, 1, 1, 0.13)
 
-                                            // Small picture of the quoted photo or sticker (cached
-                                            // only - nothing is fetched for a quote).
-                                            Image {
-                                                visible: parent.thumbSpace > 0
-                                                x: 14
-                                                y: 6
-                                                width: 32
-                                                height: 32
-                                                source: window.imageSource(model.replyQuoteImage)
-                                                sourceSize: Qt.size(64, 64)
-                                                fillMode: Image.PreserveAspectCrop
-                                                asynchronous: true
-                                                clip: true
+                                            // The quoted photo, sticker or map, rounded, on the right.
+                                            QuoteThumb {
+                                                visible: parent.thumbSize > 0
+                                                x: parent.width - 6 - width
+                                                y: (parent.height - height) / 2
+                                                width: parent.thumbSize
+                                                height: parent.thumbSize
+                                                source: visible ? window.imageSource(model.replyQuoteImage) : ""
                                             }
 
                                             Rectangle {
@@ -3024,10 +3031,27 @@ ApplicationWindow {
                                             }
 
                                             Label {
+                                                id: quoteAuthor
+                                                visible: parent.author.length > 0
+                                                textFormat: Text.PlainText
+                                                x: 14
+                                                // the name + text block sits centred beside the photo
+                                                y: (parent.height - parent.textHeight) / 2
+                                                width: Math.min(implicitWidth, msgDelegate.maxw - 22 - parent.thumbSpace)
+                                                text: parent.author
+                                                color: "#a8c7ff"
+                                                font.pixelSize: 11
+                                                font.bold: true
+                                                renderType: Text.NativeRendering
+                                                elide: Text.ElideRight
+                                            }
+
+                                            Label {
                                                 id: quoteText
                                                 textFormat: Text.PlainText
-                                                x: 14 + parent.thumbSpace
-                                                y: 6
+                                                x: 14
+                                                y: quoteAuthor.visible ? quoteAuthor.y + quoteAuthor.height + 1
+                                                                       : (parent.height - parent.textHeight) / 2
                                                 width: Math.min(implicitWidth, msgDelegate.maxw - 22 - parent.thumbSpace)
                                                 text: model.replyQuote
                                                 color: "white"
@@ -3537,7 +3561,8 @@ ApplicationWindow {
                                 spacing: 6
                                 Rectangle {
                                     Layout.fillWidth: true
-                                    // Room for the photo's thumbnail when replying to one.
+                                    // Room for the photo's thumbnail (on the right, as in the
+                                    // sent quote) when replying to one.
                                     property int thumbSpace: window.replyToImage.length > 0 ? 34 : 0
                                     implicitHeight: Math.max(replyPreviewText.implicitHeight, thumbSpace > 0 ? 28 : 0) + 12
                                     radius: 6
@@ -3551,22 +3576,19 @@ ApplicationWindow {
                                         radius: 1.5
                                         color: "#a8c7ff"
                                     }
-                                    Image {
+                                    QuoteThumb {
                                         visible: parent.thumbSpace > 0
-                                        x: 14
-                                        y: 6
+                                        x: parent.width - 6 - width
+                                        anchors.verticalCenter: parent.verticalCenter
                                         width: 28
                                         height: 28
-                                        source: window.imageSource(window.replyToImage)
-                                        sourceSize: Qt.size(56, 56)
-                                        fillMode: Image.PreserveAspectCrop
-                                        asynchronous: true
-                                        clip: true
+                                        radius: 5
+                                        source: visible ? window.imageSource(window.replyToImage) : ""
                                     }
                                     Label {
                                         id: replyPreviewText
                                         textFormat: Text.PlainText
-                                        x: 14 + parent.thumbSpace
+                                        x: 14
                                         anchors.verticalCenter: parent.verticalCenter
                                         width: parent.width - 22 - parent.thumbSpace
                                         text: window.replyToText

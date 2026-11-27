@@ -51,6 +51,9 @@ const ROLE_MAP_ATTRIBUTION: i32 = 286;
 const ROLE_GEO_URI: i32 = 287;
 const ROLE_LIVE_STATE: i32 = 288;
 const ROLE_LIVE_EXPIRES: i32 = 289;
+const ROLE_REPLY_QUOTE_SENDER: i32 = 290;
+const ROLE_REPLY_QUOTE_OUTGOING: i32 = 291;
+const ROLE_PREVIEW_CAPTION: i32 = 292;
 
 /// One message row, resolved for display.
 #[derive(Clone, Default, PartialEq)]
@@ -77,6 +80,10 @@ pub struct MessageItem {
     pub reply_to: String,
     /// Small cached image of the quoted message (a photo or sticker it shares), or empty.
     pub reply_quote_image: String,
+    /// Room nick of the quoted message's author (empty in a 1:1 chat), for the quote's name line.
+    pub reply_quote_sender: String,
+    /// Whether the quoted message is our own (its name line then says "You").
+    pub reply_quote_outgoing: bool,
     /// This message in one short line, as a reply to it shows it: the text, or for media and
     /// files an icon and a label ("🖼 Photo", "🎤 Voice message", "📎 report.pdf", …).
     pub preview_text: String,
@@ -328,6 +335,67 @@ mod described_file_tests {
         let items = MessageItem::from_rows(&[photo, answer], true, false);
         assert_eq!(items[1].reply_quote, "🖼 Photo");
         assert_eq!(items[0].reply_quote, "");
+    }
+
+    /// Next to a thumbnail the media icon is dropped; without one it stays.
+    #[test]
+    fn a_thumbnail_replaces_the_media_icon() {
+        let with = |text: &str, image: &str| MessageItem {
+            preview_text: text.into(),
+            preview_image: image.into(),
+            ..Default::default()
+        };
+        assert_eq!(with("🖼 at the lake", "/tmp/p.jpg").preview_caption(), "at the lake");
+        assert_eq!(with("🖼 at the lake", "").preview_caption(), "🖼 at the lake");
+        assert_eq!(with("📍 Live location", "data:image/jpeg;base64,AA==").preview_caption(), "Live location");
+        assert_eq!(with("🙂 Sticker", "/tmp/s.webp").preview_caption(), "Sticker");
+        assert_eq!(with("📍 here", "").preview_caption(), "📍 here");
+        assert_eq!(with("hello", "/tmp/p.jpg").preview_caption(), "hello");
+    }
+
+    /// A quote shows only the quoted message's own text, never what that message quoted.
+    #[test]
+    fn quotes_do_not_nest() {
+        let mut quoting = row(None, None, "> old\n>> older\n\nnew");
+        quoting.origin_id = Some("m1".into());
+        let mut answer = row(None, None, "reply");
+        answer.id = 2;
+        answer.reply_to = Some("m1".into());
+        let items = MessageItem::from_rows(&[quoting, answer], true, false);
+        assert_eq!(items[1].reply_quote, "new");
+        assert!(!items[1].reply_quote_outgoing);
+        assert_eq!(items[0].body, "> old\n>> older\n\nnew", "the message itself is unchanged");
+    }
+
+    /// The quote's name line: the room nick of the quoted author, or "You" for our own message.
+    #[test]
+    fn a_quote_names_its_author() {
+        let mut theirs = row(None, None, "hi");
+        theirs.counterpart = "room@muc.example/alice".into();
+        theirs.stanza_id = Some("s1".into());
+        let mut ours = row(None, None, "hello");
+        ours.id = 2;
+        ours.direction = "out".into();
+        ours.stanza_id = Some("s2".into());
+        let mut a = row(None, None, "to alice");
+        a.id = 3;
+        a.reply_to = Some("s1".into());
+        let mut b = row(None, None, "to me");
+        b.id = 4;
+        b.reply_to = Some("s2".into());
+        let items = MessageItem::from_rows(&[theirs, ours, a, b], true, true);
+        assert_eq!(items[2].reply_quote_sender, "alice");
+        assert!(!items[2].reply_quote_outgoing);
+        assert!(items[3].reply_quote_outgoing);
+    }
+
+    #[test]
+    fn quoted_lines_are_dropped_from_previews() {
+        assert_eq!(super::without_quoted_lines("a\n> x\nb"), "a\nb");
+        assert_eq!(super::without_quoted_lines("plain"), "plain");
+        assert_eq!(super::without_quoted_lines("> only a quote\n"), "only a quote");
+        assert_eq!(super::without_quoted_lines("> a\n>> b"), "a");
+        assert_eq!(super::without_quoted_lines(">a\n> > b\n> c"), "a\nc");
     }
 
     #[test]
@@ -598,6 +666,37 @@ fn file_type_label(url: &str, mime: &str) -> String {
 /// The longest preview line kept (in characters); the QML elides it further to the width.
 const PREVIEW_MAX_CHARS: usize = 160;
 
+/// `text` without its quoted lines (XEP-0393 block quotes: a line starting with `>`), so a quote
+/// of a message shows only that message's own text and quotes never nest (Signal-style). A text
+/// made of nothing but quoted lines (e.g. another client's unmarked reply fallback) gives its
+/// first quote level without the `>` instead, so its quote is never empty and still never shows
+/// two levels. Mirrors Android's `Message.withoutQuotedLines`.
+fn without_quoted_lines(text: &str) -> String {
+    let own: Vec<&str> = text.lines().filter(|l| !l.starts_with('>')).collect();
+    let own = own.join("\n");
+    let own = own.trim();
+    if !own.is_empty() {
+        return own.to_string();
+    }
+    let first_level: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix('>'))
+        .filter(|inner| !inner.trim_start_matches(' ').starts_with('>'))
+        .map(|inner| inner.strip_prefix(' ').unwrap_or(inner))
+        .collect();
+    let first_level = first_level.join("\n");
+    let first_level = first_level.trim();
+    if first_level.is_empty() { text.trim().to_string() } else { first_level.to_string() }
+}
+
+/// `text` without the media icon a preview starts with ("🖼 ", "🙂 ", "📍 ", "📎 ").
+fn without_media_icon(text: &str) -> &str {
+    ["🖼 ", "🙂 ", "📍 ", "📎 "]
+        .iter()
+        .find_map(|icon| text.strip_prefix(icon))
+        .unwrap_or(text)
+}
+
 /// `text` capped to [`PREVIEW_MAX_CHARS`] characters (with "…"). Line breaks are kept - the
 /// quote shows up to two lines - but trailing whitespace is not.
 fn capped_preview(text: &str) -> String {
@@ -689,6 +788,17 @@ fn guessed_webxdc_url(m: &MessageRow, body: &str) -> Option<String> {
 }
 
 impl MessageItem {
+    /// [`Self::preview_text`] as shown next to [`Self::preview_image`] (a quote, the reply bar):
+    /// with the thumbnail there the media icon would say the same twice, so it is dropped;
+    /// without one the icon stays, as the only hint of what the message is.
+    pub fn preview_caption(&self) -> String {
+        if self.preview_image.is_empty() {
+            self.preview_text.clone()
+        } else {
+            without_media_icon(&self.preview_text).to_string()
+        }
+    }
+
     /// `auto_download` is false for chats without automatic download (not a roster contact, a
     /// public group or a room PM - `Store::auto_download_allowed`): remote media is never fetched
     /// automatically; it renders as a typed download button (see `prefetch_images`, which is
@@ -880,7 +990,7 @@ impl MessageItem {
         } else {
             (raw.clone(), String::new())
         };
-        let preview_text = capped_preview(&preview_text);
+        let preview_text = capped_preview(&without_quoted_lines(&preview_text));
 
         // Only the sender's own text is styled - never our placeholders or tombstones.
         let body_html = if m.retracted || m.moderated {
@@ -903,6 +1013,8 @@ impl MessageItem {
             reply_quote: String::new(),
             reply_to: m.reply_to.clone().unwrap_or_default(),
             reply_quote_image: String::new(),
+            reply_quote_sender: String::new(),
+            reply_quote_outgoing: false,
             preview_text,
             preview_image,
             reactions: String::new(),
@@ -1001,17 +1113,24 @@ impl MessageItem {
                 }
             }
         }
-        let quotes: Vec<Option<(String, String)>> = rows
+        let quotes: Vec<Option<(String, String, String, bool)>> = rows
             .iter()
             .map(|r| {
-                let target = *by_marker.get(r.reply_to.as_deref()?)?;
-                Some((items[target].preview_text.clone(), items[target].preview_image.clone()))
+                let target = &items[*by_marker.get(r.reply_to.as_deref()?)?];
+                Some((
+                    target.preview_caption(),
+                    target.preview_image.clone(),
+                    target.sender.clone(),
+                    target.outgoing,
+                ))
             })
             .collect();
         for (item, quote) in items.iter_mut().zip(quotes) {
-            if let Some((text, image)) = quote {
+            if let Some((text, image, sender, outgoing)) = quote {
                 item.reply_quote = text;
                 item.reply_quote_image = image;
+                item.reply_quote_sender = sender;
+                item.reply_quote_outgoing = outgoing;
             }
         }
         items
@@ -1505,7 +1624,10 @@ impl qobject::MessageModel {
             ROLE_BODY_HTML => QVariant::from(&QString::from(item.body_html.as_str())),
             ROLE_PREVIEW_TEXT => QVariant::from(&QString::from(item.preview_text.as_str())),
             ROLE_PREVIEW_IMAGE => QVariant::from(&QString::from(item.preview_image.as_str())),
+            ROLE_PREVIEW_CAPTION => QVariant::from(&QString::from(item.preview_caption().as_str())),
             ROLE_REPLY_QUOTE_IMAGE => QVariant::from(&QString::from(item.reply_quote_image.as_str())),
+            ROLE_REPLY_QUOTE_SENDER => QVariant::from(&QString::from(item.reply_quote_sender.as_str())),
+            ROLE_REPLY_QUOTE_OUTGOING => QVariant::from(&item.reply_quote_outgoing),
             ROLE_EDIT_MARKER => QVariant::from(&QString::from(item.edit_marker.as_str())),
             ROLE_MAP_PREVIEW => QVariant::from(&QString::from(item.map_preview.as_str())),
             ROLE_MAP_ATTRIBUTION => QVariant::from(&QString::from(item.map_attribution.as_str())),
@@ -1566,7 +1688,10 @@ impl qobject::MessageModel {
         roles.insert(ROLE_BODY_HTML, QByteArray::from("bodyHtml"));
         roles.insert(ROLE_PREVIEW_TEXT, QByteArray::from("previewText"));
         roles.insert(ROLE_PREVIEW_IMAGE, QByteArray::from("previewImage"));
+        roles.insert(ROLE_PREVIEW_CAPTION, QByteArray::from("previewCaption"));
         roles.insert(ROLE_REPLY_QUOTE_IMAGE, QByteArray::from("replyQuoteImage"));
+        roles.insert(ROLE_REPLY_QUOTE_SENDER, QByteArray::from("replyQuoteSender"));
+        roles.insert(ROLE_REPLY_QUOTE_OUTGOING, QByteArray::from("replyQuoteOutgoing"));
         roles.insert(ROLE_EDIT_MARKER, QByteArray::from("editMarker"));
         roles.insert(ROLE_MAP_PREVIEW, QByteArray::from("mapPreview"));
         roles.insert(ROLE_MAP_ATTRIBUTION, QByteArray::from("mapAttribution"));
