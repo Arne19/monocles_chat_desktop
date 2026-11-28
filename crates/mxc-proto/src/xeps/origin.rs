@@ -73,9 +73,38 @@ pub fn only_child_id(el: &minidom::Element, name: &str, ns: &str) -> Option<Stri
     only.attr("id").map(str::to_string)
 }
 
+/// Number of `<name xmlns=ns>` children of `el`.
+pub fn count_children(el: &minidom::Element, name: &str, ns: &str) -> usize {
+    el.children().filter(|c| c.name() == name && c.ns() == ns).count()
+}
+
+/// More than one `<x xmlns=muc#user>` (Conversations a188a8c708): the room's own element can not
+/// be told from one the sending occupant added (fake `<item jid/affiliation/role>`, status
+/// codes), so such a stanza is dropped as a whole rather than read through either copy.
+pub fn has_ambiguous_muc_user(el: &minidom::Element) -> bool {
+    count_children(el, "x", "http://jabber.org/protocol/muc#user") > 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_muc_user_elements_are_ambiguous() {
+        let one: minidom::Element = "<presence xmlns='jabber:client'>\
+            <x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member'/></x></presence>"
+            .parse()
+            .unwrap();
+        assert!(!has_ambiguous_muc_user(&one));
+        let none: minidom::Element = "<presence xmlns='jabber:client'/>".parse().unwrap();
+        assert!(!has_ambiguous_muc_user(&none));
+        let two: minidom::Element = "<presence xmlns='jabber:client'>\
+            <x xmlns='http://jabber.org/protocol/muc#user'><item jid='victim@example.org' affiliation='owner'/></x>\
+            <x xmlns='http://jabber.org/protocol/muc#user'><item affiliation='member'/></x></presence>"
+            .parse()
+            .unwrap();
+        assert!(has_ambiguous_muc_user(&two));
+    }
 
     const ME: &str = "me@example.org";
 

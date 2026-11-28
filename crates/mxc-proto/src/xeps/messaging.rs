@@ -1738,6 +1738,13 @@ async fn process_payload(
     // joined; presence.rs applies the same rule). Otherwise any sender could spawn a fake room,
     // or - with an `<x muc#user>` on a normal message - have their own 1:1 chat treated as a
     // MUC-PM, which skips the SCE `<to>` binding.
+    // Several `<x muc#user>`: the room's can't be told from one the sender added (see
+    // origin::has_ambiguous_muc_user). Reading it as absent would file a MUC-PM under the bare
+    // JID, so the message is dropped.
+    if super::origin::has_ambiguous_muc_user(msg) {
+        tracing::debug!(from = %counterpart_full, "dropping message with several muc#user elements");
+        return Ok(());
+    }
     let is_our_room =
         store.conversation_kind(cfg.account_id, &bare).await.ok().flatten().as_deref() == Some("muc");
     let is_groupchat = msg.attr("type") == Some("groupchat");

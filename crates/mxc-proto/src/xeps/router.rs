@@ -23,6 +23,10 @@ pub async fn handle_stanza(
     match stanza.name() {
         "message" => messaging::handle_incoming(w, store, cfg, events, calls, &stanza).await,
         "presence" => {
+            if super::origin::has_ambiguous_muc_user(&stanza) {
+                tracing::debug!(from = ?stanza.attr("from"), "dropping presence with several muc#user elements");
+                return Ok(());
+            }
             // XEP-0272 Muji: drive any active group call off occupant `<muji>` presence.
             jingle::observe_muji_presence(w, calls, cfg, events, &stanza).await;
             presence::handle_incoming(w, store, cfg, events, &stanza).await
